@@ -17,16 +17,64 @@
     </header>
 
     <main class="content">
-      <div class="status-card">
-        <p class="status-title">Status da Conexão</p>
+      <!-- Status da Conexão com o WhatsApp Web -->
+      <div class="card status-card">
+        <p class="card-title">Status da Conexão</p>
         <p class="status-detail" id="status-detail">Consultando abas abertas...</p>
       </div>
 
-      <div class="actions">
-        <button id="btn-open-wa" class="btn btn-secondary">Abrir WhatsApp Web</button>
-        <button id="btn-check-ready" class="btn btn-primary" disabled>Verificar WhatsApp</button>
+      <!-- Configuração de Modo e Limite de Extração -->
+      <div class="card options-card" id="options-card">
+        <p class="card-title">Opções de Extração</p>
+        <div class="radio-group">
+          <label class="radio-label">
+            <input type="radio" id="mode-all" name="extraction-mode" value="all">
+            <span>Todos os chats da conta</span>
+          </label>
+
+          <label class="radio-label">
+            <input type="radio" id="mode-limit" name="extraction-mode" value="limit" checked>
+            <span>Limitar quantidade (modo teste)</span>
+          </label>
+        </div>
+
+        <div class="limit-input-row" id="limit-input-row">
+          <label for="max-chats-input" class="input-label">Quantidade de chats:</label>
+          <input type="number" id="max-chats-input" class="number-input" min="1" max="1000" value="3">
+        </div>
       </div>
 
+      <!-- Barra de Progresso e Métricas em Tempo Real -->
+      <div class="card progress-card hidden" id="progress-container">
+        <div class="progress-header">
+          <span class="progress-title">Progresso da Extração</span>
+          <span class="badge" id="progress-state-badge">Aguardando</span>
+        </div>
+
+        <div class="progress-bar-track">
+          <div class="progress-bar-fill" id="progress-bar-fill"></div>
+        </div>
+
+        <div class="progress-info-row">
+          <span class="progress-label" id="progress-label">0%</span>
+        </div>
+        <p class="progress-detail" id="progress-detail">Iniciando...</p>
+      </div>
+
+      <!-- Botões de Controle do Fluxo -->
+      <div class="actions">
+        <button id="btn-start-batch" class="btn btn-primary">Iniciar Extração em Lote</button>
+        <button id="btn-pause-batch" class="btn btn-secondary hidden">Pausar Extração</button>
+        <button id="btn-resume-batch" class="btn btn-primary hidden">Retomar Extração</button>
+        <button id="btn-cancel-batch" class="btn btn-danger hidden">Cancelar Extração</button>
+
+        <div class="secondary-actions">
+          <button id="btn-check-ready" class="btn btn-secondary btn-sm" disabled>Verificar WhatsApp</button>
+          <button id="btn-open-wa" class="btn btn-secondary btn-sm">Abrir WhatsApp Web</button>
+        </div>
+      </div>
+
+      <!-- Log de Atividades -->
       <div class="log-area" id="log-area">
         <p class="log-entry">Extensão inicializada pronta para uso.</p>
       </div>

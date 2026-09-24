@@ -40,6 +40,9 @@ export const SELECTORS = Object.freeze({
   EXPORT_RADIO_CUSTOM_MSGS: 'input#date-range-custom',
   EXPORT_RADIO_ALL_LABEL: 'label[for="date-range-all"]',
   EXPORT_RADIO_CUSTOM_LABEL: 'label[for="date-range-custom"]',
+  EXPORT_MODAL_BUTTONS: 'div[data-testid="export-chat-modal"] button',
+  EXPORT_CONFIRM_TEXT: 'Exportar',
+  EXPORT_CANCEL_TEXT: 'Cancelar',
 
   // Histórico de mensagens
   MSG_CONTAINER: '[data-testid="msg-container"]',

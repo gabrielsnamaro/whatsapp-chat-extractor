@@ -3,12 +3,15 @@
   --card-bg: #1f2c34;
   --primary-color: #00a884;
   --primary-hover: #06cf9c;
+  --danger-color: #ea4335;
+  --danger-hover: #f05a4d;
   --text-main: #e9edef;
   --text-muted: #8696a0;
   --border-color: #2a3942;
   --status-ok: #00a884;
   --status-warn: #e9a935;
   --status-err: #ea4335;
+  --track-bg: #111b21;
 }
 
 * {
@@ -19,7 +22,7 @@
 }
 
 body {
-  width: 320px;
+  width: 350px;
   background-color: var(--bg-color);
   color: var(--text-main);
   padding: 14px;
@@ -45,10 +48,6 @@ body {
   gap: 8px;
 }
 
-.logo-area .icon {
-  font-size: 18px;
-}
-
 .logo-area .logo-img {
   width: 22px;
   height: 22px;
@@ -64,35 +63,47 @@ body {
 .badge {
   font-size: 10px;
   font-weight: 600;
-  padding: 3px 6px;
+  padding: 3px 7px;
   border-radius: 12px;
   background-color: var(--card-bg);
   color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
 }
 
-.badge.connected {
+.badge.connected, .badge-completed {
   background-color: rgba(0, 168, 132, 0.2);
   color: var(--status-ok);
 }
 
-.badge.disconnected {
+.badge.disconnected, .badge-failed, .badge-cancelled {
   background-color: rgba(234, 67, 53, 0.2);
   color: var(--status-err);
 }
 
-.status-card {
+.badge-exporting, .badge-scanning, .badge-packaging {
+  background-color: rgba(233, 169, 53, 0.2);
+  color: var(--status-warn);
+}
+
+.badge-paused {
+  background-color: rgba(134, 150, 160, 0.2);
+  color: var(--text-muted);
+}
+
+.card {
   background-color: var(--card-bg);
   border: 1px solid var(--border-color);
   border-radius: 8px;
-  padding: 10px;
+  padding: 10px 12px;
 }
 
-.status-title {
+.card-title {
   font-size: 11px;
   font-weight: 600;
   color: var(--text-muted);
   text-transform: uppercase;
-  margin-bottom: 4px;
+  margin-bottom: 6px;
 }
 
 .status-detail {
@@ -100,21 +111,144 @@ body {
   color: var(--text-main);
 }
 
+/* Opções de extração */
+.radio-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.radio-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  cursor: pointer;
+  color: var(--text-main);
+}
+
+.radio-label input[type="radio"] {
+  accent-color: var(--primary-color);
+  cursor: pointer;
+}
+
+.limit-input-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(42, 57, 66, 0.5);
+}
+
+.input-label {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.number-input {
+  width: 70px;
+  padding: 5px 8px;
+  background-color: #111b21;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  color: var(--text-main);
+  font-size: 13px;
+  text-align: center;
+}
+
+.number-input:focus {
+  outline: none;
+  border-color: var(--primary-color);
+}
+
+.number-input:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* Barra de Progresso */
+.progress-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.progress-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.progress-title {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+}
+
+.progress-bar-track {
+  width: 100%;
+  height: 8px;
+  background-color: var(--track-bg);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.progress-bar-fill {
+  width: 0%;
+  height: 100%;
+  background-color: var(--primary-color);
+  transition: width 0.3s ease;
+}
+
+.progress-info-row {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-main);
+}
+
+.progress-detail {
+  font-size: 11px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.text-error {
+  color: var(--status-err) !important;
+}
+
+/* Ações e Botões */
 .actions {
   display: flex;
   flex-direction: column;
   gap: 8px;
 }
 
+.secondary-actions {
+  display: flex;
+  gap: 6px;
+}
+
 .btn {
   width: 100%;
-  padding: 8px 12px;
+  padding: 9px 12px;
   border-radius: 6px;
   font-size: 12px;
   font-weight: 600;
   cursor: pointer;
   border: none;
-  transition: background-color 0.2s;
+  transition: background-color 0.2s, opacity 0.2s;
+}
+
+.btn-sm {
+  padding: 6px 10px;
+  font-size: 11px;
 }
 
 .btn-primary {
@@ -137,8 +271,23 @@ body {
   border: 1px solid var(--border-color);
 }
 
-.btn-secondary:hover {
+.btn-secondary:hover:not(:disabled) {
   background-color: var(--card-bg);
+}
+
+.btn-secondary:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.btn-danger {
+  background-color: rgba(234, 67, 53, 0.15);
+  color: var(--danger-color);
+  border: 1px solid rgba(234, 67, 53, 0.4);
+}
+
+.btn-danger:hover:not(:disabled) {
+  background-color: rgba(234, 67, 53, 0.25);
 }
 
 .log-area {
@@ -146,7 +295,7 @@ body {
   border: 1px solid var(--border-color);
   border-radius: 6px;
   padding: 8px;
-  max-height: 80px;
+  max-height: 70px;
   overflow-y: auto;
   font-family: monospace;
   font-size: 11px;
@@ -155,6 +304,7 @@ body {
 .log-entry {
   color: var(--text-muted);
   word-break: break-all;
+  margin-bottom: 2px;
 }
 
 .footer {
@@ -163,4 +313,8 @@ body {
   padding-top: 8px;
   color: var(--text-muted);
   font-size: 10px;
+}
+
+.hidden {
+  display: none !important;
 }

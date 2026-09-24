@@ -1,0 +1,155 @@
+/**
+ * ExportModalHandler
+ * Responsabilidade Única: Interagir com o modal de exportação nativo do WhatsApp Web,
+ * selecionar o intervalo completo de mensagens e confirmar a geração do arquivo.
+ */
+class ExportModalHandler {
+  /**
+   * @param {Object} [options]
+   * @param {Object} [options.selectors] Sobrescrita de seletores CSS
+   * @param {number} [options.timeoutMs=6000] Timeout máximo para aguardar o modal
+   */
+  constructor(options = {}) {
+    this.selectors = {
+      modal: 'div[data-testid="export-chat-modal"]',
+      radioAllMsgs: 'input#date-range-all',
+      radioAllLabel: 'label[for="date-range-all"]',
+      modalButtons: 'div[data-testid="export-chat-modal"] button',
+      confirmText: 'Exportar',
+      cancelText: 'Cancelar',
+      ...options.selectors
+    };
+
+    this.timeoutMs = options.timeoutMs ?? 6000;
+  }
+
+  /**
+   * Helper utilitário para pausas assíncronas
+   * @private
+   * @param {number} ms
+   * @returns {Promise<void>}
+   */
+  _sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  /**
+   * Aguarda a montagem do modal de exportação no DOM
+   * @private
+   * @returns {Promise<HTMLElement>}
+   */
+  async _waitForModal() {
+    const startTime = Date.now();
+    while (Date.now() - startTime < this.timeoutMs) {
+      const modal = document.querySelector(this.selectors.modal);
+      if (modal && modal.offsetParent !== null) {
+        return modal;
+      }
+      await this._sleep(100);
+    }
+    throw new Error(`Timeout de ${this.timeoutMs}ms aguardando exibição do modal de exportação.`);
+  }
+
+  /**
+   * Garante a seleção da opção "Todas as mensagens" no modal
+   * @private
+   * @param {HTMLElement} modal
+   * @returns {Promise<void>}
+   */
+  async _selectAllMessagesOption(modal) {
+    const radio = modal.querySelector(this.selectors.radioAllMsgs);
+    const label = modal.querySelector(this.selectors.radioAllLabel);
+
+    if (radio && !radio.checked) {
+      if (label) {
+        label.click();
+      } else {
+        radio.click();
+      }
+      await this._sleep(150);
+    }
+  }
+
+  /**
+   * Localiza o botão de confirmação ("Exportar") dentro do modal
+   * @private
+   * @param {HTMLElement} modal
+   * @returns {HTMLElement|null}
+   */
+  _findConfirmButton(modal) {
+    const buttons = modal.querySelectorAll(this.selectors.modalButtons);
+    for (const btn of buttons) {
+      const text = btn.textContent.trim();
+      if (text.toLowerCase() === this.selectors.confirmText.toLowerCase()) {
+        return btn;
+      }
+    }
+
+    // Fallback: geralmente o botão de ação principal é o último botão do rodapé
+    if (buttons.length > 0) {
+      return buttons[buttons.length - 1];
+    }
+
+    return null;
+  }
+
+  /**
+   * Confirma a exportação no modal (seleciona todas as mensagens e clica em Exportar)
+   * @returns {Promise<{ success: boolean }>}
+   */
+  async confirmExport() {
+    const modal = await this._waitForModal();
+    await this._sleep(200);
+
+    // Seleciona opção "Todas as mensagens"
+    await this._selectAllMessagesOption(modal);
+
+    // Localiza e clica no botão "Exportar"
+    const confirmBtn = this._findConfirmButton(modal);
+    if (!confirmBtn) {
+      throw new Error('Botão de confirmação de exportação não encontrado no modal.');
+    }
+
+    confirmBtn.click();
+
+    // Aguarda o modal fechar ou iniciar processamento
+    const startTime = Date.now();
+    while (Date.now() - startTime < 3000) {
+      const currentModal = document.querySelector(this.selectors.modal);
+      if (!currentModal) {
+        break;
+      }
+      await this._sleep(150);
+    }
+
+    return { success: true };
+  }
+
+  /**
+   * Cancela a operação do modal caso necessário
+   * @returns {Promise<void>}
+   */
+  async cancelExport() {
+    const modal = document.querySelector(this.selectors.modal);
+    if (!modal) return;
+
+    const buttons = modal.querySelectorAll(this.selectors.modalButtons);
+    for (const btn of buttons) {
+      if (btn.textContent.trim().toLowerCase() === this.selectors.cancelText.toLowerCase()) {
+        btn.click();
+        return;
+      }
+    }
+
+    // Fallback com tecla Escape
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true }));
+  }
+}
+
+if (typeof window !== 'undefined') {
+  window.ExportModalHandler = ExportModalHandler;
+}
+
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = { ExportModalHandler };
+}

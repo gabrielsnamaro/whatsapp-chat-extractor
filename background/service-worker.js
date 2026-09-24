@@ -1,13 +1,15 @@
 /**
  * Background Service Worker (Manifest V3)
- * Coordena ciclo de vida, persistência e comunicação com clients externos.
+ * Roteador de eventos do ciclo de vida da extensão e despachante para o ExtractionOrchestrator.
  */
 import { ACTIONS } from '../shared/constants/actions.js';
 import { StorageClient } from '../shared/clients/storage-client.js';
 import { BackendClient } from '../shared/clients/backend-client.js';
+import { ExtractionOrchestrator } from './extraction-orchestrator.js';
 import { Logger } from '../shared/utils/logger.js';
 
 const log = new Logger('ServiceWorker');
+const orchestrator = new ExtractionOrchestrator();
 
 chrome.runtime.onInstalled.addListener(async (details) => {
   log.info(`Extensão instalada/atualizada: ${details.reason}`);
@@ -41,7 +43,53 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return;
       }
 
-      // Handler para sincronização através do BackendClient modular
+      // Consulta de estado da máquina de fluxo de extração
+      if (message.action === ACTIONS.GET_WORKFLOW_STATE || message.action === 'GET_WORKFLOW_STATE') {
+        sendResponse({ success: true, data: orchestrator.getState() });
+        return;
+      }
+
+      // Controle da extração em lote (Popup -> Orchestrator)
+      if (message.action === ACTIONS.START_BATCH_EXTRACTION) {
+        const { maxChats, downloadAll, safeDelayMs } = message;
+        log.info(`Iniciando extração em lote (maxChats: ${maxChats}, downloadAll: ${downloadAll})...`);
+
+        // Responde de imediato ao popup e executa o orquestrador em segundo plano
+        orchestrator.start({ maxChats, downloadAll, safeDelayMs }).catch((err) => {
+          log.error('Erro na execução da extração em lote:', err);
+        });
+
+        sendResponse({ success: true, message: 'Extração iniciada com sucesso.' });
+        return;
+      }
+
+      if (message.action === ACTIONS.PAUSE_BATCH_EXTRACTION) {
+        orchestrator.pause();
+        sendResponse({ success: true });
+        return;
+      }
+
+      if (message.action === ACTIONS.RESUME_BATCH_EXTRACTION) {
+        orchestrator.resume();
+        sendResponse({ success: true });
+        return;
+      }
+
+      if (message.action === ACTIONS.CANCEL_BATCH_EXTRACTION) {
+        orchestrator.cancel();
+        sendResponse({ success: true });
+        return;
+      }
+
+      // Notificação de blob pré-capturado pelo Content Script no DOM
+      if (message.action === ACTIONS.BLOB_CAPTURED_FROM_PAGE || message.action === 'BLOB_CAPTURED_FROM_PAGE') {
+        const { url, filename, bytes } = message;
+        orchestrator.interceptor.registerCapturedBytes(url, filename, bytes);
+        sendResponse({ success: true });
+        return;
+      }
+
+      // Handler legado para sincronização via BackendClient
       if (message.action === ACTIONS.SYNC_TO_BACKEND) {
         const client = await BackendClient.fromStorage();
         const result = await client.syncChats(message.chats || []);
@@ -51,7 +99,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
       sendResponse({ success: false, error: 'Ação desconhecida: ' + message.action });
     } catch (err) {
-      log.error('Erro ao processar mensagem:', err);
+      log.error('Erro ao processar mensagem no Service Worker:', err);
       sendResponse({ success: false, error: err.message });
     }
   })();
