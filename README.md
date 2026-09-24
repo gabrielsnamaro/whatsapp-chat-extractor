@@ -21,7 +21,8 @@ Extensão do Google Chrome (Manifest V3) desenvolvida para interagir diretamente
 
 ```text
 projects/whatsapp-web-extraction-extension/
-├── manifest.json              # Configuração do Manifest V3 (permissões, scripts, popup)
+├── manifest.json              # Configuração do Manifest V3 (permissões, scripts, popup, ícones)
+├── icons/                     # Ícones da extensão (16, 32, 48, 128px)
 ├── background/
 │   └── service-worker.js      # Service Worker de ciclo de vida e coordenação
 ├── content/
