@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WhatsApp Web Extractor</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="container">
+    <header class="header">
+      <div class="logo-area">
+        <span class="icon">💬</span>
+        <h1>WhatsApp Web Extractor</h1>
+      </div>
+      <span class="badge" id="status-badge">Verificando...</span>
+    </header>
+
+    <main class="content">
+      <div class="status-card">
+        <p class="status-title">Status da Conexão</p>
+        <p class="status-detail" id="status-detail">Consultando abas abertas...</p>
+      </div>
+
+      <div class="actions">
+        <button id="btn-open-wa" class="btn btn-secondary">Abrir WhatsApp Web</button>
+        <button id="btn-check-ready" class="btn btn-primary" disabled>Verificar WhatsApp</button>
+      </div>
+
+      <div class="log-area" id="log-area">
+        <p class="log-entry">Extensão inicializada pronta para uso.</p>
+      </div>
+    </main>
+
+    <footer class="footer">
+      <small>WhatsApp Chat Extractor &bull; Manifest V3</small>
+    </footer>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

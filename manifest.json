@@ -1,0 +1,33 @@
+{
+  "manifest_version": 3,
+  "name": "WhatsApp Web Data Extractor",
+  "version": "1.0.0",
+  "description": "Extensão para extração e sincronização de dados e chats diretamente do WhatsApp Web.",
+  "permissions": [
+    "storage",
+    "tabs",
+    "scripting",
+    "activeTab"
+  ],
+  "host_permissions": [
+    "https://web.whatsapp.com/*"
+  ],
+  "background": {
+    "service_worker": "background/service-worker.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://web.whatsapp.com/*"
+      ],
+      "js": [
+        "content/content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_title": "WhatsApp Web Extractor"
+  }
+}

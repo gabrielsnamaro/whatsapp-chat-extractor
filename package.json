@@ -1,0 +1,16 @@
+{
+  "name": "whatsapp-web-extraction-extension",
+  "version": "1.0.0",
+  "description": "Extensão Chrome Manifest V3 para extração e sincronização de dados diretamente do WhatsApp Web",
+  "main": "background/service-worker.js",
+  "scripts": {
+    "test": "echo \"No test specified\" && exit 0"
+  },
+  "keywords": [
+    "chrome-extension",
+    "manifest-v3",
+    "whatsapp-web",
+    "extractor"
+  ],
+  "license": "ISC"
+}
