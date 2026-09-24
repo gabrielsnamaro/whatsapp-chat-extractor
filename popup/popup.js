@@ -2,6 +2,7 @@
  * Popup Script (Manifest V3)
  * Coordena ações de interface do usuário, verificação de abas e acionamento de extração.
  */
+import { ACTIONS } from '../shared/constants/actions.js';
 
 document.addEventListener('DOMContentLoaded', async () => {
   const statusBadge = document.getElementById('status-badge');
@@ -64,7 +65,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     log('Consultando status do WhatsApp Web...');
     try {
-      const response = await chrome.tabs.sendMessage(tab.id, { action: 'CHECK_PAGE_READY' });
+      const response = await chrome.tabs.sendMessage(tab.id, { action: ACTIONS.CHECK_PAGE_READY });
       if (response && response.ready) {
         log('✅ WhatsApp Web carregado e pronto para extração!');
       } else {

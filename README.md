@@ -31,7 +31,22 @@ projects/whatsapp-web-extraction-extension/
 │   ├── popup.html             # Interface do popup (sem scripts inline, em conformidade com CSP)
 │   ├── popup.css              # Estilos escuros no padrão WhatsApp
 │   └── popup.js               # Lógica de controle e comunicação com abas
-├── package.json               # Metadados do subprojeto
+├── shared/                    # Módulos compartilhados e clients reutilizáveis
+│   ├── clients/               # Clientes de rede, storage e backend
+│   │   ├── http-client.js     # Cliente HTTP base com retry e timeout
+│   │   ├── storage-client.js  # Abstração de persistência (chrome.storage)
+│   │   ├── backend-client.js  # Cliente de integração com endpoints da API
+│   │   └── bigquery/          # Módulo de persistência direta no Google BigQuery
+│   │       ├── bigquery-client.js        # Cliente genérico (REST API v2)
+│   │       ├── chat-persistence-client.js # Persistência de conversas e mensagens
+│   │       └── index.js                  # Barrel export do módulo
+│   ├── constants/             # Constantes compartilhadas
+│   │   ├── actions.js         # Tipos de mensagens e ações entre contextos
+│   │   └── selectors.js       # Seletores DOM canônicos do WhatsApp Web
+│   └── utils/
+│       └── logger.js          # Utilitário de log formatado com timestamps
+├── kb/                        # Base de conhecimento de engenharia reversa do DOM
+├── package.json               # Metadados do subprojeto (type: module)
 └── README.md                  # Esta documentação
 ```
 

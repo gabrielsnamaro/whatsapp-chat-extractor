@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "description": "Extensão Chrome Manifest V3 para extração e sincronização de dados diretamente do WhatsApp Web",
   "main": "background/service-worker.js",
+  "type": "module",
   "scripts": {
     "test": "echo \"No test specified\" && exit 0"
   },
