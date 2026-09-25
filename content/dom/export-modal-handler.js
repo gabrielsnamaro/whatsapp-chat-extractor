@@ -7,20 +7,18 @@ class ExportModalHandler {
   /**
    * @param {Object} [options]
    * @param {Object} [options.selectors] Sobrescrita de seletores CSS
-   * @param {number} [options.timeoutMs=6000] Timeout máximo para aguardar o modal
    */
   constructor(options = {}) {
     this.selectors = {
       modal: 'div[data-testid="export-chat-modal"]',
+      modalFallback: 'div[role="dialog"], div[data-animate-modal-popup="true"]',
       radioAllMsgs: 'input#date-range-all',
       radioAllLabel: 'label[for="date-range-all"]',
-      modalButtons: 'div[data-testid="export-chat-modal"] button',
+      modalButtons: 'button, div[role="button"]',
       confirmText: 'Exportar',
       cancelText: 'Cancelar',
       ...options.selectors
     };
-
-    this.timeoutMs = options.timeoutMs ?? 6000;
   }
 
   /**
@@ -34,20 +32,33 @@ class ExportModalHandler {
   }
 
   /**
-   * Aguarda a montagem do modal de exportação no DOM
+   * Aguarda a montagem do modal de exportação no DOM (sem limite de timeout)
    * @private
    * @returns {Promise<HTMLElement>}
    */
   async _waitForModal() {
-    const startTime = Date.now();
-    while (Date.now() - startTime < this.timeoutMs) {
+    while (true) {
+      // 1. Tenta pelo seletor específico testid
       const modal = document.querySelector(this.selectors.modal);
       if (modal && modal.offsetParent !== null) {
         return modal;
       }
-      await this._sleep(100);
+
+      // 2. Fallback: procura por diálogos que contenham o botão de exportar ou radio de data
+      const dialogs = document.querySelectorAll(this.selectors.modalFallback);
+      for (const dialog of dialogs) {
+        if (dialog.offsetParent !== null) {
+          const hasConfirm = Array.from(dialog.querySelectorAll('button, div[role="button"]'))
+            .some(b => (b.textContent || '').trim().toLowerCase() === this.selectors.confirmText.toLowerCase());
+          const hasRadio = dialog.querySelector(this.selectors.radioAllMsgs) || dialog.querySelector(this.selectors.radioAllLabel);
+          if (hasConfirm || hasRadio) {
+            return dialog;
+          }
+        }
+      }
+
+      await this._sleep(150);
     }
-    throw new Error(`Timeout de ${this.timeoutMs}ms aguardando exibição do modal de exportação.`);
   }
 
   /**

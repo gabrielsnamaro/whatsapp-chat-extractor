@@ -89,6 +89,10 @@ class ChatHistoryLoader {
   hasReachedPhoneLimit(container) {
     if (!container) return false;
 
+    // Só é válido se o contêiner estiver no topo (scrollTop <= 50)
+    // Se o usuário/conversa estiver no meio ou no fim, não pode ser o limite alcançado
+    if (container.scrollTop > 50) return false;
+
     const root = document.querySelector('#main') || container;
 
     // 1. Procura em elementos específicos de texto dentro de #main
@@ -98,7 +102,11 @@ class ChatHistoryLoader {
       const text = (el.textContent || '').trim();
       if (text.length > 10 && text.length < 250) {
         if (this.phoneLimitRegex.test(text)) {
-          return true;
+          // Garante que o elemento está posicionado no topo da tela visível
+          const rect = el.getBoundingClientRect();
+          if (rect.height > 0 && rect.top < window.innerHeight * 0.5) {
+            return true;
+          }
         }
       }
     }
@@ -193,14 +201,12 @@ class ChatHistoryLoader {
    * @param {Object} [options]
    * @param {number} [options.maxScrollCycles=Infinity] Número máximo de ciclos de rolagem (Infinity = ilimitado)
    * @param {number} [options.cycleDelayMs=450] Intervalo de espera para carregamento entre rolagens
-   * @param {number} [options.timeoutMs=Infinity] Timeout máximo total da operação (Infinity = ilimitado)
    * @param {Function} [options.onProgress] Callback com contagem de mensagens carregadas
    * @returns {Promise<{ success: boolean, initialCount: number, finalCount: number, cycles: number, reachedBeginning: boolean }>}
    */
   async preloadFullHistory(options = {}) {
     const maxScrollCycles = options.maxScrollCycles ?? Infinity;
     const cycleDelayMs = options.cycleDelayMs ?? 450;
-    const timeoutMs = options.timeoutMs ?? Infinity;
     const onProgress = options.onProgress ?? null;
 
     const container = this.getMessagesContainer();
@@ -212,14 +218,20 @@ class ChatHistoryLoader {
     const initialCount = document.querySelectorAll(this.selectors.messageItem).length;
     console.log(`[WhatsApp Extractor :: ChatHistoryLoader] Iniciando pré-carregamento do histórico ilimitado (${initialCount} msgs em tela)...`);
 
-    const startTime = Date.now();
+    const getFirstMsgKey = () => {
+      const first = container.querySelector(this.selectors.messageItem);
+      if (!first) return '';
+      return first.getAttribute('data-id') || first.getAttribute('id') || (first.textContent || '').slice(0, 60);
+    };
+
     let consecutiveUnchanged = 0;
     let lastMsgCount = initialCount;
     let lastScrollHeight = container.scrollHeight;
+    let lastFirstMsgKey = getFirstMsgKey();
     let cycles = 0;
     let reachedBeginning = false;
 
-    while (cycles < maxScrollCycles && (timeoutMs === Infinity || Date.now() - startTime < timeoutMs)) {
+    while (cycles < maxScrollCycles) {
       cycles++;
 
       // Salvaguarda: se o contêiner foi desmontado do DOM
@@ -297,6 +309,7 @@ class ChatHistoryLoader {
       }
 
       // 8. Medição de progresso
+      const currentFirstKey = getFirstMsgKey();
       const currentCount = document.querySelectorAll(this.selectors.messageItem).length;
       const currentHeight = container.scrollHeight;
 
@@ -304,18 +317,18 @@ class ChatHistoryLoader {
         onProgress(currentCount);
       }
 
-      if (currentCount > lastMsgCount || currentHeight > lastScrollHeight) {
+      if (currentCount > lastMsgCount || currentHeight > lastScrollHeight || (currentFirstKey && currentFirstKey !== lastFirstMsgKey)) {
         consecutiveUnchanged = 0;
-        console.log(`[WhatsApp Extractor :: ChatHistoryLoader] [Ciclo ${cycles}] Histórico expandido: ${currentCount} mensagens carregadas.`);
+        console.log(`[WhatsApp Extractor :: ChatHistoryLoader] [Ciclo ${cycles}] Histórico expandido: ${currentCount} msgs (topo atualizado).`);
       } else {
         // Se houver botão ou spinner visível, não conta como estagnação
         if (this._findLoadEarlierButton(container) || this._isLoading(container)) {
           consecutiveUnchanged = 0;
-        } else if (container.scrollTop <= 20) {
+        } else if (container.scrollTop <= 30) {
           consecutiveUnchanged++;
-          // Se após 8 tentativas consecutivas (aproximadamente 4 a 5 segundos de silêncio absoluto) nada mudou
-          if (consecutiveUnchanged >= 8) {
-            console.log('[WhatsApp Extractor :: ChatHistoryLoader] Estagnação de mensagens detectada após 8 ciclos sem novos dados ou botões.');
+          // Se após 15 tentativas consecutivas (aproximadamente 7 a 8 segundos de silêncio absoluto) nada mudou
+          if (consecutiveUnchanged >= 15) {
+            console.log('[WhatsApp Extractor :: ChatHistoryLoader] Estagnação de mensagens detectada após 15 ciclos sem novos dados ou botões.');
             break;
           }
         }
@@ -323,6 +336,7 @@ class ChatHistoryLoader {
 
       lastMsgCount = currentCount;
       lastScrollHeight = currentHeight;
+      lastFirstMsgKey = currentFirstKey;
     }
 
     const finalCount = document.querySelectorAll(this.selectors.messageItem).length;

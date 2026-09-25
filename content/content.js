@@ -57,7 +57,7 @@
             console.log(`[WhatsApp Web Extractor] Processando exportação do chat: "${chat.title}"...`);
 
             // 1. Navegar até a conversa e aguardar montagem do cabeçalho
-            await navigator.openChat(chat);
+            await navigator.openChat(chat, message.chatIndex ?? null);
 
             // 2. Se habilitado (padrão true), pré-carrega o histórico rolando até o início
             const shouldPreload = message.preloadHistory !== false;
@@ -66,8 +66,7 @@
               try {
                 const preloadResult = await historyLoader.preloadFullHistory({
                   maxScrollCycles: message.maxScrollCycles ?? Infinity,
-                  cycleDelayMs: message.cycleDelayMs ?? 450,
-                  timeoutMs: message.preloadTimeoutMs ?? Infinity
+                  cycleDelayMs: message.cycleDelayMs ?? 450
                 });
                 console.log(`[WhatsApp Web Extractor] Pré-carregamento finalizado (${preloadResult.finalCount} mensagens em tela).`);
               } catch (preloadErr) {
@@ -76,7 +75,7 @@
             }
 
             // 3. Prepara a promessa para capturar o download que será gerado por este chat
-            const downloadPromise = waitForNextExportDownload(180000);
+            const downloadPromise = waitForNextExportDownload();
 
             // 4. Acionar o menu suspenso e clicar em "Exportar conversa"
             await optionsMenu.triggerExportOption();
@@ -139,19 +138,12 @@
   let activeExportResolver = null;
 
   /**
-   * Aguarda a captura do próximo download gerado pelo WhatsApp Web
-   * @param {number} [timeoutMs=30000]
+   * Aguarda a captura do próximo download gerado pelo WhatsApp Web (sem limite de timeout)
    * @returns {Promise<{ success: boolean, filename: string, bytes: Array<number> }>}
    */
-  function waitForNextExportDownload(timeoutMs = 30000) {
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        activeExportResolver = null;
-        reject(new Error(`Timeout de ${timeoutMs}ms aguardando exportação do chat pelo WhatsApp.`));
-      }, timeoutMs);
-
+  function waitForNextExportDownload() {
+    return new Promise((resolve) => {
       activeExportResolver = (data) => {
-        clearTimeout(timer);
         activeExportResolver = null;
         resolve(data);
       };

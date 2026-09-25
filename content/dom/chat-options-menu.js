@@ -7,7 +7,6 @@ class ChatOptionsMenu {
   /**
    * @param {Object} [options]
    * @param {Object} [options.selectors] Sobrescrita de seletores CSS
-   * @param {number} [options.timeoutMs=5000] Timeout máximo para abertura do menu
    */
   constructor(options = {}) {
     this.selectors = {
@@ -18,8 +17,6 @@ class ChatOptionsMenu {
       exportActionText: 'Exportar conversa',
       ...options.selectors
     };
-
-    this.timeoutMs = options.timeoutMs ?? 5000;
   }
 
   /**
@@ -42,20 +39,27 @@ class ChatOptionsMenu {
   }
 
   /**
-   * Aguarda a renderização do menu suspenso no DOM
+   * Aguarda a renderização do menu suspenso no DOM (sem limite de timeout)
    * @private
+   * @param {HTMLElement} [triggerBtn] Botão acionador para retentativas de clique se necessário
    * @returns {Promise<HTMLElement>}
    */
-  async _waitForMenu() {
-    const startTime = Date.now();
-    while (Date.now() - startTime < this.timeoutMs) {
+  async _waitForMenu(triggerBtn = null) {
+    let lastClickTime = Date.now();
+    while (true) {
       const menu = document.querySelector(this.selectors.menuContainer);
       if (menu && menu.offsetParent !== null) {
         return menu;
       }
+
+      // Se passou mais de 1.5s sem o menu abrir, re-tenta o clique no botão
+      if (triggerBtn && Date.now() - lastClickTime > 1500) {
+        this._simulateClick(triggerBtn);
+        lastClickTime = Date.now();
+      }
+
       await this._sleep(100);
     }
-    throw new Error(`Timeout de ${this.timeoutMs}ms aguardando abertura do menu de opções.`);
   }
 
   /**
@@ -116,16 +120,17 @@ class ChatOptionsMenu {
    * @returns {Promise<{ success: boolean }>}
    */
   async triggerExportOption() {
-    const btn = this._findMoreOptionsButton();
-    if (!btn) {
-      throw new Error('Botão "Mais opções" não encontrado no cabeçalho da conversa.');
+    let btn = this._findMoreOptionsButton();
+    while (!btn) {
+      await this._sleep(150);
+      btn = this._findMoreOptionsButton();
     }
 
     // Abre o menu de opções
     this._simulateClick(btn);
 
-    // Aguarda o menu aparecer
-    const menu = await this._waitForMenu();
+    // Aguarda o menu aparecer passando o botão como referência para auto-retry
+    const menu = await this._waitForMenu(btn);
     await this._sleep(150);
 
     // Localiza a opção de exportação

@@ -64,7 +64,10 @@ class ChatListScanner {
       if (cell.closest(this.selectors.archivedButton)) return;
 
       const titleEl = cell.querySelector(this.selectors.title);
-      const title = titleEl ? titleEl.textContent.trim() : null;
+      if (!titleEl) return;
+
+      const spanWithTitle = titleEl.querySelector('span[title]');
+      const title = (spanWithTitle?.getAttribute('title') || titleEl.textContent || '').trim();
 
       if (!title) return;
 

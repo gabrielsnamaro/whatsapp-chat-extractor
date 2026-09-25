@@ -7,7 +7,6 @@ class ChatNavigator {
   /**
    * @param {Object} [options]
    * @param {Object} [options.selectors] Sobrescrita de seletores CSS
-   * @param {number} [options.timeoutMs=10000] Timeout máximo para aguardar abertura do chat
    */
   constructor(options = {}) {
     this.selectors = {
@@ -20,8 +19,6 @@ class ChatNavigator {
       mainHeaderTitle: '#main header span[dir="auto"]',
       ...options.selectors
     };
-
-    this.timeoutMs = options.timeoutMs ?? 10000;
   }
 
   /**
@@ -44,8 +41,40 @@ class ChatNavigator {
     if (!str || typeof str !== 'string') return '';
     return str
       .replace(/[\u200B-\u200D\uFEFF\u200E\u200F\u202A-\u202E]/g, '')
+      .replace(/\s+/g, ' ')
       .trim()
       .toLowerCase();
+  }
+
+  /**
+   * Compara dois títulos com múltiplos níveis de tolerância (exato, parcial e alfanumérico)
+   * @private
+   * @param {string} candidateTitle
+   * @param {string} targetTitle
+   * @returns {boolean}
+   */
+  _isTitleMatch(candidateTitle, targetTitle) {
+    if (!candidateTitle || !targetTitle) return false;
+    const cleanCand = this._cleanTitle(candidateTitle);
+    const cleanTarg = this._cleanTitle(targetTitle);
+    if (!cleanCand || !cleanTarg) return false;
+
+    // 1. Match exato ou inclusão direta
+    if (cleanCand === cleanTarg || cleanCand.includes(cleanTarg) || cleanTarg.includes(cleanCand)) {
+      return true;
+    }
+
+    // 2. Match alfanumérico puro (ignora emojis, pontuações e formatações de telefone)
+    const alphaCand = cleanCand.replace(/[^a-z0-9]/gi, '');
+    const alphaTarg = cleanTarg.replace(/[^a-z0-9]/gi, '');
+    if (alphaCand && alphaTarg) {
+      if (alphaCand === alphaTarg) return true;
+      if (alphaTarg.length >= 3 && (alphaCand.includes(alphaTarg) || alphaTarg.includes(alphaCand))) {
+        return true;
+      }
+    }
+
+    return false;
   }
 
   /**
@@ -67,9 +96,6 @@ class ChatNavigator {
     const pane = document.querySelector(this.selectors.container);
     if (!pane) return null;
 
-    const cleanTarget = this._cleanTitle(targetTitle);
-    if (!cleanTarget) return null;
-
     const cells = pane.querySelectorAll(this.selectors.cell);
     for (const cell of cells) {
       if (!cell.closest(this.selectors.row)) continue;
@@ -78,12 +104,16 @@ class ChatNavigator {
       const titleEl = cell.querySelector(this.selectors.title);
       if (!titleEl) continue;
 
-      // Obtém o título preferencialmente do atributo title (mais limpo e completo no WhatsApp) ou textContent
-      const spanWithTitle = titleEl.querySelector('span[title]') || titleEl;
-      const rawTitle = spanWithTitle.getAttribute('title') || titleEl.textContent || '';
-      const cleanCellTitle = this._cleanTitle(rawTitle);
+      // Obtém o título do atributo title ou textContent
+      const spanWithTitle = titleEl.querySelector('span[title]');
+      const rawTitleAttr = spanWithTitle ? spanWithTitle.getAttribute('title') : '';
+      const rawText = titleEl.textContent || '';
 
-      if (cleanCellTitle === cleanTarget || cleanCellTitle.includes(cleanTarget) || cleanTarget.includes(cleanCellTitle)) {
+      if (
+        this._isTitleMatch(rawTitleAttr, targetTitle) ||
+        this._isTitleMatch(rawText, targetTitle) ||
+        this._isTitleMatch(cell.innerText, targetTitle)
+      ) {
         return cell;
       }
     }
@@ -91,12 +121,13 @@ class ChatNavigator {
   }
 
   /**
-   * Localiza a célula da conversa no #pane-side (rolando se necessário)
+   * Localiza a célula da conversa no #pane-side com rolagem suave e limitada
    * @private
    * @param {string} targetTitle
+   * @param {number|null} [fallbackIndex=null] Índice ordinal na lista para fallback posicional
    * @returns {Promise<HTMLElement|null>}
    */
-  async _locateCellWithScroll(targetTitle) {
+  async _locateCellWithScroll(targetTitle, fallbackIndex = null) {
     // 1. Tenta encontrar imediatamente nas células visíveis
     let cell = this._findVisibleCellByTitle(targetTitle);
     if (cell) return cell;
@@ -104,27 +135,51 @@ class ChatNavigator {
     const pane = document.querySelector(this.selectors.container);
     if (!pane) return null;
 
-    // 2. Se não estiver visível, inicia busca rolando a partir do topo
+    // 2. Volta ao topo inicial e aguarda renderização dos primeiros chats no DOM
     pane.scrollTop = 0;
-    await this._sleep(150);
+    await this._sleep(300);
 
-    const step = 350;
-    let consecutiveUnchanged = 0;
+    // Checagem imediata após voltar ao topo (casos dos chats 1, 2, 3...)
+    cell = this._findVisibleCellByTitle(targetTitle);
+    if (cell) return cell;
+
+    // 3. Busca progressiva com passos curtos (100px = ~1,3 linhas) para não pular nenhum chat
+    const step = 100;
+    const maxSearchSteps = 45; // Máximo de ~4500px de profundidade (evita qualquer loop infinito)
+    let steps = 0;
     let lastScrollTop = -1;
+    let consecutiveStall = 0;
 
-    while (consecutiveUnchanged < 5) {
+    while (steps < maxSearchSteps) {
+      steps++;
+      pane.scrollTop += step;
+      await this._sleep(150);
+
       cell = this._findVisibleCellByTitle(targetTitle);
       if (cell) return cell;
 
-      pane.scrollTop += step;
-      await this._sleep(200);
-
-      if (pane.scrollTop === lastScrollTop || (pane.scrollTop + pane.clientHeight >= pane.scrollHeight - 5)) {
-        consecutiveUnchanged++;
+      if (pane.scrollTop === lastScrollTop) {
+        consecutiveStall++;
+        if (consecutiveStall >= 3) break;
       } else {
-        consecutiveUnchanged = 0;
+        consecutiveStall = 0;
       }
       lastScrollTop = pane.scrollTop;
+    }
+
+    // 4. Fallback posicional por índice (se o chat procurado for o 3º da fila, pega a 3ª linha visível do topo)
+    if (fallbackIndex != null && fallbackIndex >= 0) {
+      console.warn(`[ChatNavigator] Chat "${targetTitle}" não localizado por nome. Tentando fallback posicional por índice (${fallbackIndex})...`);
+      pane.scrollTop = 0;
+      await this._sleep(300);
+
+      const rows = Array.from(pane.querySelectorAll(this.selectors.row))
+        .filter(r => !r.closest(this.selectors.archivedButton));
+
+      if (rows[fallbackIndex]) {
+        const fallbackCell = rows[fallbackIndex].querySelector(this.selectors.cell) || rows[fallbackIndex];
+        return fallbackCell;
+      }
     }
 
     return null;
@@ -194,13 +249,13 @@ class ChatNavigator {
    * @param {string} [chat.title]
    * @returns {Promise<{ success: boolean, title: string }>}
    */
-  async openChat(chat) {
+  async openChat(chat, fallbackIndex = null) {
     const targetTitle = typeof chat === 'string' ? chat : chat?.title;
+    const targetIndex = fallbackIndex ?? (typeof chat === 'object' ? chat?.index : null);
+
     if (!targetTitle) {
       throw new Error('Título da conversa não fornecido ao ChatNavigator.');
     }
-
-    const cleanTarget = this._cleanTitle(targetTitle);
 
     // 1. Limpa qualquer menu ou modal aberto residualmente antes de navegar
     const openModal = document.querySelector('div[data-testid="export-chat-modal"]');
@@ -212,15 +267,12 @@ class ChatNavigator {
 
     // 2. Verifica se a conversa desejada já é a ativa atualmente
     const currentActiveTitle = this.getActiveChatTitle();
-    if (currentActiveTitle) {
-      const cleanActive = this._cleanTitle(currentActiveTitle);
-      if (cleanActive === cleanTarget) {
-        return { success: true, title: targetTitle };
-      }
+    if (currentActiveTitle && this._isTitleMatch(currentActiveTitle, targetTitle)) {
+      return { success: true, title: targetTitle };
     }
 
-    // 3. Localiza a célula da conversa no #pane-side
-    const cellElement = await this._locateCellWithScroll(targetTitle);
+    // 3. Localiza a célula da conversa no #pane-side com suporte a fallback posicional
+    const cellElement = await this._locateCellWithScroll(targetTitle, targetIndex);
     if (!cellElement) {
       throw new Error(`Conversa "${targetTitle}" não foi encontrada na lista lateral.`);
     }
@@ -232,47 +284,39 @@ class ChatNavigator {
     // 5. Dispara clique simulado com coordenadas e foco
     this._simulateClick(cellElement);
 
-    // 6. Aguarda confirmação no #main header ou na seleção nativa [aria-selected="true"]
-    const startTime = Date.now();
-    let retryCount = 0;
+    // 6. Aguarda confirmação no #main header (sem limite de timeout)
+    let lastClickTime = Date.now();
+    let attempts = 0;
 
-    while (Date.now() - startTime < this.timeoutMs) {
+    while (true) {
+      attempts++;
       const activeTitle = this.getActiveChatTitle();
-      const isSelected = cellElement.closest('[aria-selected="true"]') !== null;
 
-      if (activeTitle) {
-        const cleanActive = this._cleanTitle(activeTitle);
-        if (cleanActive === cleanTarget || cleanActive.includes(cleanTarget)) {
-          await this._sleep(400); // Aguarda renderização completa do histórico
+      if (activeTitle && this._isTitleMatch(activeTitle, targetTitle)) {
+        // Aguarda renderização e estabilização do histórico da nova conversa no DOM
+        await this._sleep(500);
+        return { success: true, title: targetTitle };
+      }
+
+      // Se passou mais de 1.8s sem o cabeçalho atualizar para a nova conversa, re-tenta o clique
+      if (Date.now() - lastClickTime > 1800) {
+        this._simulateClick(cellElement);
+        lastClickTime = Date.now();
+      }
+
+      // Fallback: se a célula já está selecionada nativamente e o cabeçalho existe após várias tentativas
+      if (attempts > 25) {
+        const header = document.querySelector(this.selectors.mainHeader);
+        const isSelected = cellElement.getAttribute('aria-selected') === 'true' ||
+                           cellElement.closest('[aria-selected="true"]') !== null;
+        if (header && isSelected) {
+          await this._sleep(500);
           return { success: true, title: targetTitle };
         }
       }
 
-      if (isSelected) {
-        await this._sleep(400);
-        return { success: true, title: targetTitle };
-      }
-
-      // Se passou 1.2s ou 2.4s e ainda não abriu, re-tenta o clique automaticamente
-      const elapsed = Date.now() - startTime;
-      if (retryCount === 0 && elapsed > 1200) {
-        retryCount++;
-        this._simulateClick(cellElement);
-      } else if (retryCount === 1 && elapsed > 2500) {
-        retryCount++;
-        this._simulateClick(cellElement);
-      }
-
       await this._sleep(150);
     }
-
-    // Verificação de fallback: se o header existe e o chat parece ter aberto
-    const headerExists = Boolean(document.querySelector(this.selectors.mainHeader));
-    if (headerExists) {
-      return { success: true, title: targetTitle };
-    }
-
-    throw new Error(`Timeout de ${this.timeoutMs}ms aguardando abertura da conversa "${targetTitle}".`);
   }
 }
 

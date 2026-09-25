@@ -45,8 +45,7 @@ export class DownloadInterceptor {
     }
 
     // Rejeita eventuais promessas pendentes
-    for (const { reject, timerId } of this._pendingDownloadResolvers) {
-      clearTimeout(timerId);
+    for (const { reject } of this._pendingDownloadResolvers) {
       reject(new Error('Interceptador de downloads interrompido.'));
     }
     this._pendingDownloadResolvers = [];
@@ -72,7 +71,6 @@ export class DownloadInterceptor {
     // Se houver algum resolver aguardando este download
     if (this._pendingDownloadResolvers.length > 0) {
       const resolver = this._pendingDownloadResolvers.shift();
-      clearTimeout(resolver.timerId);
       resolver.resolve({ filename, bytes: uint8 });
       return; // Não armazena no mapa para não vazar para o próximo chat
     }
@@ -89,8 +87,7 @@ export class DownloadInterceptor {
    */
   clearPending() {
     this._capturedDataMap.clear();
-    for (const { reject, timerId } of this._pendingDownloadResolvers) {
-      clearTimeout(timerId);
+    for (const { reject } of this._pendingDownloadResolvers) {
       try { reject(new Error('Reset para nova conversa.')); } catch (_) {}
     }
     this._pendingDownloadResolvers = [];
@@ -131,7 +128,6 @@ export class DownloadInterceptor {
     // Notifica quem estiver aguardando
     if (this._pendingDownloadResolvers.length > 0) {
       const resolver = this._pendingDownloadResolvers.shift();
-      clearTimeout(resolver.timerId);
       resolver.resolve({
         downloadId: downloadItem.id,
         url,
@@ -142,13 +138,12 @@ export class DownloadInterceptor {
   }
 
   /**
-   * Aguarda a captura do arquivo exportado para o chat atual
+   * Aguarda a captura do arquivo exportado para o chat atual (sem timeout)
    * @param {Object} params
    * @param {number} params.tabId ID da aba do WhatsApp Web
-   * @param {number} [params.timeoutMs=20000]
    * @returns {Promise<{ filename: string, bytes: Uint8Array }>}
    */
-  async waitForChatExport({ tabId, timeoutMs = 20000 }) {
+  async waitForChatExport({ tabId }) {
     // 1. Verifica se já temos dados capturados recentemente no Map
     if (this._capturedDataMap.size > 0) {
       const [firstUrl, data] = this._capturedDataMap.entries().next().value;
@@ -156,15 +151,9 @@ export class DownloadInterceptor {
       return data;
     }
 
-    // 2. Aguarda o evento de download ou a notificação de captura da página
+    // 2. Aguarda o evento de download ou a notificação de captura da página (sem limite de timeout)
     const downloadEvent = await new Promise((resolve, reject) => {
-      const timerId = setTimeout(() => {
-        const index = this._pendingDownloadResolvers.findIndex((r) => r.timerId === timerId);
-        if (index !== -1) this._pendingDownloadResolvers.splice(index, 1);
-        reject(new Error(`Timeout de ${timeoutMs}ms aguardando exportação do chat.`));
-      }, timeoutMs);
-
-      this._pendingDownloadResolvers.push({ resolve, reject, timerId });
+      this._pendingDownloadResolvers.push({ resolve, reject });
     });
 
     // Se já retornou com bytes (resolvido por registerCapturedBytes)

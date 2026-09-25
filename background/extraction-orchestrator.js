@@ -257,6 +257,7 @@ export class ExtractionOrchestrator {
         const exportTriggerResponse = await chrome.tabs.sendMessage(tab.id, {
           action: ACTIONS.EXPORT_CHAT_REQUEST,
           chat,
+          chatIndex: i,
           preloadHistory
         });
 
@@ -276,8 +277,7 @@ export class ExtractionOrchestrator {
         if (!capturedBytes) {
           try {
             const captured = await this.interceptor.waitForChatExport({
-              tabId: tab.id,
-              timeoutMs: 180000
+              tabId: tab.id
             });
             capturedFilename = captured.filename;
             capturedBytes = captured.bytes;
