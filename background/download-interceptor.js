@@ -74,7 +74,26 @@ export class DownloadInterceptor {
       const resolver = this._pendingDownloadResolvers.shift();
       clearTimeout(resolver.timerId);
       resolver.resolve({ filename, bytes: uint8 });
+      return; // Não armazena no mapa para não vazar para o próximo chat
     }
+
+    this._capturedDataMap.set(url, {
+      filename,
+      bytes: uint8,
+      timestamp: Date.now()
+    });
+  }
+
+  /**
+   * Limpa qualquer dado em cache ou promessas pendentes entre iterações de chats
+   */
+  clearPending() {
+    this._capturedDataMap.clear();
+    for (const { reject, timerId } of this._pendingDownloadResolvers) {
+      clearTimeout(timerId);
+      try { reject(new Error('Reset para nova conversa.')); } catch (_) {}
+    }
+    this._pendingDownloadResolvers = [];
   }
 
   /**
@@ -86,15 +105,19 @@ export class DownloadInterceptor {
     const url = downloadItem.url || '';
     const filename = downloadItem.filename || '';
 
-    // Verifica se o download é proveniente do WhatsApp Web
-    const isWhatsAppBlob = url.startsWith('blob:') || url.includes('web.whatsapp.com');
-    const isTxtOrZip = filename.toLowerCase().endsWith('.txt') || filename.toLowerCase().endsWith('.zip');
-
-    if (!isWhatsAppBlob && !isTxtOrZip) {
-      return; // Deixa outros downloads do usuário prosseguirem normalmente
+    // Se for o nosso próprio download consolidado final, NÃO cancela!
+    if (filename.startsWith('whatsapp_backup_') || url.startsWith('data:application/zip')) {
+      log.info(`Download master consolidado detectado (${filename}). Permitindo download.`);
+      return;
     }
 
-    log.info(`Download interceptado: id=${downloadItem.id}, url=${url.slice(0, 40)}..., filename=${filename}`);
+    // Verifica se o download é proveniente do WhatsApp Web
+    const isWhatsAppSource = url.startsWith('blob:') || url.includes('web.whatsapp.com');
+    if (!isWhatsAppSource) {
+      return; // Deixa downloads não relacionados ao WhatsApp prosseguirem normalmente
+    }
+
+    log.info(`Download nativo do WhatsApp interceptado: id=${downloadItem.id}, url=${url.slice(0, 40)}..., filename=${filename}`);
 
     // Cancela imediatamente para não gravar no diretório Downloads do usuário
     try {
@@ -114,6 +137,7 @@ export class DownloadInterceptor {
         url,
         filename: filename || 'conversa.txt'
       });
+      return;
     }
   }
 

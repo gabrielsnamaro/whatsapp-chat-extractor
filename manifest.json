@@ -25,6 +25,7 @@
       "js": [
         "content/dom/chat-list-scanner.js",
         "content/dom/chat-navigator.js",
+        "content/dom/chat-history-loader.js",
         "content/dom/chat-options-menu.js",
         "content/dom/export-modal-handler.js",
         "content/content.js"

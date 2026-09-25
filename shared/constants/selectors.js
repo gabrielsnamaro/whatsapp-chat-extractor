@@ -13,7 +13,9 @@ export const SELECTORS = Object.freeze({
 
   // Lista lateral de conversas (#pane-side)
   CHAT_LIST_CONTAINER: '#pane-side',
-  CHAT_CELL: '[data-testid="cell-frame-container"]',
+  CHAT_ROW: '#pane-side [role="row"]',
+  CHAT_CELL: '#pane-side [role="row"] [data-testid="cell-frame-container"]',
+  ARCHIVED_BUTTON: '[data-testid="chatlist-panel-archived-button"]',
   CHAT_TITLE: '[data-testid="cell-frame-title"]',
   CHAT_LAST_MESSAGE: '[data-testid="cell-frame-secondary"]',
   CHAT_TIMESTAMP: '[data-testid="cell-frame-primary-detail"]',
@@ -45,7 +47,9 @@ export const SELECTORS = Object.freeze({
   EXPORT_CANCEL_TEXT: 'Cancelar',
 
   // Histórico de mensagens
+  MESSAGES_CONTAINER: 'div[data-testid="conversation-panel-messages"]',
   MSG_CONTAINER: '[data-testid="msg-container"]',
   MSG_META: '[data-testid="msg-meta"]',
-  MSG_TEXT_COPYABLE: 'div.copyable-text'
+  MSG_TEXT_COPYABLE: 'div.copyable-text',
+  LOAD_EARLIER_BTN: 'div[data-testid="conversation-panel-messages"] button'
 });

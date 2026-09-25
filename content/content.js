@@ -10,6 +10,7 @@
   // Instâncias dos controladores de DOM de responsabilidade única
   const scanner = new (window.ChatListScanner || ChatListScanner)();
   const navigator = new (window.ChatNavigator || ChatNavigator)();
+  const historyLoader = new (window.ChatHistoryLoader || ChatHistoryLoader)();
   const optionsMenu = new (window.ChatOptionsMenu || ChatOptionsMenu)();
   const modalHandler = new (window.ExportModalHandler || ExportModalHandler)();
 
@@ -58,14 +59,41 @@
             // 1. Navegar até a conversa e aguardar montagem do cabeçalho
             await navigator.openChat(chat);
 
-            // 2. Acionar o menu suspenso e clicar em "Exportar conversa"
+            // 2. Se habilitado (padrão true), pré-carrega o histórico rolando até o início
+            const shouldPreload = message.preloadHistory !== false;
+            if (shouldPreload) {
+              console.log(`[WhatsApp Web Extractor] Pré-carregando histórico de mensagens para "${chat.title}"...`);
+              try {
+                const preloadResult = await historyLoader.preloadFullHistory({
+                  maxScrollCycles: message.maxScrollCycles ?? Infinity,
+                  cycleDelayMs: message.cycleDelayMs ?? 450,
+                  timeoutMs: message.preloadTimeoutMs ?? Infinity
+                });
+                console.log(`[WhatsApp Web Extractor] Pré-carregamento finalizado (${preloadResult.finalCount} mensagens em tela).`);
+              } catch (preloadErr) {
+                console.warn('[WhatsApp Web Extractor] Aviso: falha durante pré-carregamento do histórico:', preloadErr);
+              }
+            }
+
+            // 3. Prepara a promessa para capturar o download que será gerado por este chat
+            const downloadPromise = waitForNextExportDownload(180000);
+
+            // 4. Acionar o menu suspenso e clicar em "Exportar conversa"
             await optionsMenu.triggerExportOption();
 
-            // 3. Confirmar o modal nativo com "Todas as mensagens"
+            // 5. Confirmar o modal nativo com "Todas as mensagens"
             await modalHandler.confirmExport();
 
-            console.log(`[WhatsApp Web Extractor] Solicitação de exportação disparada com sucesso para "${chat.title}".`);
-            sendResponse({ success: true, chatTitle: chat.title });
+            // 6. Aguarda a captura do arquivo gerado para ESTE chat
+            const captured = await downloadPromise;
+
+            console.log(`[WhatsApp Web Extractor] Arquivo capturado com sucesso para "${chat.title}": ${captured.filename} (${(captured.bytes.length / 1024).toFixed(1)} KB)`);
+            sendResponse({
+              success: true,
+              chatTitle: chat.title,
+              filename: captured.filename,
+              bytes: captured.bytes
+            });
             return;
           }
 
@@ -108,22 +136,57 @@
     return true; // Mantém o canal de resposta assíncrona aberto
   });
 
+  let activeExportResolver = null;
+
+  /**
+   * Aguarda a captura do próximo download gerado pelo WhatsApp Web
+   * @param {number} [timeoutMs=30000]
+   * @returns {Promise<{ success: boolean, filename: string, bytes: Array<number> }>}
+   */
+  function waitForNextExportDownload(timeoutMs = 30000) {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        activeExportResolver = null;
+        reject(new Error(`Timeout de ${timeoutMs}ms aguardando exportação do chat pelo WhatsApp.`));
+      }, timeoutMs);
+
+      activeExportResolver = (data) => {
+        clearTimeout(timer);
+        activeExportResolver = null;
+        resolve(data);
+      };
+    });
+  }
+
   // Escuta no DOM para capturar imediatamente cliques em links de download com blob:
   document.addEventListener('click', async (event) => {
     try {
       const anchor = event.target?.closest?.('a[download]');
       if (anchor && anchor.href && anchor.href.startsWith('blob:')) {
         console.log('[WhatsApp Web Extractor] Link de download interceptado no DOM:', anchor.download);
+
+        // Impede que o navegador abra a janela de download nativa para este chat individual
+        event.preventDefault();
+        event.stopPropagation();
+        event.stopImmediatePropagation();
+
         const res = await fetch(anchor.href);
         const buffer = await res.arrayBuffer();
         const bytes = Array.from(new Uint8Array(buffer));
+        const filename = anchor.download || 'conversa.txt';
 
+        // Entrega direta para o comando EXPORT_CHAT_REQUEST em andamento
+        if (activeExportResolver) {
+          activeExportResolver({ success: true, filename, bytes });
+        }
+
+        // Notifica o background caso o DownloadInterceptor queira registrar como fallback
         chrome.runtime.sendMessage({
           action: 'BLOB_CAPTURED_FROM_PAGE',
           url: anchor.href,
-          filename: anchor.download || 'conversa.txt',
+          filename,
           bytes
-        });
+        }).catch(() => {});
       }
     } catch (err) {
       console.warn('[WhatsApp Web Extractor] Erro ao pré-capturar blob do clique:', err);

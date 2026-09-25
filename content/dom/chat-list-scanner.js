@@ -14,7 +14,9 @@ class ChatListScanner {
   constructor(options = {}) {
     this.selectors = {
       container: '#pane-side',
-      cell: '[data-testid="cell-frame-container"]',
+      row: '[role="row"]',
+      cell: '[role="row"] [data-testid="cell-frame-container"]',
+      archivedButton: '[data-testid="chatlist-panel-archived-button"]',
       title: '[data-testid="cell-frame-title"]',
       lastMessage: '[data-testid="cell-frame-secondary"]',
       timestamp: '[data-testid="cell-frame-primary-detail"]',
@@ -56,11 +58,20 @@ class ChatListScanner {
     const cells = pane.querySelectorAll(this.selectors.cell);
     const chats = [];
 
-    cells.forEach((cell, index) => {
+    cells.forEach((cell) => {
+      // Validação semântica: ignora botões/pastas fora da grade virtual de conversas (ex: Arquivadas)
+      if (!cell.closest(this.selectors.row)) return;
+      if (cell.closest(this.selectors.archivedButton)) return;
+
       const titleEl = cell.querySelector(this.selectors.title);
       const title = titleEl ? titleEl.textContent.trim() : null;
 
       if (!title) return;
+
+      // Conversas reais possuem histórico/prévia ou marcação de tempo
+      const hasMessagePreview = Boolean(cell.querySelector(this.selectors.lastMessage));
+      const hasTimestamp = Boolean(cell.querySelector(this.selectors.timestamp));
+      if (!hasMessagePreview && !hasTimestamp) return;
 
       const unreadEl = cell.querySelector(this.selectors.unreadBadge);
       const timestampEl = cell.querySelector(this.selectors.timestamp);

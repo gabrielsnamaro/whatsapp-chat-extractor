@@ -2,6 +2,7 @@ import { WORKFLOW_STATES } from '../shared/constants/workflow-states.js';
 import { ACTIONS } from '../shared/constants/actions.js';
 import { StagingRepository } from '../shared/storage/staging-repository.js';
 import { ZipBuilder } from '../shared/archive/zip-builder.js';
+import { ZipReader } from '../shared/archive/zip-reader.js';
 import { DownloadInterceptor } from './download-interceptor.js';
 import { StorageClient } from '../shared/clients/storage-client.js';
 import { Logger } from '../shared/utils/logger.js';
@@ -171,9 +172,10 @@ export class ExtractionOrchestrator {
    * @param {number|null} [options.maxChats=null] Limite máximo de chats (para testes)
    * @param {boolean} [options.downloadAll=true] Se true, desconsidera maxChats e extrai todos
    * @param {number} [options.safeDelayMs=2000] Intervalo de segurança anti-ban entre conversas
+   * @param {boolean} [options.preloadHistory=true] Se true, rola o histórico até o topo antes de exportar
    * @returns {Promise<Object>}
    */
-  async start({ maxChats = null, downloadAll = true, safeDelayMs = 2000 } = {}) {
+  async start({ maxChats = null, downloadAll = true, safeDelayMs = 2000, preloadHistory = true } = {}) {
     if (this.state !== WORKFLOW_STATES.IDLE && this.state !== WORKFLOW_STATES.COMPLETED && this.state !== WORKFLOW_STATES.FAILED && this.state !== WORKFLOW_STATES.CANCELLED) {
       throw new Error(`Orquestrador já em execução no estado ${this.state}`);
     }
@@ -248,37 +250,60 @@ export class ExtractionOrchestrator {
 
         log.info(`[${this.currentIndex}/${this.totalChats}] Exportando conversa "${chat.title}"...`);
 
+        // Limpa qualquer cache do interceptador para isolamento total entre conversas
+        this.interceptor.clearPending();
+
         // Dispara exportação no DOM via Content Script
         const exportTriggerResponse = await chrome.tabs.sendMessage(tab.id, {
           action: ACTIONS.EXPORT_CHAT_REQUEST,
-          chat
+          chat,
+          preloadHistory
         });
 
         if (!exportTriggerResponse || !exportTriggerResponse.success) {
-          log.warn(`Aviso: falha ao acionar exportação no chat "${chat.title}":`, exportTriggerResponse?.error);
-          continue; // Prossegue para o próximo chat para não travar o lote inteiro
+          const errMsg = exportTriggerResponse?.error || 'Erro desconhecido na página';
+          log.warn(`Falha ao acionar exportação no chat "${chat.title}":`, errMsg);
+          this._notifyProgress({
+            warningMessage: `[${this.currentIndex}/${this.totalChats}] ⚠️ Falha ao abrir "${chat.title}": ${errMsg}`
+          });
+          continue; // Prossegue para o próximo chat
         }
 
-        // Aguarda a captura do arquivo pelo interceptador
-        try {
-          const captured = await this.interceptor.waitForChatExport({
-            tabId: tab.id,
-            timeoutMs: 25000
-          });
+        let capturedFilename = exportTriggerResponse.filename;
+        let capturedBytes = exportTriggerResponse.bytes ? new Uint8Array(exportTriggerResponse.bytes) : null;
 
-          // Grava no StagingRepository (IndexedDB)
-          await StagingRepository.saveChatFile({
-            chatId: chat.id,
-            chatTitle: chat.title,
-            filename: captured.filename,
-            blob: captured.bytes
-          });
-
-          log.info(`Chat "${chat.title}" armazenado com sucesso no staging.`);
-        } catch (captureErr) {
-          log.error(`Erro ao capturar arquivo do chat "${chat.title}":`, captureErr);
-          // Continua para os próximos chats
+        // Fallback: se o content script não tiver retornado os bytes diretamente, aguarda pelo interceptador
+        if (!capturedBytes) {
+          try {
+            const captured = await this.interceptor.waitForChatExport({
+              tabId: tab.id,
+              timeoutMs: 180000
+            });
+            capturedFilename = captured.filename;
+            capturedBytes = captured.bytes;
+          } catch (captureErr) {
+            log.error(`Erro ao capturar arquivo do chat "${chat.title}":`, captureErr);
+            this._notifyProgress({
+              warningMessage: `[${this.currentIndex}/${this.totalChats}] ⚠️ Falha ao capturar download de "${chat.title}": ${captureErr.message}`
+            });
+            continue;
+          }
         }
+
+        this.interceptor.clearPending();
+
+        // Grava no StagingRepository (IndexedDB)
+        await StagingRepository.saveChatFile({
+          chatId: chat.id,
+          chatTitle: chat.title,
+          filename: capturedFilename,
+          blob: capturedBytes
+        });
+
+        log.info(`Chat "${chat.title}" armazenado com sucesso no staging.`);
+        this._notifyProgress({
+          infoMessage: `[${this.currentIndex}/${this.totalChats}] ✅ "${chat.title}" salvo com sucesso.`
+        });
 
         // Intervalo de segurança anti-ban entre chats sucessivos
         if (i < this.chatsQueue.length - 1) {
@@ -287,6 +312,8 @@ export class ExtractionOrchestrator {
         }
       }
 
+      // Pequena pausa para garantir que eventuais eventos residuais de download do último chat sejam processados
+      await this._sleep(500);
       this.interceptor.stopListening();
 
       if (this.isCancelled) {
@@ -295,7 +322,9 @@ export class ExtractionOrchestrator {
 
       // 4. FASE DE EMPACOTAMENTO EM ZIP CONSOLIDADO (PACKAGING)
       this.state = WORKFLOW_STATES.PACKAGING;
-      this._notifyProgress();
+      this._notifyProgress({
+        infoMessage: `Empacotando conversas em arquivo ZIP master consolidado...`
+      });
       log.info('Compilando arquivo ZIP master consolidado...');
 
       const stagedFiles = await StagingRepository.getAllFiles();
@@ -306,8 +335,66 @@ export class ExtractionOrchestrator {
       const dateStr = new Date().toISOString().slice(0, 10);
       const archiveFilename = `whatsapp_backup_${dateStr}.zip`;
 
-      const zipBlob = await ZipBuilder.buildArchive(stagedFiles, {
-        archiveName: archiveFilename
+      const usedFolders = new Set();
+      const filesToArchive = [];
+
+      for (let idx = 0; idx < stagedFiles.length; idx++) {
+        const item = stagedFiles[idx];
+        const safeTitle = String(item.chatTitle || item.chatId || `chat_${idx + 1}`)
+          .replace(/[\\/:*?"<>|]/g, '_')
+          .trim();
+
+        // Garante que o nome da pasta de cada chat seja único no ZIP mestre
+        let folderName = safeTitle;
+        let counter = 1;
+        while (usedFolders.has(folderName.toLowerCase())) {
+          folderName = `${safeTitle}_${counter}`;
+          counter++;
+        }
+        usedFolders.add(folderName.toLowerCase());
+
+        const chatBytes = item.blob;
+
+        // Se o arquivo for um .ZIP exportado pelo WhatsApp Web:
+        // Descompacta as entradas e organiza os arquivos diretamente dentro da pasta do chat
+        if (ZipReader.isZip(chatBytes)) {
+          try {
+            const extracted = await ZipReader.extractEntries(chatBytes);
+            log.info(`Chat "${folderName}": ${extracted.length} arquivo(s) extraído(s) do ZIP nativo.`);
+
+            for (const entry of extracted) {
+              let innerName = entry.path.replace(/[\\:*?"<>|]/g, '_').trim();
+              // Normaliza o nome do arquivo de mensagens para conversa.txt
+              if (innerName.toLowerCase() === '_chat.txt' || innerName.toLowerCase() === 'chat.txt') {
+                innerName = 'conversa.txt';
+              }
+
+              filesToArchive.push({
+                path: `${folderName}/${innerName}`,
+                content: entry.content
+              });
+            }
+          } catch (extractErr) {
+            log.warn(`Falha ao descompactar ZIP nativo de "${folderName}"; mantendo arquivo bruto:`, extractErr);
+            filesToArchive.push({
+              path: `${folderName}/conversa.txt`,
+              content: chatBytes
+            });
+          }
+        } else {
+          // Se o WhatsApp exportou diretamente como texto puro .txt (sem mídias)
+          filesToArchive.push({
+            path: `${folderName}/conversa.txt`,
+            content: chatBytes
+          });
+        }
+      }
+
+      const zipBlob = await ZipBuilder.buildArchive(filesToArchive, {
+        archiveName: archiveFilename,
+        onProgress: (current, total, name) => {
+          log.info(`Empacotando [${current}/${total}]: ${name}`);
+        }
       });
 
       const zipArrayBuffer = await zipBlob.arrayBuffer();
@@ -326,7 +413,9 @@ export class ExtractionOrchestrator {
       await StagingRepository.clear();
       this.state = WORKFLOW_STATES.COMPLETED;
       this.currentChatTitle = 'Concluído';
-      this._notifyProgress();
+      this._notifyProgress({
+        infoMessage: `🎉 Concluído com sucesso! Backup único salvo: ${archiveFilename} (${stagedFiles.length} chats).`
+      });
       log.info('Fluxo de extração em lote concluído com sucesso!');
 
       return {

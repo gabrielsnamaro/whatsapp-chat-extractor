@@ -92,6 +92,26 @@ class ChatOptionsMenu {
   }
 
   /**
+   * Dispara a sequência real de eventos de mouse que o React escuta no WhatsApp Web
+   * @private
+   * @param {HTMLElement} element
+   */
+  _simulateClick(element) {
+    if (!element) return;
+    try { element.focus(); } catch (_) {}
+    const rect = element.getBoundingClientRect();
+    const clientX = Math.round(rect.left + rect.width / 2);
+    const clientY = Math.round(rect.top + rect.height / 2);
+    const baseInit = { bubbles: true, cancelable: true, view: window, clientX, clientY };
+    try { element.dispatchEvent(new PointerEvent('pointerdown', { ...baseInit, pointerId: 1, pointerType: 'mouse', isPrimary: true, button: 0, buttons: 1 })); } catch (_) {}
+    try { element.dispatchEvent(new MouseEvent('mousedown', { ...baseInit, button: 0, buttons: 1 })); } catch (_) {}
+    try { element.dispatchEvent(new PointerEvent('pointerup', { ...baseInit, pointerId: 1, pointerType: 'mouse', isPrimary: true, button: 0, buttons: 0 })); } catch (_) {}
+    try { element.dispatchEvent(new MouseEvent('mouseup', { ...baseInit, button: 0, buttons: 0 })); } catch (_) {}
+    try { element.dispatchEvent(new MouseEvent('click', { ...baseInit, button: 0, buttons: 0 })); } catch (_) {}
+    try { element.click(); } catch (_) {}
+  }
+
+  /**
    * Clica no botão de opções e seleciona "Exportar conversa"
    * @returns {Promise<{ success: boolean }>}
    */
@@ -102,7 +122,7 @@ class ChatOptionsMenu {
     }
 
     // Abre o menu de opções
-    btn.click();
+    this._simulateClick(btn);
 
     // Aguarda o menu aparecer
     const menu = await this._waitForMenu();
@@ -116,7 +136,7 @@ class ChatOptionsMenu {
     }
 
     // Dispara clique na opção de exportação
-    exportItem.click();
+    this._simulateClick(exportItem);
     await this._sleep(200);
 
     return { success: true };

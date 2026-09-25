@@ -94,6 +94,26 @@ class ExportModalHandler {
   }
 
   /**
+   * Dispara a sequência real de eventos de mouse que o React escuta no WhatsApp Web
+   * @private
+   * @param {HTMLElement} element
+   */
+  _simulateClick(element) {
+    if (!element) return;
+    try { element.focus(); } catch (_) {}
+    const rect = element.getBoundingClientRect();
+    const clientX = Math.round(rect.left + rect.width / 2);
+    const clientY = Math.round(rect.top + rect.height / 2);
+    const baseInit = { bubbles: true, cancelable: true, view: window, clientX, clientY };
+    try { element.dispatchEvent(new PointerEvent('pointerdown', { ...baseInit, pointerId: 1, pointerType: 'mouse', isPrimary: true, button: 0, buttons: 1 })); } catch (_) {}
+    try { element.dispatchEvent(new MouseEvent('mousedown', { ...baseInit, button: 0, buttons: 1 })); } catch (_) {}
+    try { element.dispatchEvent(new PointerEvent('pointerup', { ...baseInit, pointerId: 1, pointerType: 'mouse', isPrimary: true, button: 0, buttons: 0 })); } catch (_) {}
+    try { element.dispatchEvent(new MouseEvent('mouseup', { ...baseInit, button: 0, buttons: 0 })); } catch (_) {}
+    try { element.dispatchEvent(new MouseEvent('click', { ...baseInit, button: 0, buttons: 0 })); } catch (_) {}
+    try { element.click(); } catch (_) {}
+  }
+
+  /**
    * Confirma a exportação no modal (seleciona todas as mensagens e clica em Exportar)
    * @returns {Promise<{ success: boolean }>}
    */
@@ -110,7 +130,7 @@ class ExportModalHandler {
       throw new Error('Botão de confirmação de exportação não encontrado no modal.');
     }
 
-    confirmBtn.click();
+    this._simulateClick(confirmBtn);
 
     // Aguarda o modal fechar ou iniciar processamento
     const startTime = Date.now();

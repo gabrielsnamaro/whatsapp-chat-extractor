@@ -43,6 +43,9 @@ export class ZipBuilder {
     if (data instanceof Uint8Array) {
       return data;
     }
+    if (Array.isArray(data)) {
+      return new Uint8Array(data);
+    }
     return new Uint8Array(0);
   }
 
@@ -86,6 +89,7 @@ export class ZipBuilder {
    * @returns {string}
    */
   static sanitizeZipPath(path) {
+    if (!path || typeof path !== 'string') return 'arquivo.txt';
     return path
       .replace(/[\\:*?"<>|]/g, '_')
       .replace(/^\/+/, '');
@@ -93,7 +97,7 @@ export class ZipBuilder {
 
   /**
    * Compila um arquivo .ZIP a partir de uma lista de arquivos
-   * @param {Array<{ path: string, content: string|Blob|ArrayBuffer|Uint8Array }>} files
+   * @param {Array<{ path?: string, filename?: string, content?: any, blob?: any }>} files
    * @param {Object} [options={}]
    * @param {function(number, number, string): void} [options.onProgress] Callback de progresso
    * @returns {Promise<Blob>}
@@ -107,14 +111,16 @@ export class ZipBuilder {
 
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
-      const sanitizedPath = this.sanitizeZipPath(file.path);
+      const rawPath = file.path || file.filename || `arquivo_${i + 1}.txt`;
+      const rawContent = file.content !== undefined ? file.content : (file.blob || '');
+      const sanitizedPath = this.sanitizeZipPath(rawPath);
       const pathBytes = new TextEncoder().encode(sanitizedPath);
 
       if (options.onProgress) {
         options.onProgress(i + 1, files.length, sanitizedPath);
       }
 
-      const rawBytes = await this._toUint8Array(file.content);
+      const rawBytes = await this._toUint8Array(rawContent);
       const uncompressedSize = rawBytes.length;
       const crc = calculateCrc32(rawBytes);
 
