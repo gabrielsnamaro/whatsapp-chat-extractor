@@ -16,7 +16,8 @@ class ChatNavigator {
       archivedButton: '[data-testid="chatlist-panel-archived-button"]',
       title: '[data-testid="cell-frame-title"]',
       mainHeader: '#main header',
-      mainHeaderTitle: '#main header span[dir="auto"]',
+      mainHeaderTitle: '#main header [data-testid="conversation-info-header-chat-title"]',
+      mainHeaderTitleFallback: '#main header span[dir="auto"]',
       ...options.selectors
     };
   }
@@ -32,49 +33,58 @@ class ChatNavigator {
   }
 
   /**
-   * Normaliza textos de título removendo caracteres de controle invisíveis, espaços e emojis residuais
+   * Normaliza títulos para comparação exata: forma NFC, sem caracteres invisíveis
+   * (inclusive seletores de variação de emoji), espaços colapsados e caixa baixa
    * @private
    * @param {string} str
    * @returns {string}
    */
-  _cleanTitle(str) {
+  _normalizeTitle(str) {
     if (!str || typeof str !== 'string') return '';
     return str
-      .replace(/[\u200B-\u200D\uFEFF\u200E\u200F\u202A-\u202E]/g, '')
+      .normalize('NFC')
+      .replace(/[\u200B-\u200D\uFEFF\u200E\u200F\u202A-\u202E\uFE0E\uFE0F]/g, '')
       .replace(/\s+/g, ' ')
       .trim()
       .toLowerCase();
   }
 
   /**
-   * Compara dois títulos com múltiplos níveis de tolerância (exato, parcial e alfanumérico)
+   * Compara dois títulos por igualdade exata após normalização.
+   * Comparação parcial foi descartada porque fazia "Ana" casar com "Mariana"
+   * e exportar a conversa errada sob o nome da esperada.
    * @private
    * @param {string} candidateTitle
    * @param {string} targetTitle
    * @returns {boolean}
    */
   _isTitleMatch(candidateTitle, targetTitle) {
-    if (!candidateTitle || !targetTitle) return false;
-    const cleanCand = this._cleanTitle(candidateTitle);
-    const cleanTarg = this._cleanTitle(targetTitle);
-    if (!cleanCand || !cleanTarg) return false;
+    const cleanCand = this._normalizeTitle(candidateTitle);
+    const cleanTarg = this._normalizeTitle(targetTitle);
+    return Boolean(cleanCand) && cleanCand === cleanTarg;
+  }
 
-    // 1. Match exato ou inclusão direta
-    if (cleanCand === cleanTarg || cleanCand.includes(cleanTarg) || cleanTarg.includes(cleanCand)) {
-      return true;
-    }
-
-    // 2. Match alfanumérico puro (ignora emojis, pontuações e formatações de telefone)
-    const alphaCand = cleanCand.replace(/[^a-z0-9]/gi, '');
-    const alphaTarg = cleanTarg.replace(/[^a-z0-9]/gi, '');
-    if (alphaCand && alphaTarg) {
-      if (alphaCand === alphaTarg) return true;
-      if (alphaTarg.length >= 3 && (alphaCand.includes(alphaTarg) || alphaTarg.includes(alphaCand))) {
-        return true;
+  /**
+   * Lê o texto visível de um elemento incluindo emojis, que o WhatsApp Web
+   * renderiza como <img alt="🤓"> e por isso somem do textContent
+   * @private
+   * @param {HTMLElement} element
+   * @returns {string}
+   */
+  _readTextWithEmojis(element) {
+    if (!element) return '';
+    let text = '';
+    const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT);
+    let node = walker.nextNode();
+    while (node) {
+      if (node.nodeType === Node.TEXT_NODE) {
+        text += node.nodeValue;
+      } else if (node.tagName === 'IMG' && node.alt) {
+        text += node.alt;
       }
+      node = walker.nextNode();
     }
-
-    return false;
+    return text;
   }
 
   /**
@@ -82,8 +92,10 @@ class ChatNavigator {
    * @returns {string|null}
    */
   getActiveChatTitle() {
-    const headerTitleEl = document.querySelector(this.selectors.mainHeaderTitle);
-    return headerTitleEl ? headerTitleEl.textContent.trim() : null;
+    const headerTitleEl = document.querySelector(this.selectors.mainHeaderTitle) ||
+                          document.querySelector(this.selectors.mainHeaderTitleFallback);
+    if (!headerTitleEl) return null;
+    return (headerTitleEl.getAttribute('title') || this._readTextWithEmojis(headerTitleEl)).trim() || null;
   }
 
   /**
@@ -104,16 +116,11 @@ class ChatNavigator {
       const titleEl = cell.querySelector(this.selectors.title);
       if (!titleEl) continue;
 
-      // Obtém o título do atributo title ou textContent
+      // Mesma fonte usada pelo ChatListScanner: atributo title, com fallback para o texto com emojis
       const spanWithTitle = titleEl.querySelector('span[title]');
-      const rawTitleAttr = spanWithTitle ? spanWithTitle.getAttribute('title') : '';
-      const rawText = titleEl.textContent || '';
+      const cellTitle = spanWithTitle?.getAttribute('title') || this._readTextWithEmojis(titleEl);
 
-      if (
-        this._isTitleMatch(rawTitleAttr, targetTitle) ||
-        this._isTitleMatch(rawText, targetTitle) ||
-        this._isTitleMatch(cell.innerText, targetTitle)
-      ) {
+      if (this._isTitleMatch(cellTitle, targetTitle)) {
         return cell;
       }
     }
@@ -124,10 +131,9 @@ class ChatNavigator {
    * Localiza a célula da conversa no #pane-side com rolagem suave e limitada
    * @private
    * @param {string} targetTitle
-   * @param {number|null} [fallbackIndex=null] Índice ordinal na lista para fallback posicional
    * @returns {Promise<HTMLElement|null>}
    */
-  async _locateCellWithScroll(targetTitle, fallbackIndex = null) {
+  async _locateCellWithScroll(targetTitle) {
     // 1. Tenta encontrar imediatamente nas células visíveis
     let cell = this._findVisibleCellByTitle(targetTitle);
     if (cell) return cell;
@@ -167,21 +173,8 @@ class ChatNavigator {
       lastScrollTop = pane.scrollTop;
     }
 
-    // 4. Fallback posicional por índice (se o chat procurado for o 3º da fila, pega a 3ª linha visível do topo)
-    if (fallbackIndex != null && fallbackIndex >= 0) {
-      console.warn(`[ChatNavigator] Chat "${targetTitle}" não localizado por nome. Tentando fallback posicional por índice (${fallbackIndex})...`);
-      pane.scrollTop = 0;
-      await this._sleep(300);
-
-      const rows = Array.from(pane.querySelectorAll(this.selectors.row))
-        .filter(r => !r.closest(this.selectors.archivedButton));
-
-      if (rows[fallbackIndex]) {
-        const fallbackCell = rows[fallbackIndex].querySelector(this.selectors.cell) || rows[fallbackIndex];
-        return fallbackCell;
-      }
-    }
-
+    // Sem fallback por posição: a lista é virtualizada e reordena com mensagens novas,
+    // então clicar na N-ésima linha exportaria outra conversa sob o nome desta.
     return null;
   }
 
@@ -249,9 +242,8 @@ class ChatNavigator {
    * @param {string} [chat.title]
    * @returns {Promise<{ success: boolean, title: string }>}
    */
-  async openChat(chat, fallbackIndex = null) {
+  async openChat(chat) {
     const targetTitle = typeof chat === 'string' ? chat : chat?.title;
-    const targetIndex = fallbackIndex ?? (typeof chat === 'object' ? chat?.index : null);
 
     if (!targetTitle) {
       throw new Error('Título da conversa não fornecido ao ChatNavigator.');
@@ -271,8 +263,8 @@ class ChatNavigator {
       return { success: true, title: targetTitle };
     }
 
-    // 3. Localiza a célula da conversa no #pane-side com suporte a fallback posicional
-    const cellElement = await this._locateCellWithScroll(targetTitle, targetIndex);
+    // 3. Localiza a célula da conversa no #pane-side por título exato
+    const cellElement = await this._locateCellWithScroll(targetTitle);
     if (!cellElement) {
       throw new Error(`Conversa "${targetTitle}" não foi encontrada na lista lateral.`);
     }
