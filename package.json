@@ -5,7 +5,7 @@
   "main": "background/service-worker.js",
   "type": "module",
   "scripts": {
-    "test": "echo \"No test specified\" && exit 0"
+    "test": "node --test tests/"
   },
   "keywords": [
     "chrome-extension",

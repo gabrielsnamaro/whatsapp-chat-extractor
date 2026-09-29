@@ -36,42 +36,63 @@ export class StagingRepository {
   }
 
   /**
-   * Salva ou atualiza um arquivo de exportação de chat no IndexedDB
+   * Executa uma requisição em uma transação e fecha a conexão ao final
+   * @private
+   * @param {'readonly'|'readwrite'} mode
+   * @param {function(IDBObjectStore): IDBRequest} buildRequest
+   * @returns {Promise<any>}
+   */
+  static async _run(mode, buildRequest) {
+    const db = await this._openDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, mode);
+      const req = buildRequest(tx.objectStore(STORE_NAME));
+      let result;
+      req.onsuccess = () => { result = req.result; };
+      tx.oncomplete = () => { db.close(); resolve(result); };
+      tx.onerror = () => { db.close(); reject(tx.error || req.error); };
+      tx.onabort = () => { db.close(); reject(tx.error || new Error('Transação do IndexedDB abortada.')); };
+    });
+  }
+
+  /**
+   * Salva ou atualiza um arquivo de exportação de chat no IndexedDB.
+   * Lança erro em caso de falha: um chat não gravado não pode ser reportado como salvo.
    * @param {Object} entry
-   * @param {string} entry.chatId Identificador do chat
+   * @param {string} entry.chatId Chave do registro (a ordem das chaves define a ordem no ZIP)
    * @param {string} entry.chatTitle Título ou nome do contato/grupo
    * @param {string} entry.filename Nome do arquivo original (ex: conversa.txt ou chat.zip)
-   * @param {Blob|ArrayBuffer} entry.blob Conteúdo binário
-   * @returns {Promise<boolean>}
+   * @param {Blob|Uint8Array} entry.blob Conteúdo binário
+   * @returns {Promise<void>}
    */
   static async saveChatFile({ chatId, chatTitle, filename, blob }) {
-    try {
-      const db = await this._openDb();
-      return new Promise((resolve, reject) => {
-        const tx = db.transaction(STORE_NAME, 'readwrite');
-        const store = tx.objectStore(STORE_NAME);
+    const record = {
+      chatId,
+      chatTitle: chatTitle || chatId,
+      filename: filename || `${chatId}.txt`,
+      blob,
+      size: blob.size ?? blob.byteLength ?? 0,
+      createdAt: new Date().toISOString()
+    };
+    await this._run('readwrite', (store) => store.put(record));
+    log.info(`Chat "${record.chatTitle}" (${(record.size / 1024).toFixed(1)} KB) armazenado no staging.`);
+  }
 
-        const record = {
-          chatId,
-          chatTitle: chatTitle || chatId,
-          filename: filename || `${chatId}.txt`,
-          blob,
-          size: blob.size || (blob.byteLength ?? 0),
-          createdAt: new Date().toISOString()
-        };
+  /**
+   * Lista as chaves dos registros em ordem crescente
+   * @returns {Promise<string[]>}
+   */
+  static async listKeys() {
+    return (await this._run('readonly', (store) => store.getAllKeys())) || [];
+  }
 
-        const req = store.put(record);
-        req.onsuccess = () => {
-          log.info(`Chat "${record.chatTitle}" (${(record.size / 1024).toFixed(1)} KB) armazenado no staging.`);
-          resolve(true);
-        };
-        req.onerror = () => reject(req.error);
-        tx.oncomplete = () => db.close();
-      });
-    } catch (err) {
-      log.error(`Erro ao salvar arquivo do chat ${chatId}:`, err);
-      return false;
-    }
+  /**
+   * Lê um único registro, para processar o staging item a item sem carregar tudo na memória
+   * @param {string} chatId
+   * @returns {Promise<Object|undefined>}
+   */
+  static async getFile(chatId) {
+    return this._run('readonly', (store) => store.get(chatId));
   }
 
   /**
