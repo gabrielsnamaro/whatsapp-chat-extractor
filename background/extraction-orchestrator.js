@@ -607,7 +607,8 @@ export class ExtractionOrchestrator {
       return;
     }
 
-    await StagingRepository.clear();
+    // O ZIP já foi salvo: uma falha na limpeza não invalida a execução
+    await StagingRepository.clear().catch((err) => log.warn('Falha ao limpar o staging após o download:', err));
     this._setPhase(WORKFLOW_STATES.COMPLETED);
     this.currentChatTitle = 'Concluído';
     this.statusMessage = `Backup salvo: ${archiveFilename} (${formatSize(outcome.size)}). ` +

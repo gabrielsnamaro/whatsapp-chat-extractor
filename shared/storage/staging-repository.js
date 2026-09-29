@@ -96,71 +96,12 @@ export class StagingRepository {
   }
 
   /**
-   * Retorna todos os arquivos armazenados no staging
-   * @returns {Promise<Array<Object>>}
-   */
-  static async getAllFiles() {
-    try {
-      const db = await this._openDb();
-      return new Promise((resolve, reject) => {
-        const tx = db.transaction(STORE_NAME, 'readonly');
-        const store = tx.objectStore(STORE_NAME);
-        const req = store.getAll();
-
-        req.onsuccess = () => resolve(req.result || []);
-        req.onerror = () => reject(req.error);
-        tx.oncomplete = () => db.close();
-      });
-    } catch (err) {
-      log.error('Erro ao listar arquivos do staging:', err);
-      return [];
-    }
-  }
-
-  /**
-   * Retorna a quantidade total de chats armazenados no staging
-   * @returns {Promise<number>}
-   */
-  static async count() {
-    try {
-      const db = await this._openDb();
-      return new Promise((resolve, reject) => {
-        const tx = db.transaction(STORE_NAME, 'readonly');
-        const store = tx.objectStore(STORE_NAME);
-        const req = store.count();
-
-        req.onsuccess = () => resolve(req.result || 0);
-        req.onerror = () => reject(req.error);
-        tx.oncomplete = () => db.close();
-      });
-    } catch (err) {
-      log.error('Erro ao contar itens no staging:', err);
-      return 0;
-    }
-  }
-
-  /**
-   * Limpa todo o repositório temporário de staging
-   * @returns {Promise<boolean>}
+   * Limpa todo o repositório temporário de staging. Lança erro em caso de falha para
+   * que uma nova execução não misture arquivos da anterior.
+   * @returns {Promise<void>}
    */
   static async clear() {
-    try {
-      const db = await this._openDb();
-      return new Promise((resolve, reject) => {
-        const tx = db.transaction(STORE_NAME, 'readwrite');
-        const store = tx.objectStore(STORE_NAME);
-        const req = store.clear();
-
-        req.onsuccess = () => {
-          log.info('Repositório de staging limpo com sucesso.');
-          resolve(true);
-        };
-        req.onerror = () => reject(req.error);
-        tx.oncomplete = () => db.close();
-      });
-    } catch (err) {
-      log.error('Erro ao limpar staging:', err);
-      return false;
-    }
+    await this._run('readwrite', (store) => store.clear());
+    log.info('Repositório de staging limpo com sucesso.');
   }
 }
