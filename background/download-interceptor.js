@@ -108,6 +108,12 @@ export class DownloadInterceptor {
       return;
     }
 
+    // REGRA: Se o interceptador não estiver ativo ou não houver promessa aguardando exportação,
+    // não interfere de forma alguma! Permite que downloads manuais do usuário ocorram normalmente.
+    if (!this.isListening || this._pendingDownloadResolvers.length === 0) {
+      return;
+    }
+
     // Verifica se o download é proveniente do WhatsApp Web
     const isWhatsAppSource = url.startsWith('blob:') || url.includes('web.whatsapp.com');
     if (!isWhatsAppSource) {

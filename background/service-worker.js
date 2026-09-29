@@ -51,11 +51,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
       // Controle da extração em lote (Popup -> Orchestrator)
       if (message.action === ACTIONS.START_BATCH_EXTRACTION) {
-        const { maxChats, downloadAll, safeDelayMs, preloadHistory } = message;
-        log.info(`Iniciando extração em lote (maxChats: ${maxChats}, downloadAll: ${downloadAll}, preloadHistory: ${preloadHistory ?? true})...`);
+        const { maxChats, downloadAll, safeDelayMs } = message;
+        log.info(`Iniciando extração em lote (maxChats: ${maxChats}, downloadAll: ${downloadAll})...`);
 
         // Responde de imediato ao popup e executa o orquestrador em segundo plano
-        orchestrator.start({ maxChats, downloadAll, safeDelayMs, preloadHistory }).catch((err) => {
+        orchestrator.start({ maxChats, downloadAll, safeDelayMs }).catch((err) => {
           log.error('Erro na execução da extração em lote:', err);
         });
 

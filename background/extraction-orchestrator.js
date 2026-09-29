@@ -172,10 +172,9 @@ export class ExtractionOrchestrator {
    * @param {number|null} [options.maxChats=null] Limite máximo de chats (para testes)
    * @param {boolean} [options.downloadAll=true] Se true, desconsidera maxChats e extrai todos
    * @param {number} [options.safeDelayMs=2000] Intervalo de segurança anti-ban entre conversas
-   * @param {boolean} [options.preloadHistory=true] Se true, rola o histórico até o topo antes de exportar
    * @returns {Promise<Object>}
    */
-  async start({ maxChats = null, downloadAll = true, safeDelayMs = 2000, preloadHistory = true } = {}) {
+  async start({ maxChats = null, downloadAll = true, safeDelayMs = 2000 } = {}) {
     if (this.state !== WORKFLOW_STATES.IDLE && this.state !== WORKFLOW_STATES.COMPLETED && this.state !== WORKFLOW_STATES.FAILED && this.state !== WORKFLOW_STATES.CANCELLED) {
       throw new Error(`Orquestrador já em execução no estado ${this.state}`);
     }
@@ -237,11 +236,15 @@ export class ExtractionOrchestrator {
       for (let i = 0; i < this.chatsQueue.length; i++) {
         if (this.isCancelled) {
           log.info('Fluxo cancelado durante a fila.');
+          this.interceptor.stopListening();
           return { success: false, cancelled: true };
         }
 
         await this._waitResumeIfPaused();
-        if (this.isCancelled) return { success: false, cancelled: true };
+        if (this.isCancelled) {
+          this.interceptor.stopListening();
+          return { success: false, cancelled: true };
+        }
 
         const chat = this.chatsQueue[i];
         this.currentIndex = i + 1;
@@ -257,8 +260,7 @@ export class ExtractionOrchestrator {
         const exportTriggerResponse = await chrome.tabs.sendMessage(tab.id, {
           action: ACTIONS.EXPORT_CHAT_REQUEST,
           chat,
-          chatIndex: i,
-          preloadHistory
+          chatIndex: i
         });
 
         if (!exportTriggerResponse || !exportTriggerResponse.success) {
@@ -417,6 +419,7 @@ export class ExtractionOrchestrator {
         infoMessage: `🎉 Concluído com sucesso! Backup único salvo: ${archiveFilename} (${stagedFiles.length} chats).`
       });
       log.info('Fluxo de extração em lote concluído com sucesso!');
+      this.interceptor.stopListening();
 
       return {
         success: true,
