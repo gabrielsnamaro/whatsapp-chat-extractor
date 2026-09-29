@@ -3,319 +3,259 @@
  * Responsabilidade Única: Localizar e selecionar uma conversa específica na lista
  * lateral e aguardar a renderização e confirmação do cabeçalho da conversa aberta.
  */
-class ChatNavigator {
-  /**
-   * @param {Object} [options]
-   * @param {Object} [options.selectors] Sobrescrita de seletores CSS
-   */
-  constructor(options = {}) {
-    this.selectors = {
-      container: '#pane-side',
-      row: '[role="row"]',
-      cell: '[role="row"] [data-testid="cell-frame-container"]',
-      archivedButton: '[data-testid="chatlist-panel-archived-button"]',
-      title: '[data-testid="cell-frame-title"]',
-      mainHeader: '#main header',
-      mainHeaderTitle: '#main header [data-testid="conversation-info-header-chat-title"]',
-      mainHeaderTitleFallback: '#main header span[dir="auto"]',
-      ...options.selectors
-    };
-  }
+(function registerChatNavigator() {
+  const {
+    SELECTORS, TIMEOUTS, OperationTimeoutError,
+    waitFor, sleep, throwIfAborted, simulateClick, pressEscape,
+    readTextWithEmojis, readCellTitle, isTitleMatch
+  } = window.DomUtils;
 
-  /**
-   * Helper utilitário para pausas assíncronas
-   * @private
-   * @param {number} ms
-   * @returns {Promise<void>}
-   */
-  _sleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
-  }
-
-  /**
-   * Normaliza títulos para comparação exata: forma NFC, sem caracteres invisíveis
-   * (inclusive seletores de variação de emoji), espaços colapsados e caixa baixa
-   * @private
-   * @param {string} str
-   * @returns {string}
-   */
-  _normalizeTitle(str) {
-    if (!str || typeof str !== 'string') return '';
-    return str
-      .normalize('NFC')
-      .replace(/[\u200B-\u200D\uFEFF\u200E\u200F\u202A-\u202E\uFE0E\uFE0F]/g, '')
-      .replace(/\s+/g, ' ')
-      .trim()
-      .toLowerCase();
-  }
-
-  /**
-   * Compara dois títulos por igualdade exata após normalização.
-   * Comparação parcial foi descartada porque fazia "Ana" casar com "Mariana"
-   * e exportar a conversa errada sob o nome da esperada.
-   * @private
-   * @param {string} candidateTitle
-   * @param {string} targetTitle
-   * @returns {boolean}
-   */
-  _isTitleMatch(candidateTitle, targetTitle) {
-    const cleanCand = this._normalizeTitle(candidateTitle);
-    const cleanTarg = this._normalizeTitle(targetTitle);
-    return Boolean(cleanCand) && cleanCand === cleanTarg;
-  }
-
-  /**
-   * Lê o texto visível de um elemento incluindo emojis, que o WhatsApp Web
-   * renderiza como <img alt="🤓"> e por isso somem do textContent
-   * @private
-   * @param {HTMLElement} element
-   * @returns {string}
-   */
-  _readTextWithEmojis(element) {
-    if (!element) return '';
-    let text = '';
-    const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT);
-    let node = walker.nextNode();
-    while (node) {
-      if (node.nodeType === Node.TEXT_NODE) {
-        text += node.nodeValue;
-      } else if (node.tagName === 'IMG' && node.alt) {
-        text += node.alt;
-      }
-      node = walker.nextNode();
-    }
-    return text;
-  }
-
-  /**
-   * Retorna o título da conversa atualmente aberta no #main header
-   * @returns {string|null}
-   */
-  getActiveChatTitle() {
-    const headerTitleEl = document.querySelector(this.selectors.mainHeaderTitle) ||
-                          document.querySelector(this.selectors.mainHeaderTitleFallback);
-    if (!headerTitleEl) return null;
-    return (headerTitleEl.getAttribute('title') || this._readTextWithEmojis(headerTitleEl)).trim() || null;
-  }
-
-  /**
-   * Procura no DOM visível a célula correspondente ao título informado
-   * @private
-   * @param {string} targetTitle
-   * @returns {HTMLElement|null}
-   */
-  _findVisibleCellByTitle(targetTitle) {
-    const pane = document.querySelector(this.selectors.container);
-    if (!pane) return null;
-
-    const cells = pane.querySelectorAll(this.selectors.cell);
-    for (const cell of cells) {
-      if (!cell.closest(this.selectors.row)) continue;
-      if (cell.closest(this.selectors.archivedButton)) continue;
-
-      const titleEl = cell.querySelector(this.selectors.title);
-      if (!titleEl) continue;
-
-      // Mesma fonte usada pelo ChatListScanner: atributo title, com fallback para o texto com emojis
-      const spanWithTitle = titleEl.querySelector('span[title]');
-      const cellTitle = spanWithTitle?.getAttribute('title') || this._readTextWithEmojis(titleEl);
-
-      if (this._isTitleMatch(cellTitle, targetTitle)) {
-        return cell;
-      }
-    }
-    return null;
-  }
-
-  /**
-   * Localiza a célula da conversa no #pane-side com rolagem suave e limitada
-   * @private
-   * @param {string} targetTitle
-   * @returns {Promise<HTMLElement|null>}
-   */
-  async _locateCellWithScroll(targetTitle) {
-    // 1. Tenta encontrar imediatamente nas células visíveis
-    let cell = this._findVisibleCellByTitle(targetTitle);
-    if (cell) return cell;
-
-    const pane = document.querySelector(this.selectors.container);
-    if (!pane) return null;
-
-    // 2. Volta ao topo inicial e aguarda renderização dos primeiros chats no DOM
-    pane.scrollTop = 0;
-    await this._sleep(300);
-
-    // Checagem imediata após voltar ao topo (casos dos chats 1, 2, 3...)
-    cell = this._findVisibleCellByTitle(targetTitle);
-    if (cell) return cell;
-
-    // 3. Busca progressiva com passos curtos (100px = ~1,3 linhas) para não pular nenhum chat
-    const step = 100;
-    const maxSearchSteps = 45; // Máximo de ~4500px de profundidade (evita qualquer loop infinito)
-    let steps = 0;
-    let lastScrollTop = -1;
-    let consecutiveStall = 0;
-
-    while (steps < maxSearchSteps) {
-      steps++;
-      pane.scrollTop += step;
-      await this._sleep(150);
-
-      cell = this._findVisibleCellByTitle(targetTitle);
-      if (cell) return cell;
-
-      if (pane.scrollTop === lastScrollTop) {
-        consecutiveStall++;
-        if (consecutiveStall >= 3) break;
-      } else {
-        consecutiveStall = 0;
-      }
-      lastScrollTop = pane.scrollTop;
+  class ChatNavigator {
+    /**
+     * @param {Object} [options]
+     * @param {Object} [options.timeouts] Sobrescrita dos timeouts padrão (ms)
+     * @param {number} [options.scrollDelayMs=200] Espera de renderização da lista virtual a cada passo
+     */
+    constructor(options = {}) {
+      this.timeouts = {
+        openChatMs: TIMEOUTS.OPEN_CHAT_MS,
+        searchResultsMs: TIMEOUTS.SEARCH_RESULTS_MS,
+        ...options.timeouts
+      };
+      this.scrollDelayMs = options.scrollDelayMs ?? 200;
     }
 
-    // Sem fallback por posição: a lista é virtualizada e reordena com mensagens novas,
-    // então clicar na N-ésima linha exportaria outra conversa sob o nome desta.
-    return null;
-  }
-
-  /**
-   * Dispara a sequência real de eventos de mouse que o React escuta no WhatsApp Web
-   * calculando as coordenadas reais do centro do elemento (HitRect) e aplicando foco
-   * @private
-   * @param {HTMLElement} element
-   */
-  _simulateClick(element) {
-    if (!element) return;
-
-    // Alvo preferencial da linha interativa
-    const target = element.closest('[role="row"]') ||
-                   element.closest('[role="gridcell"]') ||
-                   element.closest('[aria-selected]') ||
-                   element;
-
-    // Foca o elemento primeiro
-    if (typeof target.focus === 'function') {
-      try { target.focus(); } catch (_) {}
+    /**
+     * Retorna o título da conversa atualmente aberta no #main header
+     * @returns {string|null}
+     */
+    getActiveChatTitle() {
+      const headerTitleEl = document.querySelector(SELECTORS.MAIN_HEADER_TITLE) ||
+                            document.querySelector(SELECTORS.MAIN_HEADER_TITLE_FALLBACK);
+      if (!headerTitleEl) return null;
+      return (headerTitleEl.getAttribute('title') || readTextWithEmojis(headerTitleEl)).trim() || null;
     }
 
-    // Calcula coordenadas centrais reais dentro da viewport
-    const rect = element.getBoundingClientRect();
-    const clientX = Math.round(rect.left + rect.width / 2);
-    const clientY = Math.round(rect.top + rect.height / 2);
-    const screenX = (window.screenX || 0) + clientX;
-    const screenY = (window.screenY || 0) + clientY;
-
-    const baseInit = {
-      bubbles: true,
-      cancelable: true,
-      view: window,
-      clientX,
-      clientY,
-      screenX,
-      screenY
-    };
-
-    const dispatchSequence = (el) => {
-      try { el.dispatchEvent(new PointerEvent('pointerdown', { ...baseInit, pointerId: 1, pointerType: 'mouse', isPrimary: true, button: 0, buttons: 1 })); } catch (_) {}
-      try { el.dispatchEvent(new MouseEvent('mousedown', { ...baseInit, button: 0, buttons: 1 })); } catch (_) {}
-      try { el.dispatchEvent(new PointerEvent('pointerup', { ...baseInit, pointerId: 1, pointerType: 'mouse', isPrimary: true, button: 0, buttons: 0 })); } catch (_) {}
-      try { el.dispatchEvent(new MouseEvent('mouseup', { ...baseInit, button: 0, buttons: 0 })); } catch (_) {}
-      try { el.dispatchEvent(new MouseEvent('click', { ...baseInit, button: 0, buttons: 0 })); } catch (_) {}
-      try { el.click(); } catch (_) {}
-    };
-
-    dispatchSequence(target);
-    if (target !== element) {
-      dispatchSequence(element);
-    }
-
-    // Dispara também tecla Enter como fallback de acessibilidade do WhatsApp Web
-    try {
-      target.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
-      target.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
-    } catch (_) {}
-  }
-
-  /**
-   * Abre a conversa especificada e aguarda a confirmação visual no cabeçalho
-   * @param {Object|string} chat Info da conversa ou string do título
-   * @param {string} [chat.title]
-   * @returns {Promise<{ success: boolean, title: string }>}
-   */
-  async openChat(chat) {
-    const targetTitle = typeof chat === 'string' ? chat : chat?.title;
-
-    if (!targetTitle) {
-      throw new Error('Título da conversa não fornecido ao ChatNavigator.');
-    }
-
-    // 1. Limpa qualquer menu ou modal aberto residualmente antes de navegar
-    const openModal = document.querySelector('div[data-testid="export-chat-modal"]');
-    const openMenu = document.querySelector('div[role="menu"]');
-    if (openModal || openMenu) {
-      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true }));
-      await this._sleep(250);
-    }
-
-    // 2. Verifica se a conversa desejada já é a ativa atualmente
-    const currentActiveTitle = this.getActiveChatTitle();
-    if (currentActiveTitle && this._isTitleMatch(currentActiveTitle, targetTitle)) {
-      return { success: true, title: targetTitle };
-    }
-
-    // 3. Localiza a célula da conversa no #pane-side por título exato
-    const cellElement = await this._locateCellWithScroll(targetTitle);
-    if (!cellElement) {
-      throw new Error(`Conversa "${targetTitle}" não foi encontrada na lista lateral.`);
-    }
-
-    // 4. Centraliza o elemento de forma imediata (sem animação assíncrona)
-    cellElement.scrollIntoView({ behavior: 'auto', block: 'center' });
-    await this._sleep(150);
-
-    // 5. Dispara clique simulado com coordenadas e foco
-    this._simulateClick(cellElement);
-
-    // 6. Aguarda confirmação no #main header (sem limite de timeout)
-    let lastClickTime = Date.now();
-    let attempts = 0;
-
-    while (true) {
-      attempts++;
-      const activeTitle = this.getActiveChatTitle();
-
-      if (activeTitle && this._isTitleMatch(activeTitle, targetTitle)) {
-        // Aguarda renderização e estabilização do histórico da nova conversa no DOM
-        await this._sleep(500);
-        return { success: true, title: targetTitle };
-      }
-
-      // Se passou mais de 1.8s sem o cabeçalho atualizar para a nova conversa, re-tenta o clique
-      if (Date.now() - lastClickTime > 1800) {
-        this._simulateClick(cellElement);
-        lastClickTime = Date.now();
-      }
-
-      // Fallback: se a célula já está selecionada nativamente e o cabeçalho existe após várias tentativas
-      if (attempts > 25) {
-        const header = document.querySelector(this.selectors.mainHeader);
-        const isSelected = cellElement.getAttribute('aria-selected') === 'true' ||
-                           cellElement.closest('[aria-selected="true"]') !== null;
-        if (header && isSelected) {
-          await this._sleep(500);
-          return { success: true, title: targetTitle };
+    /**
+     * Lista as células com título exato dentro de um contêiner
+     * @private
+     * @param {Element|null} root
+     * @param {string} targetTitle
+     * @returns {HTMLElement[]}
+     */
+    _findMatchingCells(root, targetTitle) {
+      if (!root) return [];
+      const matches = [];
+      for (const cell of root.querySelectorAll(SELECTORS.CHAT_CELL)) {
+        if (cell.closest(SELECTORS.ARCHIVED_BUTTON)) continue;
+        if (isTitleMatch(readCellTitle(cell), targetTitle)) {
+          matches.push(cell);
         }
       }
+      return matches;
+    }
 
-      await this._sleep(150);
+    /**
+     * Procura no DOM visível da lista a célula correspondente ao título.
+     * Duas células com o mesmo título ao mesmo tempo indicam homônimos: sem como
+     * saber qual é a pedida, falha em vez de escolher uma arbitrariamente.
+     * @param {string} targetTitle
+     * @returns {HTMLElement|null}
+     */
+    findVisibleCellByTitle(targetTitle) {
+      const matches = this._findMatchingCells(document.querySelector(SELECTORS.PANE_SIDE), targetTitle);
+      if (matches.length > 1) {
+        throw new Error(`Há mais de uma conversa chamada "${targetTitle}"; não é possível escolher com segurança.`);
+      }
+      return matches[0] || null;
+    }
+
+    /**
+     * @private
+     * @returns {HTMLInputElement|HTMLElement|null}
+     */
+    _findSearchInput() {
+      return document.querySelector(SELECTORS.SEARCH_INPUT);
+    }
+
+    /**
+     * Preenche a caixa de busca de forma que o React perceba a alteração
+     * @private
+     * @param {HTMLInputElement|HTMLElement} input
+     * @param {string} text
+     */
+    _setSearchText(input, text) {
+      input.focus();
+      if (input instanceof HTMLInputElement) {
+        const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+        setter.call(input, text);
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+        return;
+      }
+      // Versões antigas usavam um contenteditable no lugar do <input>
+      document.execCommand('selectAll', false, null);
+      document.execCommand(text ? 'insertText' : 'delete', false, text || null);
+    }
+
+    /**
+     * Limpa a busca para devolver a lista lateral ao estado normal
+     */
+    clearSearch() {
+      const input = this._findSearchInput();
+      if (!input) return;
+      const currentValue = input instanceof HTMLInputElement ? input.value : input.textContent;
+      if (currentValue) {
+        this._setSearchText(input, '');
+      }
+    }
+
+    /**
+     * Localiza a conversa pela caixa de busca da lista lateral. Os resultados podem incluir
+     * a seção de mensagens com o mesmo título; a seção de conversas vem primeiro, então usa a primeira.
+     * @private
+     * @param {string} targetTitle
+     * @param {AbortSignal} [signal]
+     * @returns {Promise<HTMLElement|null>}
+     */
+    async _locateCellViaSearch(targetTitle, signal) {
+      const input = this._findSearchInput();
+      if (!input) return null;
+
+      this._setSearchText(input, targetTitle);
+      try {
+        return await waitFor(
+          () => this._findMatchingCells(document.querySelector(SELECTORS.SIDE_PANEL), targetTitle)[0] || null,
+          {
+            timeoutMs: this.timeouts.searchResultsMs,
+            description: `resultados da busca por "${targetTitle}"`,
+            signal
+          }
+        );
+      } catch (err) {
+        if (err instanceof OperationTimeoutError) {
+          this.clearSearch();
+          return null;
+        }
+        throw err;
+      }
+    }
+
+    /**
+     * Varre a lista inteira do topo ao fim. Passos menores que a altura visível
+     * garantem que nenhuma linha da lista virtual seja pulada.
+     * @private
+     * @param {string} targetTitle
+     * @param {AbortSignal} [signal]
+     * @returns {Promise<HTMLElement|null>}
+     */
+    async _locateCellWithScroll(targetTitle, signal) {
+      const pane = document.querySelector(SELECTORS.PANE_SIDE);
+      if (!pane) return null;
+
+      pane.scrollTop = 0;
+      await sleep(300, signal);
+
+      const step = Math.max(100, Math.floor(pane.clientHeight * 0.7));
+      let consecutiveStall = 0;
+
+      while (true) {
+        throwIfAborted(signal);
+        const cell = this.findVisibleCellByTitle(targetTitle);
+        if (cell) return cell;
+
+        const previousTop = pane.scrollTop;
+        pane.scrollTop += step;
+        await sleep(this.scrollDelayMs, signal);
+
+        const isAtBottom = pane.scrollTop + pane.clientHeight >= pane.scrollHeight - 5;
+        consecutiveStall = pane.scrollTop === previousTop || isAtBottom ? consecutiveStall + 1 : 0;
+        if (consecutiveStall >= 3) {
+          return this.findVisibleCellByTitle(targetTitle);
+        }
+      }
+    }
+
+    /**
+     * Abre a conversa especificada e aguarda a confirmação visual no cabeçalho
+     * @param {Object|string} chat Info da conversa ou string do título
+     * @param {string} [chat.title]
+     * @param {Object} [params]
+     * @param {AbortSignal} [params.signal]
+     * @returns {Promise<{ success: boolean, title: string, via: string }>}
+     */
+    async openChat(chat, { signal } = {}) {
+      const targetTitle = typeof chat === 'string' ? chat : chat?.title;
+      if (!targetTitle) {
+        throw new Error('Título da conversa não fornecido ao ChatNavigator.');
+      }
+
+      // 1. Fecha qualquer menu ou modal residual antes de navegar
+      if (document.querySelector(SELECTORS.EXPORT_MODAL) || document.querySelector(SELECTORS.MENU_CONTAINER)) {
+        pressEscape();
+        await sleep(250, signal);
+      }
+
+      // 2. A conversa desejada já está aberta
+      if (isTitleMatch(this.getActiveChatTitle(), targetTitle)) {
+        return { success: true, title: targetTitle, via: 'already-open' };
+      }
+
+      // 3. Localiza a célula: visível agora → busca → varredura completa da lista
+      let via = 'visible';
+      let cellElement = this.findVisibleCellByTitle(targetTitle);
+      if (!cellElement) {
+        via = 'search';
+        cellElement = await this._locateCellViaSearch(targetTitle, signal);
+      }
+      if (!cellElement) {
+        via = 'scroll';
+        cellElement = await this._locateCellWithScroll(targetTitle, signal);
+      }
+      if (!cellElement) {
+        throw new Error(`Conversa "${targetTitle}" não foi encontrada na lista lateral.`);
+      }
+
+      try {
+        cellElement.scrollIntoView({ behavior: 'auto', block: 'center' });
+        await sleep(150, signal);
+        simulateClick(cellElement);
+
+        // 4. Aguarda o cabeçalho mostrar a conversa; re-tenta o clique a cada 2s (abrir chat é idempotente)
+        let lastClickAt = Date.now();
+        await waitFor(() => {
+          if (isTitleMatch(this.getActiveChatTitle(), targetTitle)) return true;
+          // A célula clicada tem título exato; se ela ficou selecionada, o chat aberto é ela
+          const isSelected = cellElement.isConnected && cellElement.closest('[aria-selected="true"]') !== null;
+          return isSelected && Boolean(document.querySelector(SELECTORS.MAIN_HEADER));
+        }, {
+          timeoutMs: this.timeouts.openChatMs,
+          description: `a abertura da conversa "${targetTitle}"`,
+          signal,
+          onTick: () => {
+            if (Date.now() - lastClickAt > 2000 && cellElement.isConnected) {
+              simulateClick(cellElement);
+              lastClickAt = Date.now();
+            }
+          }
+        });
+
+        // Estabilização da renderização da conversa antes de abrir o menu
+        await sleep(500, signal);
+        return { success: true, title: targetTitle, via };
+      } finally {
+        if (via === 'search') {
+          this.clearSearch();
+        }
+      }
     }
   }
-}
 
-if (typeof window !== 'undefined') {
-  window.ChatNavigator = ChatNavigator;
-}
+  if (typeof window !== 'undefined') {
+    window.ChatNavigator = ChatNavigator;
+  }
 
-if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { ChatNavigator };
-}
+  if (typeof module !== 'undefined' && module.exports) {
+    module.exports = { ChatNavigator };
+  }
+})();

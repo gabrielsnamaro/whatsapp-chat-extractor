@@ -3,155 +3,116 @@
  * Responsabilidade Única: Interagir com o menu contextual do cabeçalho da conversa aberta
  * e acionar a opção nativa "Exportar conversa".
  */
-class ChatOptionsMenu {
-  /**
-   * @param {Object} [options]
-   * @param {Object} [options.selectors] Sobrescrita de seletores CSS
-   */
-  constructor(options = {}) {
-    this.selectors = {
-      mainHeader: '#main header',
-      btnMoreOptions: '#main header button[aria-label="Mais opções"], #main header [role="button"][aria-label="Mais opções"]',
-      menuContainer: 'div[role="menu"]',
-      menuItemExport: 'div[role="menu"] button[role="menuitem"][aria-label="Exportar conversa"]',
-      exportActionText: 'Exportar conversa',
-      ...options.selectors
-    };
-  }
+(function registerChatOptionsMenu() {
+  const { SELECTORS, TIMEOUTS, waitFor, sleep, isVisible, simulateClick, pressEscape } = window.DomUtils;
 
-  /**
-   * Helper utilitário para pausas assíncronas
-   * @private
-   * @param {number} ms
-   * @returns {Promise<void>}
-   */
-  _sleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
-  }
-
-  /**
-   * Localiza o botão "Mais opções" no cabeçalho atual
-   * @private
-   * @returns {HTMLElement|null}
-   */
-  _findMoreOptionsButton() {
-    return document.querySelector(this.selectors.btnMoreOptions);
-  }
-
-  /**
-   * Aguarda a renderização do menu suspenso no DOM (sem limite de timeout)
-   * @private
-   * @param {HTMLElement} [triggerBtn] Botão acionador para retentativas de clique se necessário
-   * @returns {Promise<HTMLElement>}
-   */
-  async _waitForMenu(triggerBtn = null) {
-    let lastClickTime = Date.now();
-    while (true) {
-      const menu = document.querySelector(this.selectors.menuContainer);
-      if (menu && menu.offsetParent !== null) {
-        return menu;
-      }
-
-      // Se passou mais de 1.5s sem o menu abrir, re-tenta o clique no botão
-      if (triggerBtn && Date.now() - lastClickTime > 1500) {
-        this._simulateClick(triggerBtn);
-        lastClickTime = Date.now();
-      }
-
-      await this._sleep(100);
+  class ChatOptionsMenu {
+    /**
+     * @param {Object} [options]
+     * @param {Object} [options.timeouts] Sobrescrita dos timeouts padrão (ms)
+     */
+    constructor(options = {}) {
+      this.timeouts = {
+        moreOptionsButtonMs: TIMEOUTS.MORE_OPTIONS_BUTTON_MS,
+        menuMs: TIMEOUTS.MENU_MS,
+        ...options.timeouts
+      };
     }
-  }
 
-  /**
-   * Localiza o item de exportação dentro do menu
-   * @private
-   * @param {HTMLElement} menu
-   * @returns {HTMLElement|null}
-   */
-  _findExportMenuItem(menu) {
-    // 1. Tenta por seletor semântico com aria-label
-    let item = menu.querySelector(this.selectors.menuItemExport);
-    if (item) return item;
+    /**
+     * Localiza o botão "Mais opções" no cabeçalho atual
+     * @private
+     * @returns {HTMLElement|null}
+     */
+    _findMoreOptionsButton() {
+      return document.querySelector(SELECTORS.BTN_MORE_OPTIONS);
+    }
 
-    // 2. Busca por texto dentro dos itens de menu disponíveis
-    const items = menu.querySelectorAll('[role="menuitem"], button');
-    for (const el of items) {
-      if (el.textContent.includes(this.selectors.exportActionText) || el.getAttribute('aria-label') === this.selectors.exportActionText) {
-        return el;
+    /**
+     * @private
+     * @returns {HTMLElement|null}
+     */
+    _findVisibleMenu() {
+      const menu = document.querySelector(SELECTORS.MENU_CONTAINER);
+      return isVisible(menu) ? menu : null;
+    }
+
+    /**
+     * Localiza o item de exportação dentro do menu
+     * @param {HTMLElement} menu
+     * @returns {HTMLElement|null}
+     */
+    findExportMenuItem(menu) {
+      const item = menu.querySelector(SELECTORS.MENU_ITEM_EXPORT_CHAT);
+      if (item) return item;
+
+      const items = menu.querySelectorAll(`${SELECTORS.MENU_ITEM}, button`);
+      for (const el of items) {
+        if (el.getAttribute('aria-label') === SELECTORS.EXPORT_MENU_TEXT ||
+            (el.textContent || '').trim() === SELECTORS.EXPORT_MENU_TEXT) {
+          return el;
+        }
+      }
+      return null;
+    }
+
+    /**
+     * Fecha o menu suspenso caso ele esteja aberto
+     */
+    closeMenu() {
+      if (document.querySelector(SELECTORS.MENU_CONTAINER)) {
+        pressEscape();
       }
     }
 
-    return null;
-  }
+    /**
+     * Clica no botão de opções e seleciona "Exportar conversa"
+     * @param {Object} [params]
+     * @param {AbortSignal} [params.signal]
+     * @returns {Promise<{ success: boolean }>}
+     */
+    async triggerExportOption({ signal } = {}) {
+      const btn = await waitFor(() => this._findMoreOptionsButton(), {
+        timeoutMs: this.timeouts.moreOptionsButtonMs,
+        description: 'o botão "Mais opções" no cabeçalho da conversa',
+        signal
+      });
 
-  /**
-   * Fecha o menu suspenso caso ele esteja aberto
-   * @returns {void}
-   */
-  closeMenu() {
-    const menu = document.querySelector(this.selectors.menuContainer);
-    if (menu) {
-      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true }));
+      simulateClick(btn);
+
+      // Se o menu não abrir, re-tenta o clique a cada 1,5s (com clique único não há risco de abrir e fechar)
+      let lastClickAt = Date.now();
+      const menu = await waitFor(() => this._findVisibleMenu(), {
+        timeoutMs: this.timeouts.menuMs,
+        description: 'a abertura do menu de opções',
+        signal,
+        onTick: () => {
+          if (Date.now() - lastClickAt > 1500) {
+            simulateClick(this._findMoreOptionsButton() || btn);
+            lastClickAt = Date.now();
+          }
+        }
+      });
+      await sleep(150, signal);
+
+      const exportItem = this.findExportMenuItem(menu);
+      if (!exportItem) {
+        this.closeMenu();
+        throw new Error('Opção "Exportar conversa" não disponível para esta conversa (ex: chat de avisos ou restrito).');
+      }
+
+      simulateClick(exportItem);
+      await sleep(200, signal);
+
+      return { success: true };
     }
   }
 
-  /**
-   * Dispara a sequência real de eventos de mouse que o React escuta no WhatsApp Web
-   * @private
-   * @param {HTMLElement} element
-   */
-  _simulateClick(element) {
-    if (!element) return;
-    try { element.focus(); } catch (_) {}
-    const rect = element.getBoundingClientRect();
-    const clientX = Math.round(rect.left + rect.width / 2);
-    const clientY = Math.round(rect.top + rect.height / 2);
-    const baseInit = { bubbles: true, cancelable: true, view: window, clientX, clientY };
-    try { element.dispatchEvent(new PointerEvent('pointerdown', { ...baseInit, pointerId: 1, pointerType: 'mouse', isPrimary: true, button: 0, buttons: 1 })); } catch (_) {}
-    try { element.dispatchEvent(new MouseEvent('mousedown', { ...baseInit, button: 0, buttons: 1 })); } catch (_) {}
-    try { element.dispatchEvent(new PointerEvent('pointerup', { ...baseInit, pointerId: 1, pointerType: 'mouse', isPrimary: true, button: 0, buttons: 0 })); } catch (_) {}
-    try { element.dispatchEvent(new MouseEvent('mouseup', { ...baseInit, button: 0, buttons: 0 })); } catch (_) {}
-    try { element.dispatchEvent(new MouseEvent('click', { ...baseInit, button: 0, buttons: 0 })); } catch (_) {}
-    try { element.click(); } catch (_) {}
+  if (typeof window !== 'undefined') {
+    window.ChatOptionsMenu = ChatOptionsMenu;
   }
 
-  /**
-   * Clica no botão de opções e seleciona "Exportar conversa"
-   * @returns {Promise<{ success: boolean }>}
-   */
-  async triggerExportOption() {
-    let btn = this._findMoreOptionsButton();
-    while (!btn) {
-      await this._sleep(150);
-      btn = this._findMoreOptionsButton();
-    }
-
-    // Abre o menu de opções
-    this._simulateClick(btn);
-
-    // Aguarda o menu aparecer passando o botão como referência para auto-retry
-    const menu = await this._waitForMenu(btn);
-    await this._sleep(150);
-
-    // Localiza a opção de exportação
-    const exportItem = this._findExportMenuItem(menu);
-    if (!exportItem) {
-      this.closeMenu();
-      throw new Error('Opção "Exportar conversa" não disponível para esta conversa (ex: chat de avisos ou restrito).');
-    }
-
-    // Dispara clique na opção de exportação
-    this._simulateClick(exportItem);
-    await this._sleep(200);
-
-    return { success: true };
+  if (typeof module !== 'undefined' && module.exports) {
+    module.exports = { ChatOptionsMenu };
   }
-}
-
-if (typeof window !== 'undefined') {
-  window.ChatOptionsMenu = ChatOptionsMenu;
-}
-
-if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { ChatOptionsMenu };
-}
+})();

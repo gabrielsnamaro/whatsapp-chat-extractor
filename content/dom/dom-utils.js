@@ -1,0 +1,261 @@
+/**
+ * DomUtils
+ * Responsabilidade Única: Utilitários compartilhados pelas classes de automação DOM
+ * (seletores, esperas com timeout/cancelamento, clique simulado e leitura de títulos).
+ *
+ * Content scripts clássicos não importam módulos ES, por isso o compartilhamento é via window.
+ * Deve ser o primeiro arquivo da lista de content scripts no manifest.
+ */
+(function registerDomUtils() {
+  /**
+   * Seletores DOM canônicos mapeados da pasta kb/ (WhatsApp Web).
+   * Priorizam atributos semânticos estáveis (id, data-testid, role, aria-*).
+   */
+  const SELECTORS = Object.freeze({
+    // Indicadores de estado e painéis estruturais
+    APP_ROOT: '#app',
+    SIDE_PANEL: '#side',
+    PANE_SIDE: '#pane-side',
+    MAIN_CHAT: '#main',
+
+    // Lista lateral de conversas (#pane-side)
+    CHAT_ROW: '[role="row"]',
+    CHAT_CELL: '[role="row"] [data-testid="cell-frame-container"]',
+    ARCHIVED_BUTTON: '[data-testid="chatlist-panel-archived-button"]',
+    CHAT_TITLE: '[data-testid="cell-frame-title"]',
+    CHAT_LAST_MESSAGE: '[data-testid="cell-frame-secondary"]',
+    CHAT_TIMESTAMP: '[data-testid="cell-frame-primary-detail"]',
+    CHAT_UNREAD_COUNT: '[data-testid="icon-unread-count"]',
+    SEARCH_INPUT: '#side input[data-tab="3"], #side input[role="textbox"], #side div[contenteditable="true"][data-tab="3"]',
+
+    // Cabeçalho da conversa aberta (#main header)
+    MAIN_HEADER: '#main header',
+    MAIN_HEADER_TITLE: '#main header [data-testid="conversation-info-header-chat-title"]',
+    MAIN_HEADER_TITLE_FALLBACK: '#main header span[dir="auto"]',
+    BTN_MORE_OPTIONS: '#main header button[aria-label="Mais opções"], #main header [role="button"][aria-label="Mais opções"]',
+
+    // Menu suspenso ("Mais opções")
+    MENU_CONTAINER: 'div[role="menu"]',
+    MENU_ITEM: '[role="menuitem"]',
+    MENU_ITEM_EXPORT_CHAT: 'div[role="menu"] button[role="menuitem"][aria-label="Exportar conversa"]',
+    EXPORT_MENU_TEXT: 'Exportar conversa',
+
+    // Modal nativo de exportação de conversa
+    EXPORT_MODAL: 'div[data-testid="export-chat-modal"]',
+    EXPORT_MODAL_FALLBACK: 'div[role="dialog"]',
+    EXPORT_RADIO_ALL_MSGS: 'input#date-range-all',
+    EXPORT_RADIO_ALL_LABEL: 'label[for="date-range-all"]',
+    EXPORT_MODAL_BUTTONS: 'button, div[role="button"]',
+    EXPORT_CONFIRM_TEXT: 'Exportar',
+    EXPORT_CANCEL_TEXT: 'Cancelar'
+  });
+
+  /**
+   * Timeouts padrão por etapa. São generosos de propósito: os timeouts curtos
+   * anteriores (5–10s) estouravam em máquinas lentas e em contas grandes.
+   */
+  const TIMEOUTS = Object.freeze({
+    OPEN_CHAT_MS: 30000,
+    MORE_OPTIONS_BUTTON_MS: 30000,
+    MENU_MS: 15000,
+    MODAL_MS: 30000,
+    SEARCH_RESULTS_MS: 8000,
+    MODAL_CLOSE_MS: 5000
+  });
+
+  class OperationCancelledError extends Error {
+    constructor(message = 'Operação cancelada.') {
+      super(message);
+      this.name = 'OperationCancelledError';
+    }
+  }
+
+  class OperationTimeoutError extends Error {
+    constructor(message) {
+      super(message);
+      this.name = 'OperationTimeoutError';
+    }
+  }
+
+  function throwIfAborted(signal) {
+    if (signal?.aborted) throw new OperationCancelledError();
+  }
+
+  /**
+   * Pausa assíncrona interrompível por AbortSignal
+   * @param {number} ms
+   * @param {AbortSignal} [signal]
+   * @returns {Promise<void>}
+   */
+  function sleep(ms, signal) {
+    return new Promise((resolve, reject) => {
+      if (signal?.aborted) {
+        reject(new OperationCancelledError());
+        return;
+      }
+      const onAbort = () => {
+        clearTimeout(timer);
+        reject(new OperationCancelledError());
+      };
+      const timer = setTimeout(() => {
+        signal?.removeEventListener('abort', onAbort);
+        resolve();
+      }, ms);
+      signal?.addEventListener('abort', onAbort, { once: true });
+    });
+  }
+
+  /**
+   * Aguarda até que `probe()` retorne um valor verdadeiro, respeitando timeout e cancelamento
+   * @param {function(): any} probe
+   * @param {Object} options
+   * @param {number} options.timeoutMs
+   * @param {string} options.description Texto usado na mensagem de timeout
+   * @param {number} [options.intervalMs=150]
+   * @param {AbortSignal} [options.signal]
+   * @param {function(number): void} [options.onTick] Invocado a cada tentativa sem sucesso com o tempo decorrido
+   * @returns {Promise<any>}
+   */
+  async function waitFor(probe, { timeoutMs, description, intervalMs = 150, signal, onTick } = {}) {
+    const startedAt = Date.now();
+    while (true) {
+      throwIfAborted(signal);
+      const result = probe();
+      if (result) return result;
+
+      const elapsed = Date.now() - startedAt;
+      if (elapsed >= timeoutMs) {
+        throw new OperationTimeoutError(`Timeout de ${Math.round(timeoutMs / 1000)}s aguardando ${description}.`);
+      }
+      if (onTick) onTick(elapsed);
+      await sleep(intervalMs, signal);
+    }
+  }
+
+  /**
+   * Considera visível qualquer elemento com caixa renderizada. Ao contrário de
+   * offsetParent, funciona para menus e modais com position: fixed.
+   * @param {Element|null} element
+   * @returns {boolean}
+   */
+  function isVisible(element) {
+    return Boolean(element) && element.isConnected && element.getClientRects().length > 0;
+  }
+
+  /**
+   * Dispara um único clique com a sequência de eventos de ponteiro que o React escuta.
+   * element.click() já emite o evento click; emitir outro MouseEvent('click') fazia
+   * cada clique contar duas vezes (menus abriam e fechavam, "Exportar" disparava duas vezes).
+   * @param {HTMLElement} element
+   */
+  function simulateClick(element) {
+    if (!element) return;
+    try { element.focus({ preventScroll: true }); } catch (_) {}
+
+    const rect = element.getBoundingClientRect();
+    const clientX = Math.round(rect.left + rect.width / 2);
+    const clientY = Math.round(rect.top + rect.height / 2);
+    const baseInit = { bubbles: true, cancelable: true, view: window, clientX, clientY, button: 0 };
+    const pointerInit = { ...baseInit, pointerId: 1, pointerType: 'mouse', isPrimary: true };
+
+    try { element.dispatchEvent(new PointerEvent('pointerdown', { ...pointerInit, buttons: 1 })); } catch (_) {}
+    try { element.dispatchEvent(new MouseEvent('mousedown', { ...baseInit, buttons: 1 })); } catch (_) {}
+    try { element.dispatchEvent(new PointerEvent('pointerup', { ...pointerInit, buttons: 0 })); } catch (_) {}
+    try { element.dispatchEvent(new MouseEvent('mouseup', { ...baseInit, buttons: 0 })); } catch (_) {}
+    element.click();
+  }
+
+  function pressEscape() {
+    const init = { key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true };
+    const target = document.activeElement || document.body;
+    target.dispatchEvent(new KeyboardEvent('keydown', init));
+    target.dispatchEvent(new KeyboardEvent('keyup', init));
+  }
+
+  /**
+   * Lê o texto visível de um elemento incluindo emojis, que o WhatsApp Web
+   * renderiza como <img alt="🤓"> e por isso somem do textContent
+   * @param {Element|null} element
+   * @returns {string}
+   */
+  function readTextWithEmojis(element) {
+    if (!element) return '';
+    let text = '';
+    const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT);
+    let node = walker.nextNode();
+    while (node) {
+      if (node.nodeType === Node.TEXT_NODE) {
+        text += node.nodeValue;
+      } else if (node.tagName === 'IMG' && node.alt) {
+        text += node.alt;
+      }
+      node = walker.nextNode();
+    }
+    return text;
+  }
+
+  /**
+   * Título de uma célula da lista: atributo title (preserva emojis) com fallback para o texto
+   * @param {Element} cell
+   * @returns {string}
+   */
+  function readCellTitle(cell) {
+    const titleEl = cell?.querySelector(SELECTORS.CHAT_TITLE);
+    if (!titleEl) return '';
+    const spanWithTitle = titleEl.querySelector('span[title]');
+    return (spanWithTitle?.getAttribute('title') || readTextWithEmojis(titleEl)).trim();
+  }
+
+  /**
+   * Normaliza títulos para comparação exata: forma NFC, sem caracteres invisíveis
+   * (inclusive seletores de variação de emoji), espaços colapsados e caixa baixa
+   * @param {string} str
+   * @returns {string}
+   */
+  function normalizeTitle(str) {
+    if (!str || typeof str !== 'string') return '';
+    return str
+      .normalize('NFC')
+      .replace(/[​-‍﻿‎‏‪-‮︎️]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toLowerCase();
+  }
+
+  /**
+   * Igualdade exata após normalização. Comparação parcial foi descartada porque fazia
+   * "Ana" casar com "Mariana" e exportar a conversa errada sob o nome da esperada.
+   * @param {string} candidateTitle
+   * @param {string} targetTitle
+   * @returns {boolean}
+   */
+  function isTitleMatch(candidateTitle, targetTitle) {
+    const cleanCand = normalizeTitle(candidateTitle);
+    return Boolean(cleanCand) && cleanCand === normalizeTitle(targetTitle);
+  }
+
+  const DomUtils = Object.freeze({
+    SELECTORS,
+    TIMEOUTS,
+    OperationCancelledError,
+    OperationTimeoutError,
+    throwIfAborted,
+    sleep,
+    waitFor,
+    isVisible,
+    simulateClick,
+    pressEscape,
+    readTextWithEmojis,
+    readCellTitle,
+    normalizeTitle,
+    isTitleMatch
+  });
+
+  if (typeof window !== 'undefined') {
+    window.DomUtils = DomUtils;
+  }
+
+  if (typeof module !== 'undefined' && module.exports) {
+    module.exports = { DomUtils };
+  }
+})();
