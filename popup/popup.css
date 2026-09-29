@@ -303,8 +303,20 @@ body {
 
 .log-entry {
   color: var(--text-muted);
-  word-break: break-all;
+  word-break: break-word;
   margin-bottom: 2px;
+}
+
+.log-entry.log-warning {
+  color: var(--status-warn);
+}
+
+.log-entry.log-error {
+  color: var(--status-err);
+}
+
+.log-entry.log-success {
+  color: var(--status-ok);
 }
 
 .footer {

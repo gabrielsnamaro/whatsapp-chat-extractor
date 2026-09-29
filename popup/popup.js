@@ -7,6 +7,7 @@ import { ACTIONS } from '../shared/constants/actions.js';
 import { WORKFLOW_STATES } from '../shared/constants/workflow-states.js';
 import { ProgressView } from './ui/progress-view.js';
 import { ExtractionControls } from './ui/extraction-controls.js';
+import { findWhatsAppTab, countWhatsAppTabs } from '../shared/utils/whatsapp-tab.js';
 
 document.addEventListener('DOMContentLoaded', async () => {
   const statusBadge = document.getElementById('status-badge');
@@ -18,23 +19,22 @@ document.addEventListener('DOMContentLoaded', async () => {
   const progressView = new ProgressView();
   const controls = new ExtractionControls();
 
-  function log(text) {
+  /**
+   * @param {string} text
+   * @param {'info'|'warning'|'error'|'success'} [level='info']
+   */
+  function log(text, level = 'info') {
     if (!logArea) return;
     const entry = document.createElement('p');
-    entry.className = 'log-entry';
+    entry.className = level === 'info' ? 'log-entry' : `log-entry log-${level}`;
     entry.textContent = `[${new Date().toLocaleTimeString()}] ${text}`;
     logArea.appendChild(entry);
     logArea.scrollTop = logArea.scrollHeight;
   }
 
-  async function getWhatsAppTab() {
-    const tabs = await chrome.tabs.query({ url: '*://web.whatsapp.com/*' });
-    return tabs && tabs.length > 0 ? tabs[0] : null;
-  }
-
   async function updateTabStatus() {
     try {
-      const tab = await getWhatsAppTab();
+      const tab = await findWhatsAppTab();
       if (!tab) {
         statusBadge.textContent = 'Não aberto';
         statusBadge.className = 'badge disconnected';
@@ -45,7 +45,10 @@ document.addEventListener('DOMContentLoaded', async () => {
 
       statusBadge.textContent = 'Detectado';
       statusBadge.className = 'badge connected';
-      statusDetail.textContent = `Aba ativa (ID: ${tab.id})`;
+      const tabCount = await countWhatsAppTabs();
+      statusDetail.textContent = tabCount > 1
+        ? `${tabCount} abas do WhatsApp Web abertas; será usada a ativa/mais recente (ID: ${tab.id}).`
+        : `Aba ativa (ID: ${tab.id})`;
       if (btnCheckReady) btnCheckReady.disabled = false;
       return tab;
     } catch (err) {
@@ -59,32 +62,48 @@ document.addEventListener('DOMContentLoaded', async () => {
   // Carrega opções e preferências persistidas
   await controls.loadPreferences();
 
-  // Consulta o estado atual do orquestrador no background
-  try {
-    const response = await chrome.runtime.sendMessage({ action: ACTIONS.GET_WORKFLOW_STATE });
-    if (response && response.success && response.data) {
-      const stateData = response.data;
-      progressView.renderProgress(stateData);
-      controls.updateUiState(stateData.state);
-    }
-  } catch (_) {
+  /** Sincroniza a interface com o estado atual do orquestrador no background */
+  async function refreshWorkflowState() {
+    try {
+      const response = await chrome.runtime.sendMessage({ action: ACTIONS.GET_WORKFLOW_STATE });
+      if (response?.success && response.data) {
+        progressView.renderProgress(response.data);
+        controls.updateUiState(response.data.state);
+        return response.data;
+      }
+    } catch (_) {}
     controls.updateUiState(WORKFLOW_STATES.IDLE);
+    return null;
   }
+
+  const initialState = await refreshWorkflowState();
+  if (initialState?.statusMessage) {
+    log(initialState.statusMessage, initialState.state === WORKFLOW_STATES.PAUSED ? 'warning' : 'info');
+  }
+
+  // Evita repetir no log a mesma conversa e o mesmo estado final a cada atualização
+  let lastLoggedChat = null;
+  let lastLoggedFinalState = null;
 
   // Escuta atualizações de progresso emitidas pelo background em tempo real
   chrome.runtime.onMessage.addListener((message) => {
-    if (message.action === ACTIONS.WORKFLOW_PROGRESS_UPDATE) {
-      progressView.renderProgress(message);
-      controls.updateUiState(message.state);
+    if (message.action !== ACTIONS.WORKFLOW_PROGRESS_UPDATE) return;
 
-      if (message.currentChatTitle) {
-        log(`[${message.current}/${message.total}] ${message.currentChatTitle}`);
-      }
-      if (message.state === WORKFLOW_STATES.COMPLETED) {
-        log('🎉 Extração concluída! O download do arquivo ZIP foi iniciado.');
-      } else if (message.state === WORKFLOW_STATES.FAILED) {
-        log(`❌ Falha: ${message.errorMessage}`);
-      }
+    progressView.renderProgress(message);
+    controls.updateUiState(message.state);
+
+    const chatKey = `${message.current}/${message.total}:${message.currentChatTitle}`;
+    if (message.currentChatTitle && message.state === WORKFLOW_STATES.EXPORTING && chatKey !== lastLoggedChat) {
+      lastLoggedChat = chatKey;
+      log(`[${message.current}/${message.total}] Exportando "${message.currentChatTitle}"...`);
+    }
+    if (message.warningMessage) log(message.warningMessage, 'warning');
+    if (message.infoMessage) log(message.infoMessage, message.state === WORKFLOW_STATES.COMPLETED ? 'success' : 'info');
+
+    if (message.state !== lastLoggedFinalState) {
+      if (message.state === WORKFLOW_STATES.FAILED) log(`❌ Falha: ${message.errorMessage}`, 'error');
+      if (message.state === WORKFLOW_STATES.CANCELLED) log('Extração cancelada.', 'warning');
+      lastLoggedFinalState = message.state;
     }
   });
 
@@ -116,11 +135,11 @@ document.addEventListener('DOMContentLoaded', async () => {
       });
 
       if (!res || !res.success) {
-        log(`Erro ao iniciar: ${res?.error || 'Desconhecido'}`);
-        controls.updateUiState(WORKFLOW_STATES.FAILED);
+        log(`Erro ao iniciar: ${res?.error || 'Desconhecido'}`, 'error');
+        await refreshWorkflowState();
       }
     } catch (err) {
-      log(`Erro de comunicação com o Service Worker: ${err.message}`);
+      log(`Erro de comunicação com o Service Worker: ${err.message}`, 'error');
       controls.updateUiState(WORKFLOW_STATES.FAILED);
     }
   });
@@ -128,7 +147,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   // Ação: Pausar
   controls.onPause(async () => {
     log('Solicitando pausa...');
-    await chrome.runtime.sendMessage({ action: ACTIONS.PAUSE_BATCH_EXTRACTION });
+    const res = await chrome.runtime.sendMessage({ action: ACTIONS.PAUSE_BATCH_EXTRACTION });
+    if (!res?.success) log('Não há etapa pausável no momento.', 'warning');
   });
 
   // Ação: Retomar
@@ -169,7 +189,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           log('⏳ WhatsApp Web ainda carregando ou no QR Code.');
         }
       } catch (err) {
-        log('⚠️ Falha ao comunicar com a página. Recarregue a aba do WhatsApp Web.');
+        log('⚠️ Falha ao comunicar com a página. Recarregue a aba do WhatsApp Web ou inicie a extração (o script é reinjetado).', 'warning');
       }
     });
   }
