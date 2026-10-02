@@ -33,7 +33,7 @@ Depois de recarregar a extensão, não é preciso recarregar a aba do WhatsApp: 
      - O arquivo gerado pelo WhatsApp é capturado por uma de duas fontes: o clique no `<a download>` interceptado pelo content script ou, se o link não passar pelo documento, o `chrome.downloads` (o download é pausado e lido pela aba). Os bytes seguem ao background em blocos base64 de 8 MiB e o `StagingRepository` os salva no IndexedDB (`whatsapp_staging_db`).
      - É aplicado um intervalo entre conversas (2 s + variação aleatória de até 50%).
    - Ao final da fila, um **offscreen document** monta o ZIP master (`whatsapp_backup_YYYY-MM-DD.zip`) lendo o staging um registro por vez — as entradas dos ZIPs nativos (exportações com mídia) são copiadas sem descompactar — e o download é disparado por URL de Blob.
-   - O ZIP traz um `_relatorio.txt` na raiz com o status de cada conversa.
+   - O ZIP traz um `_relatorio.txt` na raiz com o status de cada conversa: `[OK]`, `[NA PASTA DOWNLOADS]`, `[NÃO EXPORTÁVEL]` ou `[FALHA]` com o motivo. Uma conversa não encontrada diz o resultado de cada tentativa (busca e rolagem da lista). Não exportáveis são contadas à parte das falhas, no cabeçalho do relatório, no popup e na mensagem final.
    - O staging só é limpo depois que o download termina. Se o "Salvar como" for cancelado, a extração fica pausada e **Retomar** gera o download de novo.
 
 ### Pausa, cancelamento e interrupções
@@ -103,9 +103,9 @@ whatsapp-extraction-extension/
 npm test
 ```
 
-Roda com `node:test` (Node 18+), sem dependências. Cobre o ZIP (ida e volta, ZIP64, cópia de entradas brutas, CRC32, sanitização de caminhos) e a normalização de títulos. Com `python3` disponível, os ZIPs gerados também são validados pelo `zipfile` do Python.
+Roda com `node:test` (Node 18+), sem dependências. Cobre o ZIP (ida e volta, ZIP64, cópia de entradas brutas, CRC32, sanitização de caminhos), a normalização de títulos e, em `tests/dom-utils.test.js`, os códigos de erro da automação e a mensagem de conversa não encontrada. Com `python3` disponível, os ZIPs gerados também são validados pelo `zipfile` do Python.
 
-`tests/orchestrator.test.js` exercita o `ExtractionOrchestrator` de ponta a ponta: fila com conversas salvas, falha no meio da fila, cancelamento durante a espera do arquivo, texto do relatório, retomada depois de um reinício do service worker e intervalo entre conversas. Ele roda sobre uma API `chrome` falsa (`tests/helpers/fake-chrome.js`), que simula o storage, as abas e o content script do WhatsApp; o staging no IndexedDB e o download do ZIP final são trocados por substitutos que só registram o que receberam. `tests/export-capture-registry.test.js` testa o registro de captura isolado: o que ele recusa (captura não esperada, blocos inválidos, tamanho divergente) e o prazo esgotado.
+`tests/orchestrator.test.js` exercita o `ExtractionOrchestrator` de ponta a ponta: fila com conversas salvas, falha no meio da fila, conversa não exportável, arquivo não entregue no prazo, código do erro em cada resultado, cancelamento durante a espera do arquivo, texto do relatório, retomada depois de um reinício do service worker e intervalo entre conversas. Ele roda sobre uma API `chrome` falsa (`tests/helpers/fake-chrome.js`), que simula o storage, as abas e o content script do WhatsApp; o staging no IndexedDB e o download do ZIP final são trocados por substitutos que só registram o que receberam. `tests/export-capture-registry.test.js` testa o registro de captura isolado: o que ele recusa (captura não esperada, blocos inválidos, tamanho divergente), a falha de leitura na página e o prazo esgotado, com o código de cada caso.
 
 A automação do DOM depende do WhatsApp Web real e não tem teste automatizado no repositório; os snapshots em `kb/page_payloads/` servem de referência para validá-la localmente.
 
@@ -128,5 +128,6 @@ A automação do DOM depende do WhatsApp Web real e não tem teste automatizado 
 
 - **Homônimos:** duas conversas com o mesmo nome visíveis ao mesmo tempo são recusadas (falha registrada); homônimos distantes na lista não são detectáveis, e só um deles é exportado (o relatório avisa quando o scanner detectou a duplicidade).
 - **Conversas arquivadas** não entram na varredura.
+- **Conversas não exportáveis:** quando o menu da conversa não oferece "Exportar conversa" (ex.: a conta "WhatsApp Business" da Meta), o próprio WhatsApp não exporta. A conversa sai como `[NÃO EXPORTÁVEL]` no relatório e não conta como falha.
 - Se o Chrome estiver configurado para perguntar onde salvar cada download, a captura via `chrome.downloads` pode exibir a janela de "Salvar como" para cada conversa.
 - Automatizar o WhatsApp Web contraria os termos de uso do serviço e pode levar a restrições da conta; use intervalos conservadores.

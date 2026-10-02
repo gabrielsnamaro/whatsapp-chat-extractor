@@ -21,6 +21,8 @@ const TEST_TIMEOUT_MS = 5000;
 // seguintes do plano mexerem nele sabendo o que mudou.
 
 const DUPLICATE_NOTE = ' Atenção: existe outra conversa com o mesmo nome, que não foi exportada.';
+// Texto que o content (chat-options-menu.js) devolve quando o menu não tem "Exportar conversa"
+const EXPORT_UNAVAILABLE_MESSAGE = 'Opção "Exportar conversa" não disponível para esta conversa (ex: chat de avisos ou restrito).';
 const DATE_PT_BR = String.raw`\d{2}/\d{2}/\d{4},? \d{2}:\d{2}:\d{2}`;
 
 function sidebarChats(titles, { duplicates = [] } = {}) {
@@ -45,18 +47,26 @@ function createDeferred() {
   return { promise, resolve };
 }
 
+/** Resposta do content real quando a exportação foi disparada na página */
+function triggeredResponse(via = 'visible') {
+  return { success: true, triggered: true, via, warnings: [] };
+}
+
 /**
  * Comportamento da aba no EXPORT_CHAT_REQUEST: entrega o arquivo da conversa, ou responde a
- * falha configurada para aquele título, como o content real faz quando a automação DOM falha
+ * falha configurada para aquele título, como o content real faz quando a automação DOM falha.
+ * A falha é o texto do erro (sem código) ou `{ error, code }`.
  */
 function deliveringExport(orch, { sizes = {}, failures = {} } = {}) {
   return (message) => {
     const { chat, captureId } = message;
-    if (failures[chat.title]) {
-      return { success: false, cancelled: false, error: failures[chat.title] };
+    const failure = failures[chat.title];
+    if (failure) {
+      const { error, code = null } = typeof failure === 'string' ? { error: failure } : failure;
+      return { success: false, cancelled: false, error, code };
     }
     deliverFile(orch, captureId, chatBytes(chat.title, sizes[chat.title] ?? 1536));
-    return { success: true, triggered: true };
+    return triggeredResponse();
   };
 }
 
@@ -83,8 +93,8 @@ function setUp({ chats }) {
   return { fake, staging, archive };
 }
 
-function createOrchestrator() {
-  const orch = new ExtractionOrchestrator();
+function createOrchestrator(options) {
+  const orch = new ExtractionOrchestrator(options);
   harness.orchestrators.push(orch);
   return orch;
 }
@@ -120,7 +130,7 @@ test('três conversas salvas: staging por posição na fila, ZIP e mensagem fina
   const state = orch.getState();
   assert.equal(state.state, WORKFLOW_STATES.COMPLETED);
   assert.equal(orch.isBusy(), false);
-  assert.deepEqual(state.summary, { saved: 3, savedToDisk: 0, failed: 0 });
+  assert.deepEqual(state.summary, { saved: 3, savedToDisk: 0, notExportable: 0, failed: 0 });
   assert.equal(state.total, 3);
   assert.equal(state.percentage, 100);
   assert.equal(state.currentChatTitle, 'Concluído');
@@ -187,6 +197,8 @@ test('três conversas salvas: staging por posição na fila, ZIP e mensagem fina
   assert.equal(persisted.state, WORKFLOW_STATES.COMPLETED);
   assert.equal(persisted.nextIndex, 3);
   assert.deepEqual(persisted.results.map((r) => r.status), ['saved', 'saved', 'saved']);
+  // Sem erro não há código; o `via` vem da resposta da aba
+  assert.deepEqual(persisted.results.map((r) => [r.code, r.via]), [[null, 'visible'], [null, 'visible'], [null, 'visible']]);
 });
 
 test('falha no meio da fila não interrompe as conversas seguintes', { timeout: TEST_TIMEOUT_MS }, async () => {
@@ -198,12 +210,15 @@ test('falha no meio da fila não interrompe as conversas seguintes', { timeout: 
 
   const state = orch.getState();
   assert.equal(state.state, WORKFLOW_STATES.COMPLETED);
-  assert.deepEqual(state.summary, { saved: 2, savedToDisk: 0, failed: 1 });
+  assert.deepEqual(state.summary, { saved: 2, savedToDisk: 0, notExportable: 0, failed: 1 });
   assert.deepEqual(fake.content.exportRequests.map((m) => m.chat.title), ['Ana', 'Bia', 'Caio']);
   assert.deepEqual(orch.run.results.map((r) => r.status), ['saved', 'failed', 'saved']);
+  // Falha sem código conhecido: `code` null; a aba não confirmou a exportação, então `via` também
   assert.deepEqual(orch.run.results[1], {
     title: 'Bia',
     status: 'failed',
+    code: null,
+    via: null,
     message: '"Bia": Conversa não encontrada na lista.'
   });
 
@@ -247,7 +262,7 @@ test('cancelamento durante a espera do arquivo encerra sem empacotar', { timeout
   // A conversa interrompida não ganha resultado e fica como a próxima da fila
   assert.equal(orch.run.nextIndex, 1);
   assert.equal(orch.run.results.length, 1);
-  assert.deepEqual(state.summary, { saved: 1, savedToDisk: 0, failed: 0 });
+  assert.deepEqual(state.summary, { saved: 1, savedToDisk: 0, notExportable: 0, failed: 0 });
 
   // O staging não é limpo no cancelamento
   assert.deepEqual([...staging.files.keys()], ['000000']);
@@ -291,13 +306,137 @@ test('relatório: cabeçalho, datas e uma linha por conversa', { timeout: TEST_T
   assert.match(lines[2], new RegExp(`^Geração do ZIP: ${DATE_PT_BR}$`));
   assert.deepEqual(lines.slice(3), [
     'Modo: limite de 3 conversa(s)',
-    'Conversas na fila: 3 | no ZIP: 2 | na pasta Downloads: 0 | falhas: 1',
+    'Conversas na fila: 3 | no ZIP: 2 | na pasta Downloads: 0 | não exportáveis: 0 | falhas: 1',
     '',
     '[OK] 1. "Ana" salvo (1.5 KB).',
     '[FALHA] 2. "Bia": Conversa não encontrada na lista.',
     `[OK] 3. "Caio" salvo (3.0 KB).${DUPLICATE_NOTE}`,
     ''
   ]);
+});
+
+test('conversa sem "Exportar conversa" no menu é não exportável, contada à parte das falhas', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const { fake, archive } = setUp({ chats: sidebarChats(['Ana', 'Bia', 'Caio']) });
+  const orch = createOrchestrator();
+  fake.content.onExport = deliveringExport(orch, {
+    failures: { Bia: { error: EXPORT_UNAVAILABLE_MESSAGE, code: 'EXPORT_OPTION_UNAVAILABLE' } }
+  });
+
+  await orch.start({ safeDelayMs: 0 });
+
+  const state = orch.getState();
+  assert.equal(state.state, WORKFLOW_STATES.COMPLETED);
+  assert.deepEqual(state.summary, { saved: 2, savedToDisk: 0, notExportable: 1, failed: 0 });
+  assert.deepEqual(fake.content.exportRequests.map((m) => m.chat.title), ['Ana', 'Bia', 'Caio']);
+  assert.deepEqual(orch.run.results[1], {
+    title: 'Bia',
+    status: 'not_exportable',
+    code: 'EXPORT_OPTION_UNAVAILABLE',
+    via: null,
+    message: `"Bia": ${EXPORT_UNAVAILABLE_MESSAGE}`
+  });
+
+  const lines = archive.calls[0].report.split('\n');
+  assert.equal(lines[4], 'Conversas na fila: 3 | no ZIP: 2 | na pasta Downloads: 0 | não exportáveis: 1 | falhas: 0');
+  assert.deepEqual(lines.slice(6, 9), [
+    '[OK] 1. "Ana" salvo (1.5 KB).',
+    `[NÃO EXPORTÁVEL] 2. "Bia": ${EXPORT_UNAVAILABLE_MESSAGE}`,
+    '[OK] 3. "Caio" salvo (1.5 KB).'
+  ]);
+
+  // Popup: o aviso da conversa leva a marcação, e o resumo traz a contagem à parte
+  const updates = fake.progressUpdates();
+  assert.deepEqual(
+    updates.map((m) => m.warningMessage).filter(Boolean),
+    [`[2/3] ⚠️ [NÃO EXPORTÁVEL] "Bia": ${EXPORT_UNAVAILABLE_MESSAGE}`]
+  );
+  assert.equal(updates.at(-1).summary.notExportable, 1);
+  assert.equal(updates.at(-1).summary.failed, 0);
+  assert.match(state.statusMessage, /\. 2 conversa\(s\) no ZIP, 0 falha\(s\), 1 não exportável\(is\)\.$/);
+});
+
+test('arquivo não entregue no prazo: falha FILE_NOT_DELIVERED com o prazo em segundos, e a fila segue', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const { fake, archive } = setUp({ chats: sidebarChats(['Ana', 'Bia', 'Caio']) });
+  const orch = createOrchestrator({ timings: { captureTimeoutMs: 50 } });
+  const deliver = deliveringExport(orch);
+  // Bia: a página abre a conversa pela busca e confirma a exportação, mas o arquivo nunca chega
+  fake.content.onExport = (message) => (message.chat.title === 'Bia' ? triggeredResponse('search') : deliver(message));
+
+  const startedAt = performance.now();
+  await orch.start({ safeDelayMs: 0 });
+  assert.ok(performance.now() - startedAt >= 45, 'a espera pelo arquivo deveria durar o prazo configurado');
+
+  const state = orch.getState();
+  assert.equal(state.state, WORKFLOW_STATES.COMPLETED);
+  assert.deepEqual(state.summary, { saved: 2, savedToDisk: 0, notExportable: 0, failed: 1 });
+  assert.deepEqual(fake.content.exportRequests.map((m) => m.chat.title), ['Ana', 'Bia', 'Caio']);
+
+  const notDelivered = 'O WhatsApp Web não entregou o arquivo exportado em 0.05 s.';
+  assert.deepEqual(orch.run.results[1], {
+    title: 'Bia',
+    status: 'failed',
+    code: 'FILE_NOT_DELIVERED',
+    via: 'search',
+    message: `"Bia": ${notDelivered}`
+  });
+  assert.equal(archive.calls[0].report.split('\n')[7], `[FALHA] 2. "Bia": ${notDelivered}`);
+  assert.equal(fake.readStorage('extractionRun').results[1].code, 'FILE_NOT_DELIVERED');
+});
+
+test('código do erro gravado em cada resultado, venha da página ou da captura do arquivo', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const { fake } = setUp({ chats: sidebarChats(['Ana', 'Bia', 'Caio', 'Davi', 'Eva']) });
+  const orch = createOrchestrator();
+  const deliver = deliveringExport(orch, {
+    failures: { Ana: { error: 'Há mais de uma conversa chamada "Ana"; não é possível escolher com segurança.', code: 'AMBIGUOUS_TITLE' } }
+  });
+  fake.content.onExport = (message) => {
+    const { chat, captureId } = message;
+    const transfer = (fields) => orch.captures.handleTransferMessage({ captureId, ...fields });
+    switch (chat.title) {
+      case 'Bia':
+        // A página confirmou a exportação, mas não conseguiu ler o arquivo gerado
+        transfer({ action: ACTIONS.EXPORT_TRANSFER_FAILED, error: 'HTTP 404 ao ler o arquivo exportado.' });
+        return triggeredResponse();
+      case 'Caio':
+        // Chegaram menos bytes do que o anunciado no início da transferência
+        transfer({ action: ACTIONS.EXPORT_TRANSFER_START, filename: 'conversa.zip', mimeType: 'application/zip', size: 10, totalChunks: 1 });
+        transfer({ action: ACTIONS.EXPORT_TRANSFER_CHUNK, index: 0, data: Buffer.from('12345').toString('base64') });
+        transfer({ action: ACTIONS.EXPORT_TRANSFER_END });
+        return triggeredResponse();
+      case 'Davi':
+        deliverFile(orch, captureId, chatBytes('Davi', 1536));
+        return triggeredResponse('search');
+      case 'Eva':
+        orch.captures.resolveSavedToDisk(captureId, { filename: 'Conversa do WhatsApp com Eva.zip', downloadId: 9 });
+        return triggeredResponse('scroll');
+      default:
+        return deliver(message);
+    }
+  };
+
+  await orch.start({ safeDelayMs: 0 });
+
+  const state = orch.getState();
+  assert.equal(state.state, WORKFLOW_STATES.COMPLETED);
+  assert.deepEqual(state.summary, { saved: 1, savedToDisk: 1, notExportable: 0, failed: 3 });
+  assert.deepEqual(orch.run.results.map(({ status, code, via }) => [status, code, via]), [
+    ['failed', 'AMBIGUOUS_TITLE', null],
+    ['failed', 'TRANSFER_FAILED', 'visible'],
+    ['failed', 'SIZE_MISMATCH', 'visible'],
+    ['saved', null, 'search'],
+    ['saved_to_disk', null, 'scroll']
+  ]);
+  assert.deepEqual(orch.run.results.slice(1, 3).map((r) => r.message), [
+    '"Bia": HTTP 404 ao ler o arquivo exportado.',
+    '"Caio": Arquivo recebido com 5 bytes; esperados 10.'
+  ]);
+
+  // O código e o `via` sobrevivem ao checkpoint, para a retomada e o relatório
+  assert.deepEqual(
+    fake.readStorage('extractionRun').results.map((r) => [r.code, r.via]),
+    [['AMBIGUOUS_TITLE', null], ['TRANSFER_FAILED', 'visible'], ['SIZE_MISMATCH', 'visible'], [null, 'search'], [null, 'scroll']]
+  );
+  assert.match(state.statusMessage, /\. 1 conversa\(s\) no ZIP, 3 falha\(s\), 1 baixada\(s\) direto na pasta Downloads\.$/);
 });
 
 test('retomada no meio da fila: nova instância exporta só as conversas restantes', { timeout: TEST_TIMEOUT_MS }, async () => {
@@ -349,7 +488,7 @@ test('retomada no meio da fila: nova instância exporta só as conversas restant
 
   const state = orchB.getState();
   assert.equal(state.state, WORKFLOW_STATES.COMPLETED);
-  assert.deepEqual(state.summary, { saved: 5, savedToDisk: 0, failed: 0 });
+  assert.deepEqual(state.summary, { saved: 5, savedToDisk: 0, notExportable: 0, failed: 0 });
 
   // B reconfere a aba, não refaz a varredura e continua do índice salvo, com o mesmo runId
   assert.equal(fakeB.content.readyChecks, 1);

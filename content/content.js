@@ -125,12 +125,12 @@
 
             const operation = beginOperation();
             try {
-              await chatNavigator.openChat(chat, { signal: operation.signal });
+              const { via } = await chatNavigator.openChat(chat, { signal: operation.signal });
               // Arma a captura antes de abrir o menu: o clique em "Exportar" já gera o download
               armedCaptureId = captureId;
               await optionsMenu.triggerExportOption({ signal: operation.signal });
               await modalHandler.confirmExport({ signal: operation.signal });
-              sendResponse({ success: true, triggered: true });
+              sendResponse({ success: true, triggered: true, via, warnings: [] });
             } catch (err) {
               if (armedCaptureId === captureId) armedCaptureId = null;
               throw err;
@@ -175,7 +175,9 @@
       } catch (err) {
         const cancelled = err instanceof OperationCancelledError;
         if (!cancelled) console.error('[WhatsApp Web Extractor] Erro no mediator do content script:', err);
-        sendResponse({ success: false, cancelled, error: err.message });
+        // DOMException traz um `code` numérico legado; só os códigos em texto são da extensão (DomUtils.ERROR_CODES)
+        const code = typeof err.code === 'string' ? err.code : null;
+        sendResponse({ success: false, cancelled, error: err.message, code });
       }
     })();
 

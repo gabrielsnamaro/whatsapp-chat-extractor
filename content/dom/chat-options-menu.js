@@ -4,7 +4,9 @@
  * e acionar a opção nativa "Exportar conversa".
  */
 (function registerChatOptionsMenu() {
-  const { SELECTORS, TIMEOUTS, waitFor, sleep, isVisible, simulateClick, pressEscape } = window.DomUtils;
+  const {
+    SELECTORS, TIMEOUTS, ERROR_CODES, DomAutomationError, waitFor, sleep, isVisible, simulateClick, pressEscape
+  } = window.DomUtils;
 
   class ChatOptionsMenu {
     /**
@@ -98,7 +100,10 @@
       const exportItem = this.findExportMenuItem(menu);
       if (!exportItem) {
         this.closeMenu();
-        throw new Error('Opção "Exportar conversa" não disponível para esta conversa (ex: chat de avisos ou restrito).');
+        throw new DomAutomationError(
+          ERROR_CODES.EXPORT_OPTION_UNAVAILABLE,
+          'Opção "Exportar conversa" não disponível para esta conversa (ex: chat de avisos ou restrito).'
+        );
       }
 
       simulateClick(exportItem);

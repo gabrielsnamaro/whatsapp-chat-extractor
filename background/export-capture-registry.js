@@ -3,11 +3,35 @@ import { Logger } from '../shared/utils/logger.js';
 
 const log = new Logger('ExportCaptureRegistry');
 
+/** Códigos gravados no resultado da conversa quando o arquivo não chega inteiro */
+export const CAPTURE_ERROR_CODES = Object.freeze({
+  FILE_NOT_DELIVERED: 'FILE_NOT_DELIVERED',
+  TRANSFER_FAILED: 'TRANSFER_FAILED',
+  SIZE_MISMATCH: 'SIZE_MISMATCH'
+});
+
 export class CaptureCancelledError extends Error {
   constructor(message = 'Captura cancelada.') {
     super(message);
     this.name = 'CaptureCancelledError';
   }
+}
+
+export class CaptureFailedError extends Error {
+  /**
+   * @param {string} code Um dos CAPTURE_ERROR_CODES
+   * @param {string} message Texto exibido no relatório da extração
+   */
+  constructor(code, message) {
+    super(message);
+    this.name = 'CaptureFailedError';
+    this.code = code;
+  }
+}
+
+/** Prazo legível: o de produção é de minutos, mas um prazo curto não pode virar "0 min" */
+function formatTimeout(ms) {
+  return ms >= 60000 ? `${Math.round(ms / 60000)} min` : `${Number((ms / 1000).toFixed(2))} s`;
 }
 
 function base64ToBytes(base64) {
@@ -108,7 +132,10 @@ export class ExportCaptureRegistry {
         }
         const blob = new Blob(transfer.chunks, { type: transfer.mimeType });
         if (transfer.size && blob.size !== transfer.size) {
-          this._fail(message.captureId, new Error(`Arquivo recebido com ${blob.size} bytes; esperados ${transfer.size}.`));
+          this._fail(message.captureId, new CaptureFailedError(
+            CAPTURE_ERROR_CODES.SIZE_MISMATCH,
+            `Arquivo recebido com ${blob.size} bytes; esperados ${transfer.size}.`
+          ));
           return { success: false, error: 'Tamanho do arquivo recebido não confere.' };
         }
         this._settle(message.captureId, { filename: transfer.filename, blob, source: transfer.source });
@@ -116,7 +143,10 @@ export class ExportCaptureRegistry {
       }
 
       case ACTIONS.EXPORT_TRANSFER_FAILED:
-        this._fail(message.captureId, new Error(message.error || 'Falha ao ler o arquivo exportado na página.'));
+        this._fail(message.captureId, new CaptureFailedError(
+          CAPTURE_ERROR_CODES.TRANSFER_FAILED,
+          message.error || 'Falha ao ler o arquivo exportado na página.'
+        ));
         return { success: true };
 
       default:
@@ -180,8 +210,10 @@ export class ExportCaptureRegistry {
     if (!capture.waiter || !capture.timeoutMs) return;
     clearTimeout(capture.timer);
     capture.timer = setTimeout(() => {
-      const minutes = Math.round(capture.timeoutMs / 60000);
-      this._fail(capture.id, new Error(`O WhatsApp Web não entregou o arquivo exportado em ${minutes} min.`));
+      this._fail(capture.id, new CaptureFailedError(
+        CAPTURE_ERROR_CODES.FILE_NOT_DELIVERED,
+        `O WhatsApp Web não entregou o arquivo exportado em ${formatTimeout(capture.timeoutMs)}.`
+      ));
     }, capture.timeoutMs);
   }
 

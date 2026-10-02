@@ -32,7 +32,8 @@ function urlPatternToRegExp(pattern) {
 /**
  * Content script simulado da aba do WhatsApp. Por padrão responde sucesso ao
  * EXPORT_CHAT_REQUEST sem entregar arquivo nenhum (como se o WhatsApp não gerasse o download);
- * cada cenário define `onExport` para entregar o arquivo (deliverFile) ou falhar.
+ * cada cenário define `onExport` para entregar o arquivo (deliverFile) ou falhar (resposta de falha
+ * ou exceção; um `code` em texto na exceção vai na resposta, como no content real).
  */
 function createFakeContent({ chats, ready }) {
   const content = {
@@ -60,11 +61,11 @@ function createFakeContent({ chats, ready }) {
         case ACTIONS.EXPORT_CHAT_REQUEST:
           content.exportRequests.push({ ...message, receivedAt: performance.now() });
           if (!content.onExport) return { success: true, triggered: true };
-          // Como o content real: um erro na página vira resposta de falha, não exceção
+          // Como o content real: um erro na página vira resposta de falha, com o código dele, não exceção
           try {
             return await content.onExport(message);
           } catch (err) {
-            return { success: false, cancelled: false, error: err.message };
+            return { success: false, cancelled: false, error: err.message, code: typeof err.code === 'string' ? err.code : null };
           }
 
         case ACTIONS.DISARM_EXPORT_CAPTURE:

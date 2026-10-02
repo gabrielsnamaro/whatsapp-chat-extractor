@@ -1,7 +1,7 @@
 /**
  * DomUtils
  * Responsabilidade Única: Utilitários compartilhados pelas classes de automação DOM
- * (seletores, esperas com timeout/cancelamento, clique simulado e leitura de títulos).
+ * (seletores, códigos de erro, esperas com timeout/cancelamento, clique simulado e leitura de títulos).
  *
  * Content scripts clássicos não importam módulos ES, por isso o compartilhamento é via window.
  * Deve ser o primeiro arquivo da lista de content scripts no manifest.
@@ -63,6 +63,29 @@
     MODAL_CLOSE_MS: 5000
   });
 
+  /**
+   * Códigos de erro da automação DOM. Vão na resposta ao background, que classifica o resultado
+   * da conversa por eles (ex: uma conversa não exportável é contada à parte das falhas).
+   */
+  const ERROR_CODES = Object.freeze({
+    CHAT_NOT_FOUND: 'CHAT_NOT_FOUND',
+    AMBIGUOUS_TITLE: 'AMBIGUOUS_TITLE',
+    EXPORT_OPTION_UNAVAILABLE: 'EXPORT_OPTION_UNAVAILABLE',
+    DATE_RANGE_NOT_ALL: 'DATE_RANGE_NOT_ALL',
+    TIMEOUT: 'TIMEOUT'
+  });
+
+  /** Por que uma tentativa de localizar a conversa na lista lateral não achou a célula */
+  const LOCATE_FAILURES = Object.freeze({
+    SEARCH_INPUT_MISSING: 'search-input-missing',
+    SEARCH_NO_RESULT: 'search-no-result',
+    LIST_MISSING: 'list-missing',
+    END_OF_LIST: 'end-of-list',
+    SCROLL_STALLED: 'scroll-stalled'
+  });
+
+  const LOCATE_VIA_LABELS = Object.freeze({ search: 'busca', scroll: 'rolagem' });
+
   class OperationCancelledError extends Error {
     constructor(message = 'Operação cancelada.') {
       super(message);
@@ -74,7 +97,61 @@
     constructor(message) {
       super(message);
       this.name = 'OperationTimeoutError';
+      this.code = ERROR_CODES.TIMEOUT;
     }
+  }
+
+  class DomAutomationError extends Error {
+    /**
+     * @param {string} code Um dos ERROR_CODES
+     * @param {string} message Texto exibido no relatório da extração
+     */
+    constructor(code, message) {
+      super(message);
+      this.name = 'DomAutomationError';
+      this.code = code;
+    }
+  }
+
+  function formatSeconds(ms) {
+    return `${Number((ms / 1000).toFixed(2))} s`;
+  }
+
+  /**
+   * @param {{ via: string, reason: string, timeoutMs?: number, steps?: number }} attempt
+   * @returns {string}
+   */
+  function describeFailedAttempt({ via, reason, timeoutMs, steps }) {
+    const label = LOCATE_VIA_LABELS[via];
+    if (!label) throw new Error(`Tentativa de localização desconhecida: ${via}`);
+
+    switch (reason) {
+      case LOCATE_FAILURES.SEARCH_INPUT_MISSING:
+        return `${label}: campo de busca não encontrado`;
+      case LOCATE_FAILURES.SEARCH_NO_RESULT:
+        return `${label}: sem resultado em ${formatSeconds(timeoutMs)}`;
+      case LOCATE_FAILURES.LIST_MISSING:
+        return `${label}: lista lateral não encontrada`;
+      case LOCATE_FAILURES.END_OF_LIST:
+        return `${label}: ${steps} passo(s) até o fim da lista`;
+      case LOCATE_FAILURES.SCROLL_STALLED:
+        return `${label}: parou após ${steps} passo(s), antes do fim da lista`;
+      default:
+        throw new Error(`Motivo de tentativa desconhecido: ${reason}`);
+    }
+  }
+
+  /**
+   * Mensagem de conversa não encontrada com o motivo de cada tentativa (busca, rolagem).
+   * Não toca no DOM, para ser testada no Node.
+   * @param {string} targetTitle
+   * @param {Array<{ via: 'search'|'scroll', reason: string, timeoutMs?: number, steps?: number }>} failedAttempts
+   * @returns {string}
+   */
+  function buildChatNotFoundMessage(targetTitle, failedAttempts) {
+    const base = `Conversa "${targetTitle}" não foi encontrada na lista lateral`;
+    if (!failedAttempts.length) return `${base}.`;
+    return `${base} (${failedAttempts.map(describeFailedAttempt).join('; ')}).`;
   }
 
   function throwIfAborted(signal) {
@@ -237,8 +314,12 @@
   const DomUtils = Object.freeze({
     SELECTORS,
     TIMEOUTS,
+    ERROR_CODES,
+    LOCATE_FAILURES,
     OperationCancelledError,
     OperationTimeoutError,
+    DomAutomationError,
+    buildChatNotFoundMessage,
     throwIfAborted,
     sleep,
     waitFor,

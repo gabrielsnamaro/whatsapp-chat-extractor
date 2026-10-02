@@ -51,7 +51,7 @@ export class ProgressView {
    * @param {string} [data.currentChatTitle='']
    * @param {string} [data.errorMessage=null]
    * @param {string} [data.statusMessage=null] Mensagem de estado (ex: execução interrompida, download não concluído)
-   * @param {{ saved: number, savedToDisk: number, failed: number }} [data.summary]
+   * @param {{ saved: number, savedToDisk: number, notExportable: number, failed: number }} [data.summary]
    */
   renderProgress({ state, current = 0, total = 0, percentage = 0, currentChatTitle = '', errorMessage = null, statusMessage = null, summary = null }) {
     if (!this.container) return;
@@ -75,7 +75,8 @@ export class ProgressView {
         this.label.textContent = 'Buscando lista de chats...';
       } else if (total > 0) {
         const failures = summary?.failed ? ` · ${summary.failed} falha(s)` : '';
-        this.label.textContent = `${current} de ${total} (${validPercent}%)${failures}`;
+        const notExportable = summary?.notExportable ? ` · ${summary.notExportable} não exportável(is)` : '';
+        this.label.textContent = `${current} de ${total} (${validPercent}%)${failures}${notExportable}`;
       } else {
         this.label.textContent = `${validPercent}%`;
       }

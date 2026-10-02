@@ -5,8 +5,8 @@
  */
 (function registerChatNavigator() {
   const {
-    SELECTORS, TIMEOUTS, OperationTimeoutError,
-    waitFor, sleep, throwIfAborted, simulateClick, pressEscape,
+    SELECTORS, TIMEOUTS, ERROR_CODES, LOCATE_FAILURES, OperationTimeoutError, DomAutomationError,
+    buildChatNotFoundMessage, waitFor, sleep, throwIfAborted, simulateClick, pressEscape,
     readTextWithEmojis, readCellTitle, isTitleMatch
   } = window.DomUtils;
 
@@ -65,7 +65,10 @@
     findVisibleCellByTitle(targetTitle) {
       const matches = this._findMatchingCells(document.querySelector(SELECTORS.PANE_SIDE), targetTitle);
       if (matches.length > 1) {
-        throw new Error(`Há mais de uma conversa chamada "${targetTitle}"; não é possível escolher com segurança.`);
+        throw new DomAutomationError(
+          ERROR_CODES.AMBIGUOUS_TITLE,
+          `Há mais de uma conversa chamada "${targetTitle}"; não é possível escolher com segurança.`
+        );
       }
       return matches[0] || null;
     }
@@ -116,15 +119,17 @@
      * @private
      * @param {string} targetTitle
      * @param {AbortSignal} [signal]
-     * @returns {Promise<HTMLElement|null>}
+     * @returns {Promise<{ cell: HTMLElement|null, failure: Object|null }>} `failure` diz por que a célula não foi achada
      */
     async _locateCellViaSearch(targetTitle, signal) {
       const input = this._findSearchInput();
-      if (!input) return null;
+      if (!input) {
+        return { cell: null, failure: { via: 'search', reason: LOCATE_FAILURES.SEARCH_INPUT_MISSING } };
+      }
 
       this._setSearchText(input, targetTitle);
       try {
-        return await waitFor(
+        const cell = await waitFor(
           () => this._findMatchingCells(document.querySelector(SELECTORS.SIDE_PANEL), targetTitle)[0] || null,
           {
             timeoutMs: this.timeouts.searchResultsMs,
@@ -132,10 +137,14 @@
             signal
           }
         );
+        return { cell, failure: null };
       } catch (err) {
         if (err instanceof OperationTimeoutError) {
           this.clearSearch();
-          return null;
+          return {
+            cell: null,
+            failure: { via: 'search', reason: LOCATE_FAILURES.SEARCH_NO_RESULT, timeoutMs: this.timeouts.searchResultsMs }
+          };
         }
         throw err;
       }
@@ -147,31 +156,40 @@
      * @private
      * @param {string} targetTitle
      * @param {AbortSignal} [signal]
-     * @returns {Promise<HTMLElement|null>}
+     * @returns {Promise<{ cell: HTMLElement|null, failure: Object|null }>} `failure` diz por que a célula não foi achada
      */
     async _locateCellWithScroll(targetTitle, signal) {
       const pane = document.querySelector(SELECTORS.PANE_SIDE);
-      if (!pane) return null;
+      if (!pane) {
+        return { cell: null, failure: { via: 'scroll', reason: LOCATE_FAILURES.LIST_MISSING } };
+      }
 
       pane.scrollTop = 0;
       await sleep(300, signal);
 
       const step = Math.max(100, Math.floor(pane.clientHeight * 0.7));
       let consecutiveStall = 0;
+      let steps = 0;
 
       while (true) {
         throwIfAborted(signal);
         const cell = this.findVisibleCellByTitle(targetTitle);
-        if (cell) return cell;
+        if (cell) return { cell, failure: null };
 
         const previousTop = pane.scrollTop;
         pane.scrollTop += step;
         await sleep(this.scrollDelayMs, signal);
+        // Só conta o passo em que a lista andou: as tentativas paradas no fim não são rolagem
+        if (pane.scrollTop !== previousTop) steps++;
 
         const isAtBottom = pane.scrollTop + pane.clientHeight >= pane.scrollHeight - 5;
         consecutiveStall = pane.scrollTop === previousTop || isAtBottom ? consecutiveStall + 1 : 0;
         if (consecutiveStall >= 3) {
-          return this.findVisibleCellByTitle(targetTitle);
+          const lastCell = this.findVisibleCellByTitle(targetTitle);
+          if (lastCell) return { cell: lastCell, failure: null };
+          // A rolagem também para quando o scrollTop deixa de mudar antes do fim da lista
+          const reason = isAtBottom ? LOCATE_FAILURES.END_OF_LIST : LOCATE_FAILURES.SCROLL_STALLED;
+          return { cell: null, failure: { via: 'scroll', reason, steps } };
         }
       }
     }
@@ -204,16 +222,21 @@
       // 3. Localiza a célula: visível agora → busca → varredura completa da lista
       let via = 'visible';
       let cellElement = this.findVisibleCellByTitle(targetTitle);
+      const failedAttempts = [];
       if (!cellElement) {
         via = 'search';
-        cellElement = await this._locateCellViaSearch(targetTitle, signal);
+        const search = await this._locateCellViaSearch(targetTitle, signal);
+        cellElement = search.cell;
+        if (search.failure) failedAttempts.push(search.failure);
       }
       if (!cellElement) {
         via = 'scroll';
-        cellElement = await this._locateCellWithScroll(targetTitle, signal);
+        const scroll = await this._locateCellWithScroll(targetTitle, signal);
+        cellElement = scroll.cell;
+        if (scroll.failure) failedAttempts.push(scroll.failure);
       }
       if (!cellElement) {
-        throw new Error(`Conversa "${targetTitle}" não foi encontrada na lista lateral.`);
+        throw new DomAutomationError(ERROR_CODES.CHAT_NOT_FOUND, buildChatNotFoundMessage(targetTitle, failedAttempts));
       }
 
       try {

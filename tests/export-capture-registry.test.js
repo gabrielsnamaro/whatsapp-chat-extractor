@@ -103,9 +103,10 @@ test('bloco fora da faixa ou antes do início é recusado, e o fim exige todos o
   assert.equal(await captured.blob.text(), 'primeira|segunda');
 });
 
-test('tamanho divergente rejeita a espera, esteja ela registrada antes ou depois', async () => {
+test('tamanho divergente rejeita a espera com SIZE_MISMATCH, esteja ela registrada antes ou depois', async () => {
   const registry = new ExportCaptureRegistry();
   const mismatch = { success: false, error: 'Tamanho do arquivo recebido não confere.' };
+  const rejection = { message: 'Arquivo recebido com 5 bytes; esperados 10.', code: 'SIZE_MISMATCH' };
   const bytes = encoder.encode('12345');
 
   // Espera registrada antes da transferência (o caso comum: o arquivo chega depois do clique)
@@ -114,29 +115,69 @@ test('tamanho divergente rejeita a espera, esteja ela registrada antes ou depois
   start(registry, 'antes', { size: 10 });
   chunk(registry, 'antes', 0, bytes);
   assert.deepEqual(end(registry, 'antes'), mismatch);
-  await assert.rejects(waiting, { message: 'Arquivo recebido com 5 bytes; esperados 10.' });
+  await assert.rejects(waiting, rejection);
 
   // Arquivo entregue antes da espera: o erro fica guardado para quem chamar waitFor
   registry.expect('depois');
   start(registry, 'depois', { size: 10 });
   chunk(registry, 'depois', 0, bytes);
   assert.deepEqual(end(registry, 'depois'), mismatch);
-  await assert.rejects(registry.waitFor('depois', { timeoutMs: 1000 }), { message: 'Arquivo recebido com 5 bytes; esperados 10.' });
+  await assert.rejects(registry.waitFor('depois', { timeoutMs: 1000 }), rejection);
 
   // Depois da falha, a captura deixa de existir
   assert.deepEqual(start(registry, 'antes', { size: 5 }), { success: false, error: UNEXPECTED_CAPTURE });
 });
 
-test('prazo esgotado sem atividade rejeita a espera e descarta a captura', async () => {
+test('falha de leitura na página rejeita a espera com TRANSFER_FAILED', async () => {
+  const registry = new ExportCaptureRegistry();
+  const failed = (captureId, fields = {}) => registry.handleTransferMessage({ action: ACTIONS.EXPORT_TRANSFER_FAILED, captureId, ...fields });
+
+  registry.expect('com-motivo');
+  const waiting = registry.waitFor('com-motivo', { timeoutMs: 1000 });
+  assert.deepEqual(failed('com-motivo', { error: 'HTTP 404 ao ler o arquivo exportado.' }), { success: true });
+  await assert.rejects(waiting, { message: 'HTTP 404 ao ler o arquivo exportado.', code: 'TRANSFER_FAILED' });
+
+  // Sem o motivo vindo da página, a mensagem padrão; o erro também fica guardado para um waitFor posterior
+  registry.expect('sem-motivo');
+  failed('sem-motivo');
+  await assert.rejects(
+    registry.waitFor('sem-motivo', { timeoutMs: 1000 }),
+    { message: 'Falha ao ler o arquivo exportado na página.', code: 'TRANSFER_FAILED' }
+  );
+});
+
+test('prazo esgotado sem atividade rejeita a espera com FILE_NOT_DELIVERED e descarta a captura', async () => {
   const registry = new ExportCaptureRegistry();
   registry.expect('a');
 
   const startedAt = performance.now();
-  // O texto arredonda o prazo para minutos: com 30 ms, a mensagem diz "0 min"
+  // Prazo abaixo de 1 min aparece em segundos (antes, 30 ms viravam "0 min")
   await assert.rejects(
     registry.waitFor('a', { timeoutMs: 30 }),
-    { message: 'O WhatsApp Web não entregou o arquivo exportado em 0 min.' }
+    { message: 'O WhatsApp Web não entregou o arquivo exportado em 0.03 s.', code: 'FILE_NOT_DELIVERED' }
   );
   assert.ok(performance.now() - startedAt >= 20, 'a espera não deveria expirar antes do prazo');
   assert.deepEqual(start(registry, 'a'), { success: false, error: UNEXPECTED_CAPTURE });
+});
+
+test('prazo de produção (10 min) aparece em minutos na mensagem', async () => {
+  const registry = new ExportCaptureRegistry();
+  registry.expect('a');
+
+  // O timer do prazo dispara na hora, para o teste não esperar os 10 min; o valor pedido fica registrado
+  const realSetTimeout = globalThis.setTimeout;
+  const requested = [];
+  globalThis.setTimeout = (callback, ms, ...args) => {
+    requested.push(ms);
+    return realSetTimeout(callback, 0, ...args);
+  };
+  try {
+    await assert.rejects(
+      registry.waitFor('a', { timeoutMs: 10 * 60 * 1000 }),
+      { message: 'O WhatsApp Web não entregou o arquivo exportado em 10 min.', code: 'FILE_NOT_DELIVERED' }
+    );
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+  }
+  assert.deepEqual(requested, [10 * 60 * 1000]);
 });

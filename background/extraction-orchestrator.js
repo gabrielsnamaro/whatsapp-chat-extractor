@@ -26,8 +26,14 @@ const ACTIVE_STATES = [
 const RESULT_STATUS = Object.freeze({
   SAVED: 'saved',
   SAVED_TO_DISK: 'saved_to_disk',
+  NOT_EXPORTABLE: 'not_exportable',
   FAILED: 'failed'
 });
+
+// Código lançado pelo content (DomUtils.ERROR_CODES em content/dom/dom-utils.js; content script
+// clássico não é importável aqui) quando o menu não oferece "Exportar conversa". O próprio WhatsApp
+// não exporta essa conversa, então ela é contada à parte e não como falha.
+const NOT_EXPORTABLE_CODE = 'EXPORT_OPTION_UNAVAILABLE';
 
 class RunCancelledError extends Error {
   constructor() {
@@ -41,6 +47,16 @@ function formatSize(bytes) {
 }
 
 /**
+ * Código de erro de uma resposta da aba ou de uma exceção. DOMException (ex: do IndexedDB) traz um
+ * `code` numérico legado, que não é um código desta extensão.
+ * @param {{ code?: unknown }|null|undefined} source
+ * @returns {string|null}
+ */
+function errorCodeOf(source) {
+  return typeof source?.code === 'string' ? source.code : null;
+}
+
+/**
  * ExtractionOrchestrator
  * Responsabilidade Única: Coordenação do ciclo de vida da fila de extração em lote,
  * aplicação de restrições de limites de conversas, controle de pausas e disparo
@@ -50,7 +66,13 @@ function formatSize(bytes) {
  * worker no meio de execuções longas, e a execução volta como pausada para ser retomada.
  */
 export class ExtractionOrchestrator {
-  constructor() {
+  /**
+   * @param {Object} [options]
+   * @param {Object} [options.timings] Prazos em ms; os testes encurtam para não esperar os de produção
+   * @param {number} [options.timings.captureTimeoutMs] Espera pelo arquivo exportado, contada da última atividade
+   */
+  constructor({ timings = {} } = {}) {
+    this.timings = { captureTimeoutMs: CAPTURE_TIMEOUT_MS, ...timings };
     this.state = WORKFLOW_STATES.IDLE;
     this.isPaused = false;
     this.errorMessage = null;
@@ -134,6 +156,7 @@ export class ExtractionOrchestrator {
       summary: {
         saved: results.filter((r) => r.status === RESULT_STATUS.SAVED).length,
         savedToDisk: results.filter((r) => r.status === RESULT_STATUS.SAVED_TO_DISK).length,
+        notExportable: results.filter((r) => r.status === RESULT_STATUS.NOT_EXPORTABLE).length,
         failed: results.filter((r) => r.status === RESULT_STATUS.FAILED).length
       }
     };
@@ -477,9 +500,13 @@ export class ExtractionOrchestrator {
       this.run.nextIndex = index + 1;
 
       const prefix = `[${index + 1}/${queue.length}]`;
-      this._notifyProgress(result.status === RESULT_STATUS.FAILED
-        ? { warningMessage: `${prefix} ⚠️ ${result.message}` }
-        : { infoMessage: `${prefix} ✅ ${result.message}` });
+      if (result.status === RESULT_STATUS.FAILED) {
+        this._notifyProgress({ warningMessage: `${prefix} ⚠️ ${result.message}` });
+      } else if (result.status === RESULT_STATUS.NOT_EXPORTABLE) {
+        this._notifyProgress({ warningMessage: `${prefix} ⚠️ [NÃO EXPORTÁVEL] ${result.message}` });
+      } else {
+        this._notifyProgress({ infoMessage: `${prefix} ✅ ${result.message}` });
+      }
 
       if (this.run.nextIndex < queue.length) {
         // Variação aleatória para o ritmo não ser perfeitamente regular
@@ -493,14 +520,23 @@ export class ExtractionOrchestrator {
   }
 
   /**
-   * Exporta uma conversa: dispara a exportação na aba e aguarda o arquivo pela página ou pelo download
+   * Exporta uma conversa: dispara a exportação na aba e aguarda o arquivo pela página ou pelo download.
+   * `code` é o código do erro (null sem erro ou sem código conhecido); `via` diz como a aba abriu a
+   * conversa (null se a aba não chegou a confirmar a exportação).
    * @private
-   * @returns {Promise<{ title: string, status: string, message: string, size?: number }>}
+   * @returns {Promise<{ title: string, status: string, code: string|null, via: string|null, message: string, size?: number }>}
    */
   async _exportChat(chat, index, signal) {
     const { runId, tabId } = this.run;
     const captureId = `${runId}-${index}`;
-    const failed = (message) => ({ title: chat.title, status: RESULT_STATUS.FAILED, message: `"${chat.title}": ${message}` });
+    let via = null;
+    const failed = (message, code) => ({
+      title: chat.title,
+      status: code === NOT_EXPORTABLE_CODE ? RESULT_STATUS.NOT_EXPORTABLE : RESULT_STATUS.FAILED,
+      code,
+      via,
+      message: `"${chat.title}": ${message}`
+    });
 
     this.captures.expect(captureId);
     this.interceptor.arm({ captureId, tabId });
@@ -509,17 +545,20 @@ export class ExtractionOrchestrator {
       const trigger = await this._sendToTab(tabId, { action: ACTIONS.EXPORT_CHAT_REQUEST, chat, captureId }, signal);
       if (!trigger?.success) {
         if (trigger?.cancelled && signal.aborted) throw new RunCancelledError();
-        return failed(trigger?.error || 'erro desconhecido na página.');
+        return failed(trigger?.error || 'erro desconhecido na página.', errorCodeOf(trigger));
       }
+      via = trigger.via ?? null;
 
       this._setPhase(WORKFLOW_STATES.WAITING_DOWNLOAD);
       this._notifyProgress();
-      const captured = await this.captures.waitFor(captureId, { timeoutMs: CAPTURE_TIMEOUT_MS, signal });
+      const captured = await this.captures.waitFor(captureId, { timeoutMs: this.timings.captureTimeoutMs, signal });
 
       if (captured.savedToDisk) {
         return {
           title: chat.title,
           status: RESULT_STATUS.SAVED_TO_DISK,
+          code: null,
+          via,
           message: `"${chat.title}" foi baixado direto para a pasta Downloads (${captured.filename}) e não está no ZIP.`
         };
       }
@@ -535,13 +574,15 @@ export class ExtractionOrchestrator {
       return {
         title: chat.title,
         status: RESULT_STATUS.SAVED,
+        code: null,
+        via,
         size: captured.blob.size,
         message: `"${chat.title}" salvo (${formatSize(captured.blob.size)}).${homonymNote}`
       };
     } catch (err) {
       if (err instanceof RunCancelledError || signal.aborted) throw new RunCancelledError();
       log.warn(`Falha na conversa "${chat.title}":`, err);
-      return failed(err.message);
+      return failed(err.message, errorCodeOf(err));
     } finally {
       this.captures.discard(captureId);
       this.interceptor.disarm();
@@ -560,6 +601,7 @@ export class ExtractionOrchestrator {
     const labels = {
       [RESULT_STATUS.SAVED]: 'OK',
       [RESULT_STATUS.SAVED_TO_DISK]: 'NA PASTA DOWNLOADS',
+      [RESULT_STATUS.NOT_EXPORTABLE]: 'NÃO EXPORTÁVEL',
       [RESULT_STATUS.FAILED]: 'FALHA'
     };
 
@@ -568,7 +610,8 @@ export class ExtractionOrchestrator {
       `Início: ${new Date(startedAt).toLocaleString('pt-BR')}`,
       `Geração do ZIP: ${new Date().toLocaleString('pt-BR')}`,
       `Modo: ${options.downloadAll ? 'todas as conversas' : `limite de ${options.maxChats} conversa(s)`}`,
-      `Conversas na fila: ${queue.length} | no ZIP: ${summary.saved} | na pasta Downloads: ${summary.savedToDisk} | falhas: ${summary.failed}`,
+      `Conversas na fila: ${queue.length} | no ZIP: ${summary.saved} | na pasta Downloads: ${summary.savedToDisk} | ` +
+        `não exportáveis: ${summary.notExportable} | falhas: ${summary.failed}`,
       ''
     ];
     queue.forEach((chat, i) => {
@@ -611,9 +654,10 @@ export class ExtractionOrchestrator {
     await StagingRepository.clear().catch((err) => log.warn('Falha ao limpar o staging após o download:', err));
     this._setPhase(WORKFLOW_STATES.COMPLETED);
     this.currentChatTitle = 'Concluído';
-    this.statusMessage = `Backup salvo: ${archiveFilename} (${formatSize(outcome.size)}). ` +
-      `${summary.saved} conversa(s) no ZIP, ${summary.failed} falha(s)` +
-      (summary.savedToDisk ? `, ${summary.savedToDisk} baixada(s) direto na pasta Downloads.` : '.');
+    const counts = [`${summary.saved} conversa(s) no ZIP`, `${summary.failed} falha(s)`];
+    if (summary.notExportable) counts.push(`${summary.notExportable} não exportável(is)`);
+    if (summary.savedToDisk) counts.push(`${summary.savedToDisk} baixada(s) direto na pasta Downloads`);
+    this.statusMessage = `Backup salvo: ${archiveFilename} (${formatSize(outcome.size)}). ${counts.join(', ')}.`;
     log.info('Fluxo de extração em lote concluído com sucesso!');
     this._notifyProgress({ infoMessage: `🎉 ${this.statusMessage}` });
   }
