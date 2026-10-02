@@ -35,7 +35,8 @@ function urlPatternToRegExp(pattern) {
  * o download); cada cenário define `onExport` para armar a captura (armCapture) e entregar o arquivo
  * (deliverFile), ou falhar (resposta de falha ou exceção; um `code` em texto na exceção vai na
  * resposta, como no content real). `onFetchBlob` simula a leitura de um download interceptado pelo
- * chrome.downloads; sem ele, a leitura falha.
+ * chrome.downloads; sem ele, a leitura falha. `onResetSidebar` responde ao RESET_SIDEBAR (antes da
+ * repescagem); sem ele, a lista volta ao normal com sucesso.
  */
 function createFakeContent({ chats, ready }) {
   const content = {
@@ -51,6 +52,8 @@ function createFakeContent({ chats, ready }) {
     onExport: null,
     /** @type {null|function(Object): (Object|Promise<Object>)} */
     onFetchBlob: null,
+    /** @type {null|function(Object): (Object|Promise<Object>)} */
+    onResetSidebar: null,
 
     async handle(message) {
       switch (message.action) {
@@ -80,6 +83,15 @@ function createFakeContent({ chats, ready }) {
             return await content.onFetchBlob(message);
           } catch (err) {
             return { success: false, cancelled: false, error: err.message, code: typeof err.code === 'string' ? err.code : null };
+          }
+
+        case ACTIONS.RESET_SIDEBAR:
+          if (!content.onResetSidebar) return { success: true };
+          // Como o content real: um erro na página vira resposta de falha
+          try {
+            return await content.onResetSidebar(message);
+          } catch (err) {
+            return { success: false, cancelled: false, error: err.message, code: null };
           }
 
         case ACTIONS.DISARM_EXPORT_CAPTURE:

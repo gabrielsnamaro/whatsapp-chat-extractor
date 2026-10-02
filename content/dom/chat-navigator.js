@@ -114,6 +114,21 @@
     }
 
     /**
+     * Devolve a lista lateral ao estado do início da execução antes da repescagem: uma falha anterior
+     * pode ter deixado a busca preenchida, um menu ou modal aberto, ou a lista rolada até o meio
+     */
+    resetSidebar() {
+      // Escape antes: um menu ou modal aberto ficaria por cima da busca que vai ser limpa
+      pressEscape();
+      this.clearSearch();
+      const pane = document.querySelector(SELECTORS.PANE_SIDE);
+      if (!pane) {
+        throw new Error('Lista lateral (#pane-side) não encontrada para voltar ao topo.');
+      }
+      pane.scrollTop = 0;
+    }
+
+    /**
      * Localiza a conversa pela caixa de busca da lista lateral. Os resultados podem incluir
      * a seção de mensagens com o mesmo título; a seção de conversas vem primeiro, então usa a primeira.
      * @private

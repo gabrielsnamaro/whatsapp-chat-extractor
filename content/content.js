@@ -180,6 +180,12 @@
             return;
           }
 
+          case 'RESET_SIDEBAR': {
+            chatNavigator.resetSidebar();
+            sendResponse({ success: true });
+            return;
+          }
+
           case 'DISARM_EXPORT_CAPTURE': {
             if (!message.captureId || armedCaptureId === message.captureId) armedCaptureId = null;
             sendResponse({ success: true });

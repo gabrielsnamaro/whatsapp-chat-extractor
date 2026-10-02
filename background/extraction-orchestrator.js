@@ -17,6 +17,9 @@ const CAPTURE_TIMEOUT_MS = 10 * 60 * 1000;
 // Espera extra depois do prazo esgotado, com as duas fontes ainda armadas. O prazo já conta da última
 // atividade, então um arquivo depois dele é raro, e a quarentena só custa nas conversas que o estouraram
 const QUARANTINE_MS = 60 * 1000;
+// Espera antes da repescagem: as falhas passageiras costumam vir em bloco (o WhatsApp lento por alguns
+// minutos), e tentar de novo logo depois da última conversa da fila repetiria a falha
+const RETRY_COOLDOWN_MS = 60 * 1000;
 // Chamadas a APIs da extensão reiniciam o contador de inatividade do service worker
 const KEEP_ALIVE_INTERVAL_MS = 20000;
 
@@ -39,13 +42,17 @@ const RESULT_STATUS = Object.freeze({
 // não exporta essa conversa, então ela é contada à parte e não como falha.
 const NOT_EXPORTABLE_CODE = 'EXPORT_OPTION_UNAVAILABLE';
 
+// Falhas que se repetiriam do mesmo jeito ficam fora da repescagem: não exportável, homônimo
+// (AMBIGUOUS_TITLE) e modal sem "Todas as mensagens" (DATE_RANGE_NOT_ALL), códigos do content
+// (DomUtils.ERROR_CODES). É uma lista de exclusão para um código novo, ou uma falha sem código, entrar
+// na repescagem por padrão
+const NOT_RETRIED_CODES = new Set([NOT_EXPORTABLE_CODE, 'AMBIGUOUS_TITLE', 'DATE_RANGE_NOT_ALL']);
+
 // Exportação vazia: o arquivo chegou e está no ZIP, mas o texto da conversa veio em branco. É um
 // SAVED com `empty: true`, não um status próprio, para continuar contando como "no ZIP"
 const EMPTY_EXPORT_LABEL = 'OK – VAZIA';
 
 const LATE_FILE_NOTE = ' Chegou atrasado: o arquivo foi entregue na quarentena, depois do prazo de espera.';
-// Um arquivo atrasado que chegue depois do clique em "Exportar" da conversa seguinte não se distingue do dela
-const PREVIOUS_NOT_DELIVERED_NOTE = ' Conferir: a conversa anterior não entregou o arquivo.';
 
 const UNEXPECTED_FILE_SOURCE_LABELS = Object.freeze({ page: 'página', download: 'chrome.downloads' });
 
@@ -54,6 +61,15 @@ class RunCancelledError extends Error {
     super('Extração cancelada.');
     this.name = 'RunCancelledError';
   }
+}
+
+/**
+ * A conversa recebeu o arquivo, no ZIP ou na pasta Downloads
+ * @param {{ status: string }|undefined} result
+ * @returns {boolean}
+ */
+function gotFile(result) {
+  return result?.status === RESULT_STATUS.SAVED || result?.status === RESULT_STATUS.SAVED_TO_DISK;
 }
 
 function formatSize(bytes) {
@@ -95,7 +111,11 @@ export class ExtractionOrchestrator {
     this.currentIndex = 0;
     this.currentChatTitle = '';
 
-    /** @type {{ runId: string, tabId: number|null, options: Object, queue: Array, nextIndex: number, results: Array, unexpectedFiles: Array, startedAt: string }|null} */
+    /**
+     * `retry` é a repescagem: null até a fila terminar; `indices` são as posições na fila que entraram
+     * nela, `cursor` a próxima a exportar e `startsAt` quando a rodada pode começar.
+     * @type {{ runId: string, tabId: number|null, options: Object, queue: Array, nextIndex: number, results: Array, unexpectedFiles: Array, retry: { indices: number[], cursor: number, startsAt: string }|null, startedAt: string }|null}
+     */
     this.run = null;
 
     this.captures = new ExportCaptureRegistry();
@@ -150,7 +170,9 @@ export class ExtractionOrchestrator {
     // Nada está rodando agora: a execução volta pausada para o usuário retomar
     this.isPaused = true;
     this.state = WORKFLOW_STATES.PAUSED;
-    this._activeState = run.nextIndex >= run.queue.length ? WORKFLOW_STATES.PACKAGING : WORKFLOW_STATES.EXPORTING;
+    this._activeState = run.nextIndex >= run.queue.length && !this._hasPendingRetry()
+      ? WORKFLOW_STATES.PACKAGING
+      : WORKFLOW_STATES.EXPORTING;
     this.statusMessage = state === WORKFLOW_STATES.PAUSED
       ? (statusMessage || 'Extração pausada.')
       : 'A extração foi interrompida pelo navegador. Clique em "Retomar" para continuar de onde parou.';
@@ -165,11 +187,16 @@ export class ExtractionOrchestrator {
     const total = this.run?.queue?.length || 0;
     const processed = this.run?.nextIndex || 0;
     const results = (this.run?.results || []).filter(Boolean);
+    const retry = this._retryProgress();
+    let percentage = total > 0 ? Math.round((processed / total) * 100) : 0;
+    // Na repescagem a fila já está em 100%: a porcentagem passa a ser a da rodada
+    if (retry) percentage = Math.round(((retry.current - 1) / retry.total) * 100);
     return {
       state: this.state,
       current: this.currentIndex || processed,
       total,
-      percentage: total > 0 ? Math.round((processed / total) * 100) : 0,
+      percentage,
+      retry,
       currentChatTitle: this.currentChatTitle,
       errorMessage: this.errorMessage,
       statusMessage: this.statusMessage,
@@ -181,6 +208,42 @@ export class ExtractionOrchestrator {
         failed: results.filter((r) => r.status === RESULT_STATUS.FAILED).length
       }
     };
+  }
+
+  /**
+   * Andamento da repescagem enquanto ela tem conversas por exportar. `current` é a posição na rodada da
+   * conversa em exportação, ou da próxima durante a espera e a pausa.
+   * @private
+   * @returns {{ current: number, total: number }|null}
+   */
+  _retryProgress() {
+    const retry = this.run?.retry;
+    if (!retry || retry.cursor >= retry.indices.length) return null;
+    return { current: retry.cursor + 1, total: retry.indices.length };
+  }
+
+  /**
+   * A fila terminou e a repescagem ainda tem conversas por exportar, inclusive quando a rodada nem foi
+   * montada (o service worker reiniciou logo depois da última conversa da fila)
+   * @private
+   * @returns {boolean}
+   */
+  _hasPendingRetry() {
+    const { queue, nextIndex, retry } = this.run;
+    if (nextIndex < queue.length) return false;
+    return retry ? retry.cursor < retry.indices.length : this._retryCandidates().length > 0;
+  }
+
+  /**
+   * Conversas que entram na repescagem: as que falharam, menos as de código em NOT_RETRIED_CODES. Uma
+   * exportação vazia foi salva, não falhou, e fica fora.
+   * @private
+   * @returns {number[]} Posições na fila
+   */
+  _retryCandidates() {
+    return this.run.results.flatMap((result, index) => (
+      result?.status === RESULT_STATUS.FAILED && !NOT_RETRIED_CODES.has(result.code) ? [index] : []
+    ));
   }
 
   /**
@@ -251,7 +314,7 @@ export class ExtractionOrchestrator {
       this._resumeResolver = null;
     } else if (!this.isBusy() && this.run) {
       this._execute(async (signal) => {
-        if (this.run.nextIndex < this.run.queue.length) {
+        if (this.run.nextIndex < this.run.queue.length || this._hasPendingRetry()) {
           const tab = await this._prepareTab(this.run.tabId);
           this.run.tabId = tab.id;
         }
@@ -349,9 +412,10 @@ export class ExtractionOrchestrator {
    * @param {number|null} [options.maxChats=null] Limite máximo de chats (para testes)
    * @param {boolean} [options.downloadAll=true] Se true, desconsidera maxChats e extrai todos
    * @param {number} [options.safeDelayMs=2000] Intervalo base entre conversas (recebe variação aleatória de até +50%)
+   * @param {number} [options.retryCooldownMs=60000] Espera entre o fim da fila e a repescagem
    * @returns {Promise<void>}
    */
-  async start({ maxChats = null, downloadAll = true, safeDelayMs = 2000 } = {}) {
+  async start({ maxChats = null, downloadAll = true, safeDelayMs = 2000, retryCooldownMs = RETRY_COOLDOWN_MS } = {}) {
     if (this.isBusy()) {
       throw new Error('Já existe uma extração em andamento.');
     }
@@ -365,11 +429,12 @@ export class ExtractionOrchestrator {
     this.run = {
       runId: Date.now().toString(36),
       tabId: null,
-      options: { maxChats, downloadAll, safeDelayMs },
+      options: { maxChats, downloadAll, safeDelayMs, retryCooldownMs },
       queue: [],
       nextIndex: 0,
       results: [],
       unexpectedFiles: [],
+      retry: null,
       startedAt: new Date().toISOString()
     };
 
@@ -552,7 +617,7 @@ export class ExtractionOrchestrator {
    * @param {AbortSignal} signal
    */
   async _processQueue(signal) {
-    const { queue, options } = this.run;
+    const { queue } = this.run;
 
     if (queue.length === 0) {
       this._setPhase(WORKFLOW_STATES.COMPLETED);
@@ -575,29 +640,140 @@ export class ExtractionOrchestrator {
       log.info(`[${index + 1}/${queue.length}] Exportando conversa "${chat.title}"...`);
 
       const result = await this._exportChat(chat, index, signal);
-      this.run.results[index] = result;
+      this.run.results[index] = { ...result, attempts: 1 };
       this.run.nextIndex = index + 1;
+      this._notifyResult(`[${index + 1}/${queue.length}]`, this.run.results[index]);
 
-      const prefix = `[${index + 1}/${queue.length}]`;
-      if (result.status === RESULT_STATUS.FAILED) {
-        this._notifyProgress({ warningMessage: `${prefix} ⚠️ ${result.message}` });
-      } else if (result.status === RESULT_STATUS.NOT_EXPORTABLE) {
-        this._notifyProgress({ warningMessage: `${prefix} ⚠️ [NÃO EXPORTÁVEL] ${result.message}` });
-      } else if (result.empty) {
-        this._notifyProgress({ warningMessage: `${prefix} ⚠️ [${EMPTY_EXPORT_LABEL}] ${result.message}` });
-      } else {
-        this._notifyProgress({ infoMessage: `${prefix} ✅ ${result.message}` });
-      }
-
-      if (this.run.nextIndex < queue.length) {
-        // Variação aleatória para o ritmo não ser perfeitamente regular
-        const delay = Math.round(options.safeDelayMs * (1 + Math.random() * 0.5));
-        await this._sleep(delay, signal);
-      }
+      if (this.run.nextIndex < queue.length) await this._waitBetweenChats(signal);
     }
 
+    // Antes do stopListening: a repescagem usa as mesmas duas fontes de captura da fila
+    await this._retryFailures(signal);
     this.interceptor.stopListening();
     await this._packageAndDownload(signal);
+  }
+
+  /**
+   * REPESCAGEM: uma rodada só, no fim da fila e antes do empacotamento, com as conversas que falharam por
+   * um motivo que pode passar (`_retryCandidates`). O andamento fica em `run.retry`, para a retomada
+   * depois de um reinício do service worker continuar de onde parou; uma rodada concluída não se repete
+   * (ex: "Retomar" depois de o download do ZIP não ser concluído).
+   * @private
+   * @param {AbortSignal} signal
+   */
+  async _retryFailures(signal) {
+    const { queue } = this.run;
+    let announce = false;
+    if (!this.run.retry) {
+      // Uma execução gravada por uma versão anterior da extensão não tem a espera nas opções
+      const cooldownMs = this.run.options.retryCooldownMs ?? RETRY_COOLDOWN_MS;
+      this.run.retry = {
+        indices: this._retryCandidates(),
+        cursor: 0,
+        // Horário, e não duração: a retomada depois de um reinício espera só o que faltava
+        startsAt: new Date(Date.now() + cooldownMs).toISOString()
+      };
+      announce = true;
+    }
+
+    const retry = this.run.retry;
+    const total = retry.indices.length;
+    if (retry.cursor >= total) return;
+
+    this._setPhase(WORKFLOW_STATES.EXPORTING);
+    this.currentChatTitle = '';
+    const waitMs = Date.parse(retry.startsAt) - Date.now();
+    const waitLabel = `${Math.ceil(waitMs / 1000)} s`;
+    if (waitMs > 0 && !this.isPaused) {
+      this.statusMessage = `Aguardando ${waitLabel} antes da repescagem de ${total} conversa(s).`;
+    }
+    this._notifyProgress(announce ? {
+      infoMessage: `Repescagem: ${total} conversa(s) que falharam serão tentadas de novo${waitMs > 0 ? ` daqui a ${waitLabel}` : ''}.`
+    } : {});
+    if (waitMs > 0) {
+      await this._sleep(waitMs, signal);
+      // Uma pausa pedida durante a espera trocou a mensagem, e a dela continua valendo
+      if (!this.isPaused) this.statusMessage = null;
+    }
+    await this._waitResumeIfPaused(signal);
+    await this._resetSidebar(signal);
+
+    while (retry.cursor < total) {
+      await this._waitResumeIfPaused(signal);
+
+      const index = retry.indices[retry.cursor];
+      const chat = queue[index];
+      const position = `${retry.cursor + 1}/${total}`;
+      this.currentIndex = index + 1;
+      this.currentChatTitle = chat.title;
+      this._setPhase(WORKFLOW_STATES.EXPORTING);
+      this._notifyProgress();
+      log.info(`[repescagem ${position}] Exportando de novo a conversa "${chat.title}" (${index + 1}/${queue.length})...`);
+
+      const firstAttemptCode = this.run.results[index]?.code ?? null;
+      const result = await this._exportChat(chat, index, signal, { attempt: 2 });
+      // Fica o resultado da repescagem, sucesso ou falha: a 1ª tentativa falhou sem deixar arquivo no
+      // staging. O código dela fica para o relatório reconstituir a ordem real das tentativas
+      this.run.results[index] = { ...result, attempts: 2, firstAttemptCode };
+      retry.cursor++;
+      this._notifyResult(`[Repescagem ${position}]`, this.run.results[index]);
+
+      if (retry.cursor < total) await this._waitBetweenChats(signal);
+    }
+    // Sem isto, o fim da execução mostraria a posição da última conversa repescada (ex: "2 de 5 (100%)")
+    this.currentIndex = queue.length;
+  }
+
+  /**
+   * Devolve a lista lateral da aba ao normal antes da repescagem. Se a aba não conseguir, a repescagem
+   * segue com o aviso: cada conversa ainda tem a busca e a rolagem para ser encontrada, e uma falha fica
+   * no resultado dela.
+   * @private
+   * @param {AbortSignal} signal
+   */
+  async _resetSidebar(signal) {
+    let response;
+    try {
+      response = await this._sendToTab(this.run.tabId, { action: ACTIONS.RESET_SIDEBAR }, signal);
+    } catch (err) {
+      if (err instanceof RunCancelledError || signal.aborted) throw new RunCancelledError();
+      response = { success: false, error: err.message };
+    }
+    if (response?.success) return;
+
+    const reason = response?.error || 'a aba não respondeu.';
+    log.warn(`Lista lateral não devolvida ao normal antes da repescagem: ${reason}`);
+    this._notifyProgress({
+      warningMessage: `⚠️ Repescagem: a lista lateral não voltou ao normal, e as conversas são tentadas mesmo assim. Motivo: ${reason}`
+    });
+  }
+
+  /**
+   * Intervalo entre conversas, com variação aleatória para o ritmo não ser perfeitamente regular
+   * @private
+   * @param {AbortSignal} signal
+   */
+  _waitBetweenChats(signal) {
+    const delay = Math.round(this.run.options.safeDelayMs * (1 + Math.random() * 0.5));
+    return this._sleep(delay, signal);
+  }
+
+  /**
+   * Avisa o popup do resultado de uma conversa
+   * @private
+   * @param {string} prefix Posição da conversa (ex: "[3/10]" na fila, "[Repescagem 1/2]")
+   * @param {{ status: string, empty?: boolean, message: string }} result
+   */
+  _notifyResult(prefix, result) {
+    if (result.status === RESULT_STATUS.FAILED) {
+      this._notifyProgress({ warningMessage: `${prefix} ⚠️ ${result.message}` });
+    } else if (result.status === RESULT_STATUS.NOT_EXPORTABLE) {
+      this._notifyProgress({ warningMessage: `${prefix} ⚠️ [NÃO EXPORTÁVEL] ${result.message}` });
+    } else if (result.empty) {
+      this._notifyProgress({ warningMessage: `${prefix} ⚠️ [${EMPTY_EXPORT_LABEL}] ${result.message}` });
+    } else {
+      this._notifyProgress({ infoMessage: `${prefix} ✅ ${result.message}` });
+    }
   }
 
   /**
@@ -608,11 +784,17 @@ export class ExtractionOrchestrator {
    * resultado da inspeção do texto (`empty`, contagens e datas, null se o conteúdo não foi inspecionado,
    * com o motivo em `inspectionError`).
    * @private
+   * @param {{ title: string, duplicateTitle: boolean }} chat
+   * @param {number} index Posição na fila
+   * @param {AbortSignal} signal
+   * @param {Object} [options]
+   * @param {number} [options.attempt=1] 1 na fila, 2 na repescagem
    * @returns {Promise<{ title: string, status: string, code: string|null, via: string|null, staged: boolean, late: boolean, message: string, size?: number }>}
    */
-  async _exportChat(chat, index, signal) {
+  async _exportChat(chat, index, signal, { attempt = 1 } = {}) {
     const { runId, tabId } = this.run;
-    const captureId = `${runId}-${index}`;
+    // Uma captura por tentativa: um bloco atrasado da transferência da 1ª é recusado na repescagem
+    const captureId = attempt === 1 ? `${runId}-${index}` : `${runId}-${index}-r${attempt - 1}`;
     let via = null;
     let late = false;
     const failed = (message, code) => ({
@@ -749,7 +931,7 @@ export class ExtractionOrchestrator {
    * @returns {string}
    */
   _buildReport() {
-    const { queue, results, options, startedAt } = this.run;
+    const { queue, results, options, retry, startedAt } = this.run;
     const summary = this.getState().summary;
     const labels = {
       [RESULT_STATUS.SAVED]: 'OK',
@@ -771,18 +953,26 @@ export class ExtractionOrchestrator {
       'Conteúdo: somente texto; o WhatsApp Web exporta sem mídia, e os anexos aparecem como marcadores ' +
         `(${omittedMedia} anexo(s) omitido(s) nesta execução${partialNote}).`,
       `Conversas na fila: ${queue.length} | no ZIP: ${summary.saved} (vazias: ${summary.empty}) | ` +
-        `na pasta Downloads: ${summary.savedToDisk} | não exportáveis: ${summary.notExportable} | falhas: ${summary.failed}`,
-      ''
+        `na pasta Downloads: ${summary.savedToDisk} | não exportáveis: ${summary.notExportable} | falhas: ${summary.failed}`
     ];
+    if (retry?.indices.length) {
+      const recovered = retry.indices.filter((index) => gotFile(results[index])).length;
+      lines.push(
+        `Repescagem: ${retry.indices.length} conversa(s) tentada(s) de novo no fim da fila, ${recovered} recuperada(s); ` +
+          'as demais tiveram uma tentativa só.'
+      );
+    }
+    lines.push('');
+
+    const checkNotes = this._notDeliveredCheckNotes();
     queue.forEach((chat, i) => {
       const result = results[i];
       if (!result) {
         lines.push(`[NÃO PROCESSADA] ${i + 1}. "${chat.title}"`);
         return;
       }
-      const gotFile = result.status === RESULT_STATUS.SAVED || result.status === RESULT_STATUS.SAVED_TO_DISK;
-      const checkNote = gotFile && results[i - 1]?.code === CAPTURE_ERROR_CODES.FILE_NOT_DELIVERED ? PREVIOUS_NOT_DELIVERED_NOTE : '';
-      lines.push(`[${result.empty ? EMPTY_EXPORT_LABEL : labels[result.status]}] ${i + 1}. ${result.message}${checkNote}`);
+      const attemptsNote = result.attempts > 1 ? ` Tentativas: ${result.attempts}.` : '';
+      lines.push(`[${result.empty ? EMPTY_EXPORT_LABEL : labels[result.status]}] ${i + 1}. ${result.message}${attemptsNote}${checkNotes.get(i) ?? ''}`);
     });
 
     const unexpectedFiles = this.run.unexpectedFiles ?? [];
@@ -797,6 +987,43 @@ export class ExtractionOrchestrator {
       }
     }
     return lines.join('\n') + '\n';
+  }
+
+  /**
+   * Nota "conferir" de cada conversa que recebeu arquivo logo depois de uma tentativa que não entregou o
+   * dela: um arquivo atrasado que chegue depois do clique em "Exportar" da tentativa seguinte não se
+   * distingue do desta. "Logo depois" é na ordem real das exportações (a fila e, em seguida, a
+   * repescagem), não na posição da fila. A nota diz qual foi a exportação anterior porque ela não é
+   * sempre a linha de cima, e a linha de cima pode já mostrar a conversa recuperada na repescagem.
+   * @private
+   * @returns {Map<number, string>} Nota por posição na fila
+   */
+  _notDeliveredCheckNotes() {
+    const { queue, results, retry } = this.run;
+    const retried = retry ? retry.indices.slice(0, retry.cursor) : [];
+    const retriedSet = new Set(retried);
+
+    // A 1ª tentativa de uma conversa repescada só sobrevive no `firstAttemptCode` do resultado
+    const attempts = [];
+    queue.forEach((_, index) => {
+      const result = results[index];
+      if (!result) return;
+      const final = !retriedSet.has(index);
+      attempts.push({ index, number: 1, final, code: final ? result.code : result.firstAttemptCode });
+    });
+    for (const index of retried) attempts.push({ index, number: 2, final: true, code: results[index].code });
+
+    const notes = new Map();
+    attempts.forEach((attempt, position) => {
+      const previous = attempts[position - 1];
+      if (!attempt.final || !gotFile(results[attempt.index]) || previous?.code !== CAPTURE_ERROR_CODES.FILE_NOT_DELIVERED) return;
+      notes.set(
+        attempt.index,
+        ` Conferir: a exportação anterior (${previous.index + 1}. "${queue[previous.index].title}", ` +
+          `${previous.number}ª tentativa) não entregou o arquivo.`
+      );
+    });
+    return notes;
   }
 
   /**
