@@ -3,7 +3,6 @@
  * Roteador de eventos do ciclo de vida da extensão e despachante para o ExtractionOrchestrator.
  */
 import { ACTIONS } from '../shared/constants/actions.js';
-import { BackendClient } from '../shared/clients/backend-client.js';
 import { ExtractionOrchestrator } from './extraction-orchestrator.js';
 import { Logger } from '../shared/utils/logger.js';
 
@@ -66,13 +65,6 @@ async function handleMessage(message, sender) {
     case ACTIONS.CANCEL_BATCH_EXTRACTION:
       await orchestrator.cancel();
       return { success: true };
-
-    // Handler legado para sincronização via BackendClient
-    case ACTIONS.SYNC_TO_BACKEND: {
-      const client = await BackendClient.fromStorage();
-      const result = await client.syncChats(message.chats || []);
-      return { success: true, result };
-    }
 
     default:
       return { success: false, error: 'Ação desconhecida: ' + message.action };

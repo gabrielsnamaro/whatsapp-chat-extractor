@@ -84,11 +84,8 @@ whatsapp-extraction-extension/
 │   ├── constants/
 │   │   ├── actions.js                  # Contrato padronizado de mensagens entre contextos
 │   │   └── workflow-states.js          # Enum de estados da máquina de fluxo de extração
-│   ├── clients/                        # Clientes modulares (rede, storage, backend) — backend/BigQuery ainda sem uso no fluxo
-│   │   ├── http-client.js
-│   │   ├── storage-client.js
-│   │   ├── backend-client.js
-│   │   └── bigquery/
+│   ├── clients/
+│   │   └── storage-client.js           # Acesso assíncrono ao chrome.storage.local (preferências do popup e estado da execução)
 │   └── utils/
 │       ├── logger.js                   # Logger padronizado com timestamps
 │       └── whatsapp-tab.js             # Localização da aba do WhatsApp Web (ativa/mais recente)
@@ -107,6 +104,8 @@ npm test
 ```
 
 Roda com `node:test` (Node 18+), sem dependências. Cobre o ZIP (ida e volta, ZIP64, cópia de entradas brutas, CRC32, sanitização de caminhos) e a normalização de títulos. Com `python3` disponível, os ZIPs gerados também são validados pelo `zipfile` do Python.
+
+`tests/orchestrator.test.js` exercita o `ExtractionOrchestrator` de ponta a ponta: fila com conversas salvas, falha no meio da fila, cancelamento durante a espera do arquivo, texto do relatório, retomada depois de um reinício do service worker e intervalo entre conversas. Ele roda sobre uma API `chrome` falsa (`tests/helpers/fake-chrome.js`), que simula o storage, as abas e o content script do WhatsApp; o staging no IndexedDB e o download do ZIP final são trocados por substitutos que só registram o que receberam. `tests/export-capture-registry.test.js` testa o registro de captura isolado: o que ele recusa (captura não esperada, blocos inválidos, tamanho divergente) e o prazo esgotado.
 
 A automação do DOM depende do WhatsApp Web real e não tem teste automatizado no repositório; os snapshots em `kb/page_payloads/` servem de referência para validá-la localmente.
 

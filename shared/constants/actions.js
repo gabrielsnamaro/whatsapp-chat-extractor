@@ -31,10 +31,7 @@ export const ACTIONS = Object.freeze({
   GET_WORKFLOW_STATE: 'GET_WORKFLOW_STATE',
 
   // Eventos de progresso e estado (Background -> Popup)
-  WORKFLOW_PROGRESS_UPDATE: 'WORKFLOW_PROGRESS_UPDATE',
-
-  // Sincronização externa / Backend (legado, sem uso no fluxo de extração)
-  SYNC_TO_BACKEND: 'SYNC_TO_BACKEND'
+  WORKFLOW_PROGRESS_UPDATE: 'WORKFLOW_PROGRESS_UPDATE'
 });
 
 /** Destino das mensagens tratadas pelo offscreen document */
