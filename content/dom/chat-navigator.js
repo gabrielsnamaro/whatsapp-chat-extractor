@@ -257,15 +257,20 @@
       try {
         cellElement.scrollIntoView({ behavior: 'auto', block: 'center' });
         await sleep(150, signal);
+        const previousHeaderTitle = this.getActiveChatTitle();
         simulateClick(cellElement);
 
         // 4. Aguarda o cabeçalho mostrar a conversa; re-tenta o clique a cada 2s (abrir chat é idempotente)
         let lastClickAt = Date.now();
         await waitFor(() => {
           if (isTitleMatch(this.getActiveChatTitle(), targetTitle)) return true;
-          // A célula clicada tem título exato; se ela ficou selecionada, o chat aberto é ela
+          // A célula clicada tem título exato; se ela ficou selecionada, o chat aberto é ela. Mas só depois
+          // que o cabeçalho deixar de mostrar a conversa anterior: sem isso, "Mais opções" seria clicado
+          // no cabeçalho antigo e a conversa errada seria exportada com o nome desta
           const isSelected = cellElement.isConnected && cellElement.closest('[aria-selected="true"]') !== null;
-          return isSelected && Boolean(document.querySelector(SELECTORS.MAIN_HEADER));
+          const headerTitle = this.getActiveChatTitle();
+          const headerChanged = Boolean(headerTitle) && headerTitle !== previousHeaderTitle;
+          return isSelected && headerChanged && Boolean(document.querySelector(SELECTORS.MAIN_HEADER));
         }, {
           timeoutMs: this.timeouts.openChatMs,
           description: `a abertura da conversa "${targetTitle}"`,
@@ -278,8 +283,7 @@
           }
         });
 
-        // Estabilização da renderização da conversa antes de abrir o menu
-        await sleep(500, signal);
+        // Sem espera de estabilização: a etapa seguinte já espera o botão "Mais opções" aparecer
         return { success: true, title: targetTitle, via };
       } finally {
         if (via === 'search') {

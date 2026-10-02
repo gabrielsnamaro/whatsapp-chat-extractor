@@ -59,7 +59,11 @@
     OPEN_CHAT_MS: 30000,
     MORE_OPTIONS_BUTTON_MS: 30000,
     MENU_MS: 15000,
+    // Curto de propósito: o menu já abriu, e um menu sem o item é uma conversa não exportável
+    MENU_ITEM_MS: 1500,
     MODAL_MS: 30000,
+    // O modal já abriu: o botão "Exportar" faz parte dele e só demora o tempo de renderizar
+    MODAL_CONFIRM_BUTTON_MS: 3000,
     SEARCH_RESULTS_MS: 8000,
     MODAL_CLOSE_MS: 5000
   });

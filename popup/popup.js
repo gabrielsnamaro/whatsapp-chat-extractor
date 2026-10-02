@@ -92,10 +92,15 @@ document.addEventListener('DOMContentLoaded', async () => {
     progressView.renderProgress(message);
     controls.updateUiState(message.state);
 
-    const chatKey = `${message.current}/${message.total}:${message.currentChatTitle}`;
+    // Na repescagem a posição é a da rodada: com a da fila, uma conversa repescada teria a mesma chave da
+    // 1ª tentativa e não apareceria no log
+    const position = message.retry
+      ? `Repescagem ${message.retry.current}/${message.retry.total}`
+      : `${message.current}/${message.total}`;
+    const chatKey = `${position}:${message.currentChatTitle}`;
     if (message.currentChatTitle && message.state === WORKFLOW_STATES.EXPORTING && chatKey !== lastLoggedChat) {
       lastLoggedChat = chatKey;
-      log(`[${message.current}/${message.total}] Exportando "${message.currentChatTitle}"...`);
+      log(`[${position}] Exportando "${message.currentChatTitle}"...`);
     }
     if (message.warningMessage) log(message.warningMessage, 'warning');
     if (message.infoMessage) log(message.infoMessage, message.state === WORKFLOW_STATES.COMPLETED ? 'success' : 'info');
@@ -131,7 +136,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         action: ACTIONS.START_BATCH_EXTRACTION,
         maxChats: options.maxChats,
         downloadAll: options.downloadAll,
-        safeDelayMs: 2000
+        safeDelayMs: options.safeDelayMs
       });
 
       if (!res || !res.success) {

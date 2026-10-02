@@ -1085,6 +1085,30 @@ test('intervalo entre conversas fica entre d e 1,5 × d, sem espera depois da ú
   }
 });
 
+test('intervalo entre conversas inválido: start() lança o erro sem começar a execução', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const { fake, archive } = setUp({ chats: sidebarChats(['Ana']) });
+  const orch = createOrchestrator();
+  fake.content.onExport = deliveringExport(orch);
+
+  for (const safeDelayMs of [-1, Number.NaN, Number.POSITIVE_INFINITY, '2000', null]) {
+    await assert.rejects(
+      orch.start({ safeDelayMs }),
+      /^Error: Intervalo entre conversas inválido: .+ \(esperado um número de milissegundos ≥ 0\)\.$/,
+      `safeDelayMs = ${String(safeDelayMs)}`
+    );
+    assert.equal(orch.isBusy(), false);
+    assert.equal(orch.getState().state, WORKFLOW_STATES.IDLE);
+    assert.equal(orch.run, null);
+  }
+  assert.equal(fake.content.readyChecks, 0);
+  assert.equal(archive.calls.length, 0);
+
+  // 0 é aceito: o mínimo de 1 s é do popup, não do orquestrador
+  await orch.start({ safeDelayMs: 0 });
+  assert.equal(orch.getState().state, WORKFLOW_STATES.COMPLETED);
+  assert.equal(archive.calls.length, 1);
+});
+
 test('interceptor só é armado depois do EXPORT_CAPTURE_ARMED: um download antes do aviso não é tomado', { timeout: TEST_TIMEOUT_MS }, async () => {
   const { fake, staging, archive } = setUp({ chats: sidebarChats(['Ana', 'Bia']) });
   const orch = createOrchestrator();

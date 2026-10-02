@@ -5,7 +5,8 @@
  */
 (function registerExportModalHandler() {
   const {
-    SELECTORS, TIMEOUTS, ERROR_CODES, DomAutomationError, waitFor, sleep, throwIfAborted, isVisible, simulateClick, pressEscape
+    SELECTORS, TIMEOUTS, ERROR_CODES, DomAutomationError, OperationTimeoutError, waitFor, sleep, throwIfAborted, isVisible,
+    simulateClick, pressEscape
   } = window.DomUtils;
 
   class ExportModalHandler {
@@ -16,6 +17,7 @@
     constructor(options = {}) {
       this.timeouts = {
         modalMs: TIMEOUTS.MODAL_MS,
+        confirmButtonMs: TIMEOUTS.MODAL_CONFIRM_BUTTON_MS,
         modalCloseMs: TIMEOUTS.MODAL_CLOSE_MS,
         ...options.timeouts
       };
@@ -107,15 +109,22 @@
         description: 'o modal "Exportar conversa"',
         signal
       });
-      await sleep(200, signal);
 
-      const allMessagesConfirmed = await this._selectAllMessagesOption(modal, signal);
-
-      const confirmBtn = this.findButtonByText(modal, SELECTORS.EXPORT_CONFIRM_TEXT);
-      if (!confirmBtn) {
+      // Esperar o botão, e não um tempo fixo, garante que o conteúdo do modal (rádios e botões) já renderizou
+      let confirmBtn;
+      try {
+        confirmBtn = await waitFor(() => this.findButtonByText(modal, SELECTORS.EXPORT_CONFIRM_TEXT), {
+          timeoutMs: this.timeouts.confirmButtonMs,
+          description: 'o botão "Exportar" no modal de exportação',
+          signal
+        });
+      } catch (err) {
+        if (!(err instanceof OperationTimeoutError)) throw err;
         this.cancelExport();
         throw new Error('Botão "Exportar" não encontrado no modal de exportação.');
       }
+
+      const allMessagesConfirmed = await this._selectAllMessagesOption(modal, signal);
 
       let buttonToClick = confirmBtn;
       if (onBeforeConfirm) {

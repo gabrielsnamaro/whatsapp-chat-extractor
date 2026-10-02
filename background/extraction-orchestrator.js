@@ -416,13 +416,17 @@ export class ExtractionOrchestrator {
    * @param {Object} options
    * @param {number|null} [options.maxChats=null] Limite máximo de chats (para testes)
    * @param {boolean} [options.downloadAll=true] Se true, desconsidera maxChats e extrai todos
-   * @param {number} [options.safeDelayMs=2000] Intervalo base entre conversas (recebe variação aleatória de até +50%)
+   * @param {number} [options.safeDelayMs=2000] Intervalo base entre conversas, em ms (recebe variação aleatória de
+   *   até +50%). Aceita qualquer número finito ≥ 0: o mínimo de 1 s para o usuário é aplicado no popup, e os testes usam 0
    * @param {number} [options.retryCooldownMs=60000] Espera entre o fim da fila e a repescagem
    * @returns {Promise<void>}
    */
   async start({ maxChats = null, downloadAll = true, safeDelayMs = 2000, retryCooldownMs = RETRY_COOLDOWN_MS } = {}) {
     if (this.isBusy()) {
       throw new Error('Já existe uma extração em andamento.');
+    }
+    if (typeof safeDelayMs !== 'number' || !Number.isFinite(safeDelayMs) || safeDelayMs < 0) {
+      throw new Error(`Intervalo entre conversas inválido: ${String(safeDelayMs)} (esperado um número de milissegundos ≥ 0).`);
     }
 
     // Uma execução pausada ou interrompida anterior é descartada ao iniciar outra

@@ -5,7 +5,7 @@
  */
 (function registerChatOptionsMenu() {
   const {
-    SELECTORS, TIMEOUTS, ERROR_CODES, DomAutomationError, waitFor, sleep, isVisible, simulateClick, pressEscape
+    SELECTORS, TIMEOUTS, ERROR_CODES, DomAutomationError, OperationTimeoutError, waitFor, isVisible, simulateClick, pressEscape
   } = window.DomUtils;
 
   class ChatOptionsMenu {
@@ -17,6 +17,7 @@
       this.timeouts = {
         moreOptionsButtonMs: TIMEOUTS.MORE_OPTIONS_BUTTON_MS,
         menuMs: TIMEOUTS.MENU_MS,
+        menuItemMs: TIMEOUTS.MENU_ITEM_MS,
         ...options.timeouts
       };
     }
@@ -95,10 +96,17 @@
           }
         }
       });
-      await sleep(150, signal);
 
-      const exportItem = this.findExportMenuItem(menu);
-      if (!exportItem) {
+      let exportItem;
+      try {
+        exportItem = await waitFor(() => this.findExportMenuItem(menu), {
+          timeoutMs: this.timeouts.menuItemMs,
+          description: 'o item "Exportar conversa" no menu de opções',
+          signal
+        });
+      } catch (err) {
+        if (!(err instanceof OperationTimeoutError)) throw err;
+        // O menu abriu e não trouxe o item: é uma conversa não exportável, não uma lentidão a repescar
         this.closeMenu();
         throw new DomAutomationError(
           ERROR_CODES.EXPORT_OPTION_UNAVAILABLE,
@@ -107,8 +115,6 @@
       }
 
       simulateClick(exportItem);
-      await sleep(200, signal);
-
       return { success: true };
     }
   }
