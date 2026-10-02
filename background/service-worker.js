@@ -23,6 +23,11 @@ chrome.runtime.onInstalled.addListener((details) => {
   log.info(`Extensão instalada/atualizada: ${details.reason}`);
 });
 
+/** Mensagens sobre o arquivo exportado só valem vindas do content script da aba do WhatsApp Web */
+function isFromWhatsAppTab(sender) {
+  return Boolean(sender.tab?.url?.startsWith('https://web.whatsapp.com/'));
+}
+
 /**
  * @param {Object} message
  * @param {chrome.runtime.MessageSender} sender
@@ -30,7 +35,7 @@ chrome.runtime.onInstalled.addListener((details) => {
  */
 async function handleMessage(message, sender) {
   if (TRANSFER_ACTIONS.has(message.action)) {
-    if (!sender.tab?.url?.startsWith('https://web.whatsapp.com/')) {
+    if (!isFromWhatsAppTab(sender)) {
       return { success: false, error: 'Origem não autorizada para transferência de arquivo.' };
     }
     return orchestrator.captures.handleTransferMessage(message);
@@ -39,6 +44,18 @@ async function handleMessage(message, sender) {
   switch (message.action) {
     case ACTIONS.PING:
       return { status: 'PONG', sender: 'service-worker' };
+
+    case ACTIONS.EXPORT_CAPTURE_ARMED:
+      if (!isFromWhatsAppTab(sender)) {
+        return { success: false, error: 'Origem não autorizada para armar a captura do arquivo.' };
+      }
+      return orchestrator.armCapture({ captureId: message.captureId, tabId: sender.tab.id });
+
+    case ACTIONS.EXPORT_UNEXPECTED_FILE:
+      if (!isFromWhatsAppTab(sender)) {
+        return { success: false, error: 'Origem não autorizada para avisar de arquivo exportado.' };
+      }
+      return orchestrator.recordUnexpectedFile({ filename: message.filename, source: 'page' });
 
     case ACTIONS.GET_WORKFLOW_STATE:
       return { success: true, data: orchestrator.getState() };

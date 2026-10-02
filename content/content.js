@@ -20,6 +20,13 @@
   // 8 MiB por bloco (~11 MB em base64), abaixo do limite de 64 MiB por mensagem de extensão
   const TRANSFER_CHUNK_BYTES = 8 * 1024 * 1024;
 
+  // O WhatsApp Web exporta a conversa em .zip ou .txt; imagens e documentos baixados da página não são tomados
+  const CHAT_EXPORT_FILENAME = /\.(zip|txt)$/i;
+
+  // Código da conversa que falha porque a captura não foi armada. Não é da automação do DOM
+  // (DomUtils.ERROR_CODES): vem do aviso ao background antes do clique em "Exportar"
+  const CAPTURE_NOT_ARMED_CODE = 'CAPTURE_NOT_ARMED';
+
   /** @type {AbortController|null} Operação DOM em andamento (scan ou exportação) */
   let currentOperation = null;
   /** @type {string|null} Captura aguardando o arquivo gerado pela exportação atual */
@@ -48,6 +55,22 @@
       throw new Error(response?.error || `O background recusou ${message.action}.`);
     }
     return response;
+  }
+
+  /**
+   * Avisa o background, que arma a captura pelo chrome.downloads, e só depois da confirmação arma a
+   * do clique no link. Sem a confirmação (recusa ou falha de comunicação), "Exportar" não é clicado.
+   * @param {string} captureId
+   */
+  async function armCaptureBeforeConfirm(captureId) {
+    try {
+      await sendToBackground({ action: 'EXPORT_CAPTURE_ARMED', captureId });
+    } catch (err) {
+      const error = new Error(`A exportação não foi confirmada: a captura do arquivo não foi armada. ${err.message}`);
+      error.code = CAPTURE_NOT_ARMED_CODE;
+      throw error;
+    }
+    armedCaptureId = captureId;
   }
 
   function blobToBase64(blob) {
@@ -117,6 +140,10 @@
 
           // Dispara a exportação nativa; o arquivo chega ao background separadamente, em blocos
           case 'EXPORT_CHAT_REQUEST': {
+            // Um DISARM perdido (ex: service worker reiniciado no meio da espera) deixaria a captura da
+            // conversa anterior armada até o onBeforeConfirm desta, e um arquivo nesse intervalo seria
+            // bloqueado na página e recusado pelo background, sem ir para o ZIP nem para a pasta Downloads
+            armedCaptureId = null;
             const { chat, captureId } = message;
             if (!chat?.title || !captureId) {
               sendResponse({ success: false, error: 'Parâmetros inválidos para exportação.' });
@@ -126,10 +153,13 @@
             const operation = beginOperation();
             try {
               const { via } = await chatNavigator.openChat(chat, { signal: operation.signal });
-              // Arma a captura antes de abrir o menu: o clique em "Exportar" já gera o download
-              armedCaptureId = captureId;
               await optionsMenu.triggerExportOption({ signal: operation.signal });
-              await modalHandler.confirmExport({ signal: operation.signal });
+              // A captura só é armada imediatamente antes do clique em "Exportar" (o link de download só
+              // existe depois dele): até lá, um arquivo atrasado da conversa anterior não é tomado como desta
+              await modalHandler.confirmExport({
+                signal: operation.signal,
+                onBeforeConfirm: () => armCaptureBeforeConfirm(captureId)
+              });
               sendResponse({ success: true, triggered: true, via, warnings: [] });
             } catch (err) {
               if (armedCaptureId === captureId) armedCaptureId = null;
@@ -185,12 +215,21 @@
   });
 
   // Intercepta o link de download que o WhatsApp Web cria para o arquivo exportado.
-  // Só age com uma captura armada: downloads manuais do usuário seguem normalmente.
+  // Só toma o arquivo com uma captura armada: downloads manuais do usuário seguem normalmente.
   document.addEventListener('click', (event) => {
-    if (!isActiveInstance() || !armedCaptureId) return;
+    if (!isActiveInstance()) return;
 
     const anchor = event.target?.closest?.('a[download]');
-    if (!anchor?.href?.startsWith('blob:')) return;
+    if (!anchor?.href?.startsWith('blob:') || !CHAT_EXPORT_FILENAME.test(anchor.download)) return;
+    const filename = anchor.download;
+
+    if (!armedCaptureId) {
+      // O download segue; durante uma extração, o background lista o arquivo no relatório
+      chrome.runtime.sendMessage({ action: 'EXPORT_UNEXPECTED_FILE', filename }).catch((err) => {
+        console.warn('[WhatsApp Web Extractor] Falha ao avisar o background de um arquivo exportado fora de hora:', err);
+      });
+      return;
+    }
 
     event.preventDefault();
     event.stopPropagation();
@@ -198,7 +237,6 @@
 
     const captureId = armedCaptureId;
     armedCaptureId = null;
-    const filename = anchor.download || 'conversa.txt';
     console.log('[WhatsApp Web Extractor] Link de download interceptado no DOM durante extração:', filename);
 
     // O fetch sai antes de qualquer await: o WhatsApp pode revogar a URL logo após o clique

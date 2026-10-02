@@ -6,7 +6,7 @@ import { inspectChatExport } from '../shared/archive/chat-export-inspector.js';
 import { findWhatsAppTab } from '../shared/utils/whatsapp-tab.js';
 import { Logger } from '../shared/utils/logger.js';
 import { DownloadInterceptor } from './download-interceptor.js';
-import { ExportCaptureRegistry } from './export-capture-registry.js';
+import { ExportCaptureRegistry, CAPTURE_ERROR_CODES } from './export-capture-registry.js';
 import { ArchiveDownloader } from './archive-downloader.js';
 
 const log = new Logger('ExtractionOrchestrator');
@@ -14,6 +14,9 @@ const log = new Logger('ExtractionOrchestrator');
 const RUN_STORAGE_KEY = 'extractionRun';
 // Conversas grandes com mídia levam minutos para o WhatsApp gerar o arquivo
 const CAPTURE_TIMEOUT_MS = 10 * 60 * 1000;
+// Espera extra depois do prazo esgotado, com as duas fontes ainda armadas. O prazo já conta da última
+// atividade, então um arquivo depois dele é raro, e a quarentena só custa nas conversas que o estouraram
+const QUARANTINE_MS = 60 * 1000;
 // Chamadas a APIs da extensão reiniciam o contador de inatividade do service worker
 const KEEP_ALIVE_INTERVAL_MS = 20000;
 
@@ -39,6 +42,12 @@ const NOT_EXPORTABLE_CODE = 'EXPORT_OPTION_UNAVAILABLE';
 // Exportação vazia: o arquivo chegou e está no ZIP, mas o texto da conversa veio em branco. É um
 // SAVED com `empty: true`, não um status próprio, para continuar contando como "no ZIP"
 const EMPTY_EXPORT_LABEL = 'OK – VAZIA';
+
+const LATE_FILE_NOTE = ' Chegou atrasado: o arquivo foi entregue na quarentena, depois do prazo de espera.';
+// Um arquivo atrasado que chegue depois do clique em "Exportar" da conversa seguinte não se distingue do dela
+const PREVIOUS_NOT_DELIVERED_NOTE = ' Conferir: a conversa anterior não entregou o arquivo.';
+
+const UNEXPECTED_FILE_SOURCE_LABELS = Object.freeze({ page: 'página', download: 'chrome.downloads' });
 
 class RunCancelledError extends Error {
   constructor() {
@@ -75,9 +84,10 @@ export class ExtractionOrchestrator {
    * @param {Object} [options]
    * @param {Object} [options.timings] Prazos em ms; os testes encurtam para não esperar os de produção
    * @param {number} [options.timings.captureTimeoutMs] Espera pelo arquivo exportado, contada da última atividade
+   * @param {number} [options.timings.quarantineMs] Espera extra depois do prazo esgotado (quarentena)
    */
   constructor({ timings = {} } = {}) {
-    this.timings = { captureTimeoutMs: CAPTURE_TIMEOUT_MS, ...timings };
+    this.timings = { captureTimeoutMs: CAPTURE_TIMEOUT_MS, quarantineMs: QUARANTINE_MS, ...timings };
     this.state = WORKFLOW_STATES.IDLE;
     this.isPaused = false;
     this.errorMessage = null;
@@ -85,12 +95,17 @@ export class ExtractionOrchestrator {
     this.currentIndex = 0;
     this.currentChatTitle = '';
 
-    /** @type {{ runId: string, tabId: number|null, options: Object, queue: Array, nextIndex: number, results: Array, startedAt: string }|null} */
+    /** @type {{ runId: string, tabId: number|null, options: Object, queue: Array, nextIndex: number, results: Array, unexpectedFiles: Array, startedAt: string }|null} */
     this.run = null;
 
     this.captures = new ExportCaptureRegistry();
-    this.interceptor = new DownloadInterceptor({ registry: this.captures });
+    this.interceptor = new DownloadInterceptor({
+      registry: this.captures,
+      onUnexpectedFile: ({ filename }) => this.recordUnexpectedFile({ filename, source: 'download' })
+    });
 
+    /** @type {{ captureId: string, tabId: number, title: string }|null} Conversa em exportação agora */
+    this._exportInProgress = null;
     this._activeState = WORKFLOW_STATES.IDLE;
     this._loopPromise = null;
     this._abortController = null;
@@ -272,6 +287,63 @@ export class ExtractionOrchestrator {
   }
 
   /**
+   * Arma o interceptor de downloads para a conversa em exportação. A aba chama isto (EXPORT_CAPTURE_ARMED)
+   * imediatamente antes de clicar em "Exportar", e só arma a sua captura depois desta resposta: até lá
+   * nenhuma das duas fontes está armada, e um arquivo atrasado da conversa anterior não é tomado como desta.
+   * @param {{ captureId: string, tabId: number }} params
+   * @returns {{ success: boolean, error?: string }}
+   */
+  armCapture({ captureId, tabId }) {
+    const current = this._exportInProgress;
+    if (!current || current.captureId !== captureId) {
+      return { success: false, error: 'A captura não é a da conversa em exportação (concluída, cancelada ou de outra execução).' };
+    }
+    if (current.tabId !== tabId) {
+      return { success: false, error: 'O aviso veio de outra aba, não da que está exportando a conversa.' };
+    }
+    this.interceptor.arm({ captureId, tabId });
+    log.info(`Captura ${captureId} armada para "${current.title}".`);
+    return { success: true };
+  }
+
+  /**
+   * Registra um arquivo de exportação do WhatsApp que chegou sem captura armada (antes do clique em
+   * "Exportar" da conversa atual ou entre conversas). Ele não é salvo: o download segue para a pasta
+   * Downloads, e o relatório o lista. Fora de uma execução em andamento é um download do próprio
+   * usuário, e é ignorado.
+   * @param {{ filename: string|null, source: 'page'|'download' }} params
+   * @returns {{ success: boolean, recorded: boolean }}
+   */
+  recordUnexpectedFile({ filename, source }) {
+    if (!this.isBusy() || !this.run) return { success: true, recorded: false };
+
+    const entry = {
+      at: new Date().toISOString(),
+      filename: typeof filename === 'string' && filename ? filename : null,
+      source,
+      duringChat: this._exportInProgress?.title ?? null
+    };
+    // Uma execução gravada por uma versão anterior da extensão e retomada agora não tem a lista
+    (this.run.unexpectedFiles ??= []).push(entry);
+    log.warn(`Arquivo recebido fora de hora (${UNEXPECTED_FILE_SOURCE_LABELS[source]}): ${entry.filename ?? '(nome ainda não definido)'}`);
+    this._notifyProgress({
+      warningMessage: `⚠️ Arquivo recebido fora de hora (${this._describeUnexpectedFile(entry)}): não foi salvo no ZIP e seguiu para a pasta Downloads.`
+    });
+    return { success: true, recorded: true };
+  }
+
+  /**
+   * @private
+   * @param {{ filename: string|null, source: string, duringChat: string|null }} entry
+   * @returns {string}
+   */
+  _describeUnexpectedFile({ filename, source, duringChat }) {
+    const name = filename ? `"${filename}"` : 'nome ainda não definido pelo Chrome';
+    const moment = duringChat ? `durante "${duringChat}"` : 'entre conversas';
+    return `${UNEXPECTED_FILE_SOURCE_LABELS[source]}, ${name}, ${moment}`;
+  }
+
+  /**
    * Inicia o fluxo completo de extração em lote
    * @param {Object} options
    * @param {number|null} [options.maxChats=null] Limite máximo de chats (para testes)
@@ -297,6 +369,7 @@ export class ExtractionOrchestrator {
       queue: [],
       nextIndex: 0,
       results: [],
+      unexpectedFiles: [],
       startedAt: new Date().toISOString()
     };
 
@@ -531,26 +604,30 @@ export class ExtractionOrchestrator {
    * Exporta uma conversa: dispara a exportação na aba e aguarda o arquivo pela página ou pelo download.
    * `code` é o código do erro (null sem erro ou sem código conhecido); `via` diz como a aba abriu a
    * conversa (null se a aba não chegou a confirmar a exportação); `staged` diz se o arquivo foi
-   * gravado no staging. Uma conversa salva traz também o resultado da inspeção do texto (`empty`,
-   * contagens e datas, null se o conteúdo não foi inspecionado, com o motivo em `inspectionError`).
+   * gravado no staging; `late` diz se ele só chegou na quarentena. Uma conversa salva traz também o
+   * resultado da inspeção do texto (`empty`, contagens e datas, null se o conteúdo não foi inspecionado,
+   * com o motivo em `inspectionError`).
    * @private
-   * @returns {Promise<{ title: string, status: string, code: string|null, via: string|null, staged: boolean, message: string, size?: number }>}
+   * @returns {Promise<{ title: string, status: string, code: string|null, via: string|null, staged: boolean, late: boolean, message: string, size?: number }>}
    */
   async _exportChat(chat, index, signal) {
     const { runId, tabId } = this.run;
     const captureId = `${runId}-${index}`;
     let via = null;
+    let late = false;
     const failed = (message, code) => ({
       title: chat.title,
       status: code === NOT_EXPORTABLE_CODE ? RESULT_STATUS.NOT_EXPORTABLE : RESULT_STATUS.FAILED,
       code,
       via,
       staged: false,
+      late: false,
       message: `"${chat.title}": ${message}`
     });
 
+    // As duas fontes só são armadas quando a aba avisa que vai clicar em "Exportar" (armCapture)
     this.captures.expect(captureId);
-    this.interceptor.arm({ captureId, tabId });
+    this._exportInProgress = { captureId, tabId, title: chat.title };
 
     try {
       const trigger = await this._sendToTab(tabId, { action: ACTIONS.EXPORT_CHAT_REQUEST, chat, captureId }, signal);
@@ -562,7 +639,18 @@ export class ExtractionOrchestrator {
 
       this._setPhase(WORKFLOW_STATES.WAITING_DOWNLOAD);
       this._notifyProgress();
-      const captured = await this.captures.waitFor(captureId, { timeoutMs: this.timings.captureTimeoutMs, signal });
+      let captured;
+      try {
+        captured = await this.captures.waitFor(captureId, { timeoutMs: this.timings.captureTimeoutMs, signal });
+      } catch (err) {
+        if (errorCodeOf(err) !== CAPTURE_ERROR_CODES.FILE_NOT_DELIVERED) throw err;
+        // O registry apagou a captura ao esgotar o prazo. Registrá-la de novo sem nenhum await no meio
+        // não deixa brecha para o arquivo atrasado chegar e ser recusado como captura não esperada
+        this.captures.expect(captureId);
+        captured = await this._waitInQuarantine(chat, captureId, err, signal);
+        late = true;
+      }
+      const lateNote = late ? LATE_FILE_NOTE : '';
 
       if (captured.savedToDisk) {
         return {
@@ -571,7 +659,8 @@ export class ExtractionOrchestrator {
           code: null,
           via,
           staged: false,
-          message: `"${chat.title}" foi baixado direto para a pasta Downloads (${captured.filename}) e não está no ZIP.`
+          late,
+          message: `"${chat.title}" foi baixado direto para a pasta Downloads (${captured.filename}) e não está no ZIP.${lateNote}`
         };
       }
 
@@ -597,6 +686,7 @@ export class ExtractionOrchestrator {
         code: null,
         via,
         staged: true,
+        late,
         size: captured.blob.size,
         empty: inspection?.isEmpty === true,
         inspectionError,
@@ -605,16 +695,36 @@ export class ExtractionOrchestrator {
         omittedMediaCount: inspection?.omittedMediaCount ?? null,
         firstTimestamp: inspection?.firstTimestamp ?? null,
         lastTimestamp: inspection?.lastTimestamp ?? null,
-        message: `"${chat.title}" salvo (${details.join(', ')}).${inspectionNote}${homonymNote}`
+        message: `"${chat.title}" salvo (${details.join(', ')}).${inspectionNote}${homonymNote}${lateNote}`
       };
     } catch (err) {
       if (err instanceof RunCancelledError || signal.aborted) throw new RunCancelledError();
       log.warn(`Falha na conversa "${chat.title}":`, err);
       return failed(err.message, errorCodeOf(err));
     } finally {
+      this._exportInProgress = null;
       this.captures.discard(captureId);
       this.interceptor.disarm();
       chrome.tabs.sendMessage(tabId, { action: ACTIONS.DISARM_EXPORT_CAPTURE, captureId }).catch(() => {});
+    }
+  }
+
+  /**
+   * Quarentena: depois do prazo esgotado, espera mais `quarantineMs` com as duas fontes ainda armadas.
+   * Um arquivo que chegue aqui é desta conversa, porque a seguinte ainda não clicou em "Exportar". Se o
+   * prazo da quarentena também esgotar, vale a falha do prazo original.
+   * @private
+   * @param {{ title: string }} chat
+   * @param {string} captureId Já registrada de novo no registry
+   * @param {Error} notDelivered A falha FILE_NOT_DELIVERED do prazo original
+   * @param {AbortSignal} signal
+   */
+  async _waitInQuarantine(chat, captureId, notDelivered, signal) {
+    log.warn(`"${chat.title}": prazo esgotado; aguardando o arquivo por mais ${this.timings.quarantineMs} ms (quarentena).`);
+    try {
+      return await this.captures.waitFor(captureId, { timeoutMs: this.timings.quarantineMs, signal });
+    } catch (err) {
+      throw errorCodeOf(err) === CAPTURE_ERROR_CODES.FILE_NOT_DELIVERED ? notDelivered : err;
     }
   }
 
@@ -666,10 +776,26 @@ export class ExtractionOrchestrator {
     ];
     queue.forEach((chat, i) => {
       const result = results[i];
-      lines.push(result
-        ? `[${result.empty ? EMPTY_EXPORT_LABEL : labels[result.status]}] ${i + 1}. ${result.message}`
-        : `[NÃO PROCESSADA] ${i + 1}. "${chat.title}"`);
+      if (!result) {
+        lines.push(`[NÃO PROCESSADA] ${i + 1}. "${chat.title}"`);
+        return;
+      }
+      const gotFile = result.status === RESULT_STATUS.SAVED || result.status === RESULT_STATUS.SAVED_TO_DISK;
+      const checkNote = gotFile && results[i - 1]?.code === CAPTURE_ERROR_CODES.FILE_NOT_DELIVERED ? PREVIOUS_NOT_DELIVERED_NOTE : '';
+      lines.push(`[${result.empty ? EMPTY_EXPORT_LABEL : labels[result.status]}] ${i + 1}. ${result.message}${checkNote}`);
     });
+
+    const unexpectedFiles = this.run.unexpectedFiles ?? [];
+    if (unexpectedFiles.length) {
+      lines.push(
+        '',
+        `Arquivos recebidos fora de hora (${unexpectedFiles.length}): chegaram sem captura armada, não estão no ZIP ` +
+          'e o download seguiu para a pasta Downloads. O mesmo arquivo pode aparecer uma vez por fonte (página e chrome.downloads).'
+      );
+      for (const entry of unexpectedFiles) {
+        lines.push(`- ${new Date(entry.at).toLocaleString('pt-BR')}: ${this._describeUnexpectedFile(entry)}`);
+      }
+    }
     return lines.join('\n') + '\n';
   }
 

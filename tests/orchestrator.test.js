@@ -5,10 +5,13 @@ import { ZipBuilder } from '../shared/archive/zip-builder.js';
 import { ACTIONS } from '../shared/constants/actions.js';
 import { WORKFLOW_STATES } from '../shared/constants/workflow-states.js';
 import {
+  WHATSAPP_TAB_ID,
   createFakeChrome,
   installFakeChrome,
   uninstallFakeChrome,
+  armCapture,
   deliverFile,
+  whatsAppDownload,
   stubStaging,
   stubArchiveDownloader,
   waitUntil
@@ -73,10 +76,11 @@ function triggeredResponse(via = 'visible') {
 }
 
 /**
- * Comportamento da aba no EXPORT_CHAT_REQUEST: entrega o arquivo da conversa, ou responde a
- * falha configurada para aquele título, como o content real faz quando a automação DOM falha.
- * A falha é o texto do erro (sem código) ou `{ error, code }`. `files` troca os bytes arbitrários
- * de um título por um arquivo específico (ex: um ZIP nativo).
+ * Comportamento da aba no EXPORT_CHAT_REQUEST: arma a captura (como o content real antes do clique
+ * em "Exportar") e entrega o arquivo da conversa, ou responde a falha configurada para aquele título,
+ * como o content real faz quando a automação DOM falha. A falha é o texto do erro (sem código) ou
+ * `{ error, code }`. `files` troca os bytes arbitrários de um título por um arquivo específico (ex: um
+ * ZIP nativo).
  */
 function deliveringExport(orch, { sizes = {}, failures = {}, files = {} } = {}) {
   return (message) => {
@@ -86,10 +90,24 @@ function deliveringExport(orch, { sizes = {}, failures = {}, files = {} } = {}) 
       const { error, code = null } = typeof failure === 'string' ? { error: failure } : failure;
       return { success: false, cancelled: false, error, code };
     }
+    armCapture(orch, captureId);
     deliverFile(orch, captureId, files[chat.title] ?? chatBytes(chat.title, sizes[chat.title] ?? 1536));
     return triggeredResponse();
   };
 }
+
+/** Texto do relatório para um arquivo recebido fora de hora; a data depende do fuso */
+function unexpectedFileLine(description) {
+  return new RegExp(`^- ${DATE_PT_BR}: ${description.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`);
+}
+
+function unexpectedFilesHeader(count) {
+  return `Arquivos recebidos fora de hora (${count}): chegaram sem captura armada, não estão no ZIP ` +
+    'e o download seguiu para a pasta Downloads. O mesmo arquivo pode aparecer uma vez por fonte (página e chrome.downloads).';
+}
+
+const LATE_NOTE = ' Chegou atrasado: o arquivo foi entregue na quarentena, depois do prazo de espera.';
+const PREVIOUS_NOT_DELIVERED_NOTE = ' Conferir: a conversa anterior não entregou o arquivo.';
 
 let harness = null;
 const originalConsole = { log: console.log, warn: console.warn, debug: console.debug };
@@ -228,6 +246,7 @@ test('três conversas salvas: staging por posição na fila, ZIP e mensagem fina
     code: null,
     via: 'visible',
     staged: true,
+    late: false,
     size: 1536,
     empty: false,
     inspectionError: null,
@@ -260,6 +279,7 @@ test('falha no meio da fila não interrompe as conversas seguintes', { timeout: 
     code: null,
     via: null,
     staged: false,
+    late: false,
     message: '"Bia": Conversa não encontrada na lista.'
   });
 
@@ -280,8 +300,12 @@ test('cancelamento durante a espera do arquivo encerra sem empacotar', { timeout
   const { fake, staging, archive } = setUp({ chats: sidebarChats(['Ana', 'Bia', 'Caio']) });
   const orch = createOrchestrator();
   const deliver = deliveringExport(orch);
-  // Bia: a página confirma a exportação, mas o arquivo nunca chega
-  fake.content.onExport = (message) => (message.chat.title === 'Bia' ? { success: true, triggered: true } : deliver(message));
+  // Bia: a página arma a captura e confirma a exportação, mas o arquivo nunca chega
+  fake.content.onExport = (message) => {
+    if (message.chat.title !== 'Bia') return deliver(message);
+    armCapture(orch, message.captureId);
+    return { success: true, triggered: true };
+  };
 
   const loop = orch.start({ safeDelayMs: 0 });
   await waitUntil(
@@ -376,6 +400,7 @@ test('conversa sem "Exportar conversa" no menu é não exportável, contada à p
     code: 'EXPORT_OPTION_UNAVAILABLE',
     via: null,
     staged: false,
+    late: false,
     message: `"Bia": ${EXPORT_UNAVAILABLE_MESSAGE}`
   });
 
@@ -398,22 +423,33 @@ test('conversa sem "Exportar conversa" no menu é não exportável, contada à p
   assert.match(state.statusMessage, /\. 2 conversa\(s\) no ZIP, 0 falha\(s\), 1 não exportável\(is\)\.$/);
 });
 
-test('arquivo não entregue no prazo: falha FILE_NOT_DELIVERED com o prazo em segundos, e a fila segue', { timeout: TEST_TIMEOUT_MS }, async () => {
-  const { fake, archive } = setUp({ chats: sidebarChats(['Ana', 'Bia', 'Caio']) });
-  const orch = createOrchestrator({ timings: { captureTimeoutMs: 50 } });
+test('arquivo não entregue no prazo nem na quarentena: falha FILE_NOT_DELIVERED do prazo original, e a seguinte fica marcada para conferir', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const { fake, archive } = setUp({ chats: sidebarChats(['Ana', 'Bia', 'Caio', 'Davi']) });
+  const captureTimeoutMs = 50;
+  const quarantineMs = 60;
+  const orch = createOrchestrator({ timings: { captureTimeoutMs, quarantineMs } });
   const deliver = deliveringExport(orch);
-  // Bia: a página abre a conversa pela busca e confirma a exportação, mas o arquivo nunca chega
-  fake.content.onExport = (message) => (message.chat.title === 'Bia' ? triggeredResponse('search') : deliver(message));
+  // Bia: a página abre a conversa pela busca, arma a captura e confirma a exportação, mas o arquivo nunca chega
+  fake.content.onExport = (message) => {
+    if (message.chat.title !== 'Bia') return deliver(message);
+    armCapture(orch, message.captureId);
+    return triggeredResponse('search');
+  };
 
   const startedAt = performance.now();
   await orch.start({ safeDelayMs: 0 });
-  assert.ok(performance.now() - startedAt >= 45, 'a espera pelo arquivo deveria durar o prazo configurado');
+  // A folga de 10 ms cobre o relógio dos timers do Node, que pode disparar um pouco antes
+  assert.ok(
+    performance.now() - startedAt >= captureTimeoutMs + quarantineMs - 10,
+    'a espera pelo arquivo deveria durar o prazo e mais a quarentena'
+  );
 
   const state = orch.getState();
   assert.equal(state.state, WORKFLOW_STATES.COMPLETED);
-  assert.deepEqual(state.summary, { saved: 2, empty: 0, savedToDisk: 0, notExportable: 0, failed: 1 });
-  assert.deepEqual(fake.content.exportRequests.map((m) => m.chat.title), ['Ana', 'Bia', 'Caio']);
+  assert.deepEqual(state.summary, { saved: 3, empty: 0, savedToDisk: 0, notExportable: 0, failed: 1 });
+  assert.deepEqual(fake.content.exportRequests.map((m) => m.chat.title), ['Ana', 'Bia', 'Caio', 'Davi']);
 
+  // A mensagem é a do prazo original, não a da quarentena
   const notDelivered = 'O WhatsApp Web não entregou o arquivo exportado em 0.05 s.';
   assert.deepEqual(orch.run.results[1], {
     title: 'Bia',
@@ -421,10 +457,224 @@ test('arquivo não entregue no prazo: falha FILE_NOT_DELIVERED com o prazo em se
     code: 'FILE_NOT_DELIVERED',
     via: 'search',
     staged: false,
+    late: false,
     message: `"Bia": ${notDelivered}`
   });
-  assert.equal(archive.calls[0].report.split('\n')[8], `[FALHA] 2. "Bia": ${notDelivered}`);
+
+  // Um arquivo atrasado de Bia que chegasse depois do clique em "Exportar" de Caio seria tomado como de
+  // Caio: o relatório marca só a conversa seguinte a um FILE_NOT_DELIVERED
+  assert.deepEqual(archive.calls[0].report.split('\n').slice(7, 11), [
+    '[OK] 1. "Ana" salvo (1.5 KB).',
+    `[FALHA] 2. "Bia": ${notDelivered}`,
+    `[OK] 3. "Caio" salvo (1.5 KB).${PREVIOUS_NOT_DELIVERED_NOTE}`,
+    '[OK] 4. "Davi" salvo (1.5 KB).'
+  ]);
+  // A marcação é só do relatório; o resultado de Caio não muda
+  assert.equal(orch.run.results[2].message, '"Caio" salvo (1.5 KB).');
   assert.equal(fake.readStorage('extractionRun').results[1].code, 'FILE_NOT_DELIVERED');
+});
+
+test('arquivo atrasado chega na quarentena, pela página ou pelo chrome.downloads, e é salvo na conversa certa', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const { fake, staging, archive } = setUp({ chats: sidebarChats(['Ana', 'Bia', 'Caio', 'Davi']) });
+  const captureTimeoutMs = 40;
+  const lateDelayMs = 100;
+  const orch = createOrchestrator({ timings: { captureTimeoutMs, quarantineMs: 2000 } });
+  const deliver = deliveringExport(orch);
+  const disarmedBeforeArrival = {};
+  const disarmed = (captureId) => fake.content.received.some((m) => m.action === ACTIONS.DISARM_EXPORT_CAPTURE && m.captureId === captureId);
+
+  fake.content.onFetchBlob = (message) => {
+    deliverFile(orch, message.captureId, chatBytes('Caio', 3072), { filename: message.filename, source: 'download' });
+    return { success: true };
+  };
+  fake.content.onExport = (message) => {
+    const { chat, captureId } = message;
+    if (chat.title !== 'Bia' && chat.title !== 'Caio') return deliver(message);
+    armCapture(orch, captureId);
+    // O arquivo chega depois do prazo, dentro da quarentena: Bia pelo clique na página, Caio pelo chrome.downloads
+    setTimeout(() => {
+      disarmedBeforeArrival[chat.title] = disarmed(captureId);
+      if (chat.title === 'Bia') deliverFile(orch, captureId, chatBytes('Bia', 2048));
+      else fake.dispatchDownload(whatsAppDownload({ id: 41, filename: '' }));
+    }, lateDelayMs);
+    return triggeredResponse();
+  };
+
+  const startedAt = performance.now();
+  await orch.start({ safeDelayMs: 0 });
+  const elapsed = performance.now() - startedAt;
+
+  const state = orch.getState();
+  assert.equal(state.state, WORKFLOW_STATES.COMPLETED);
+  assert.deepEqual(state.summary, { saved: 4, empty: 0, savedToDisk: 0, notExportable: 0, failed: 0 });
+  // A quarentena termina quando o arquivo chega, sem esperar o prazo dela inteiro
+  assert.ok(elapsed >= 2 * lateDelayMs - 10, `a fila terminou em ${elapsed.toFixed(0)} ms, antes da chegada dos arquivos`);
+  assert.ok(elapsed < 1500, `a fila levou ${elapsed.toFixed(0)} ms: a quarentena não terminou com a chegada do arquivo`);
+
+  // As duas fontes continuavam armadas: nada foi desarmado na aba antes da chegada
+  assert.deepEqual(disarmedBeforeArrival, { Bia: false, Caio: false });
+  assert.equal(fake.content.fetchRequests.length, 1);
+  assert.equal(fake.content.fetchRequests[0].captureId, `${orch.run.runId}-2`);
+
+  assert.deepEqual(orch.run.results.map(({ status, code, staged, late }) => ({ status, code, staged, late })), [
+    { status: 'saved', code: null, staged: true, late: false },
+    { status: 'saved', code: null, staged: true, late: true },
+    { status: 'saved', code: null, staged: true, late: true },
+    { status: 'saved', code: null, staged: true, late: false }
+  ]);
+  assert.equal(orch.run.results[1].message, `"Bia" salvo (2.0 KB).${LATE_NOTE}`);
+
+  // Salvo na conversa certa, com a mesma inspeção e o mesmo staging das outras
+  assert.deepEqual(staging.saves.map(({ chatId, chatTitle, filename, size }) => ({ chatId, chatTitle, filename, size })), [
+    { chatId: '000000', chatTitle: 'Ana', filename: 'conversa.zip', size: 1536 },
+    { chatId: '000001', chatTitle: 'Bia', filename: 'conversa.zip', size: 2048 },
+    { chatId: '000002', chatTitle: 'Caio', filename: 'exportacao.zip', size: 3072 },
+    { chatId: '000003', chatTitle: 'Davi', filename: 'conversa.zip', size: 1536 }
+  ]);
+  assert.deepEqual(new Uint8Array(await staging.saves[1].blob.arrayBuffer()), chatBytes('Bia', 2048));
+  assert.equal(orch.run.results[1].messageCount, 1);
+
+  // Chegou na quarentena: a conversa seguinte não é marcada para conferir
+  assert.deepEqual(archive.calls[0].report.split('\n').slice(7, 11), [
+    '[OK] 1. "Ana" salvo (1.5 KB).',
+    `[OK] 2. "Bia" salvo (2.0 KB).${LATE_NOTE}`,
+    `[OK] 3. "Caio" salvo (3.0 KB).${LATE_NOTE}`,
+    '[OK] 4. "Davi" salvo (1.5 KB).'
+  ]);
+  assert.equal(fake.readStorage('extractionRun').results[1].late, true);
+});
+
+test('outra falha na quarentena prevalece sobre o prazo esgotado: leitura falha na página ou tamanho divergente', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const { fake, staging, archive } = setUp({ chats: sidebarChats(['Ana', 'Bia', 'Caio', 'Davi']) });
+  const captureTimeoutMs = 40;
+  const lateDelayMs = 100;
+  const orch = createOrchestrator({ timings: { captureTimeoutMs, quarantineMs: 2000 } });
+  const deliver = deliveringExport(orch);
+  const arrivedAfterMs = {};
+
+  fake.content.onExport = (message) => {
+    const { chat, captureId } = message;
+    if (chat.title !== 'Bia' && chat.title !== 'Caio') return deliver(message);
+    armCapture(orch, captureId);
+    const requestedAt = performance.now();
+    const transfer = (fields) => orch.captures.handleTransferMessage({ captureId, ...fields });
+    // Depois do prazo, dentro da quarentena: a página de Bia não consegue ler o arquivo, e de Caio
+    // chegam menos bytes do que o anunciado
+    setTimeout(() => {
+      arrivedAfterMs[chat.title] = performance.now() - requestedAt;
+      if (chat.title === 'Bia') {
+        transfer({ action: ACTIONS.EXPORT_TRANSFER_FAILED, error: 'HTTP 404 ao ler o arquivo exportado.' });
+        return;
+      }
+      transfer({ action: ACTIONS.EXPORT_TRANSFER_START, filename: 'conversa.zip', mimeType: 'application/zip', size: 10, totalChunks: 1 });
+      transfer({ action: ACTIONS.EXPORT_TRANSFER_CHUNK, index: 0, data: Buffer.from('12345').toString('base64') });
+      transfer({ action: ACTIONS.EXPORT_TRANSFER_END });
+    }, lateDelayMs);
+    return triggeredResponse();
+  };
+
+  const startedAt = performance.now();
+  await orch.start({ safeDelayMs: 0 });
+  const elapsed = performance.now() - startedAt;
+
+  const state = orch.getState();
+  assert.equal(state.state, WORKFLOW_STATES.COMPLETED);
+  assert.deepEqual(state.summary, { saved: 2, empty: 0, savedToDisk: 0, notExportable: 0, failed: 2 });
+  for (const title of ['Bia', 'Caio']) {
+    assert.ok(arrivedAfterMs[title] >= captureTimeoutMs, `a falha de "${title}" chegou antes do fim do prazo original`);
+  }
+  // A quarentena termina com a falha, sem esperar o prazo dela inteiro
+  assert.ok(elapsed < 1500, `a fila levou ${elapsed.toFixed(0)} ms: a quarentena não terminou com a falha`);
+
+  // O código e a mensagem são os da falha que chegou, não os do prazo esgotado
+  assert.deepEqual(orch.run.results.slice(1, 3), [
+    {
+      title: 'Bia',
+      status: 'failed',
+      code: 'TRANSFER_FAILED',
+      via: 'visible',
+      staged: false,
+      late: false,
+      message: '"Bia": HTTP 404 ao ler o arquivo exportado.'
+    },
+    {
+      title: 'Caio',
+      status: 'failed',
+      code: 'SIZE_MISMATCH',
+      via: 'visible',
+      staged: false,
+      late: false,
+      message: '"Caio": Arquivo recebido com 5 bytes; esperados 10.'
+    }
+  ]);
+  assert.deepEqual(staging.saves.map((s) => s.chatTitle), ['Ana', 'Davi']);
+
+  // Sem FILE_NOT_DELIVERED no resultado, a conversa seguinte não é marcada para conferir
+  assert.deepEqual(archive.calls[0].report.split('\n').slice(7, 11), [
+    '[OK] 1. "Ana" salvo (1.5 KB).',
+    '[FALHA] 2. "Bia": HTTP 404 ao ler o arquivo exportado.',
+    '[FALHA] 3. "Caio": Arquivo recebido com 5 bytes; esperados 10.',
+    '[OK] 4. "Davi" salvo (1.5 KB).'
+  ]);
+});
+
+test('"conferir" só marca a conversa seguinte que recebeu arquivo, não uma falha nem uma não exportável', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const chats = sidebarChats(['Ana', 'Bia', 'Caio', 'Davi', 'Eva', 'Fabi', 'Gil', 'Hugo', 'Ivo', 'Juca']);
+  const { fake, archive } = setUp({ chats });
+  const captureTimeoutMs = 20;
+  const quarantineMs = 80;
+  const orch = createOrchestrator({ timings: { captureTimeoutMs, quarantineMs } });
+  const emptyZip = await nativeExportZip('\n');
+  const deliver = deliveringExport(orch, {
+    files: { Fabi: emptyZip },
+    failures: {
+      Bia: 'Conversa não encontrada na lista.',
+      Juca: { error: EXPORT_UNAVAILABLE_MESSAGE, code: 'EXPORT_OPTION_UNAVAILABLE' }
+    }
+  });
+  // Cada uma destas confirma a exportação, mas o arquivo não chega nem no prazo nem na quarentena
+  const notDelivered = ['Ana', 'Caio', 'Eva', 'Gil', 'Ivo'];
+
+  fake.content.onExport = (message) => {
+    const { chat, captureId } = message;
+    if (notDelivered.includes(chat.title)) {
+      armCapture(orch, captureId);
+      return triggeredResponse();
+    }
+    if (chat.title === 'Davi') {
+      armCapture(orch, captureId);
+      orch.captures.resolveSavedToDisk(captureId, { filename: 'Conversa do WhatsApp com Davi.zip', downloadId: 4 });
+      return triggeredResponse();
+    }
+    if (chat.title === 'Hugo') {
+      armCapture(orch, captureId);
+      // Depois do prazo, no meio da quarentena
+      setTimeout(() => deliverFile(orch, captureId, chatBytes('Hugo', 2048)), captureTimeoutMs + quarantineMs / 2);
+      return triggeredResponse();
+    }
+    return deliver(message);
+  };
+
+  await orch.start({ safeDelayMs: 0 });
+
+  assert.equal(orch.getState().state, WORKFLOW_STATES.COMPLETED);
+  const notDeliveredMessage = 'O WhatsApp Web não entregou o arquivo exportado em 0.02 s.';
+  const lines = archive.calls[0].report.split('\n');
+  assert.equal(lines[5], 'Conversas na fila: 10 | no ZIP: 2 (vazias: 1) | na pasta Downloads: 1 | não exportáveis: 1 | falhas: 6');
+  // Cada conversa par vem depois de um FILE_NOT_DELIVERED: Bia (falha) e Juca (não exportável) não
+  // receberam arquivo nenhum e não são marcadas; na pasta Downloads, vazia e atrasada, sim
+  assert.deepEqual(lines.slice(7, 17), [
+    `[FALHA] 1. "Ana": ${notDeliveredMessage}`,
+    '[FALHA] 2. "Bia": Conversa não encontrada na lista.',
+    `[FALHA] 3. "Caio": ${notDeliveredMessage}`,
+    `[NA PASTA DOWNLOADS] 4. "Davi" foi baixado direto para a pasta Downloads (Conversa do WhatsApp com Davi.zip) e não está no ZIP.${PREVIOUS_NOT_DELIVERED_NOTE}`,
+    `[FALHA] 5. "Eva": ${notDeliveredMessage}`,
+    `[OK – VAZIA] 6. "Fabi" salvo (${sizeLabel(emptyZip)}).${PREVIOUS_NOT_DELIVERED_NOTE}`,
+    `[FALHA] 7. "Gil": ${notDeliveredMessage}`,
+    `[OK] 8. "Hugo" salvo (2.0 KB).${LATE_NOTE}${PREVIOUS_NOT_DELIVERED_NOTE}`,
+    `[FALHA] 9. "Ivo": ${notDeliveredMessage}`,
+    `[NÃO EXPORTÁVEL] 10. "Juca": ${EXPORT_UNAVAILABLE_MESSAGE}`
+  ]);
 });
 
 test('código do erro gravado em cada resultado, venha da página ou da captura do arquivo', { timeout: TEST_TIMEOUT_MS }, async () => {
@@ -436,6 +686,7 @@ test('código do erro gravado em cada resultado, venha da página ou da captura 
   fake.content.onExport = (message) => {
     const { chat, captureId } = message;
     const transfer = (fields) => orch.captures.handleTransferMessage({ captureId, ...fields });
+    if (chat.title !== 'Ana') armCapture(orch, captureId);
     switch (chat.title) {
       case 'Bia':
         // A página confirmou a exportação, mas não conseguiu ler o arquivo gerado
@@ -504,6 +755,7 @@ test('exportação vazia: [OK – VAZIA] no relatório, contada no ZIP e gravada
     code: null,
     via: 'visible',
     staged: true,
+    late: false,
     size: emptyZip.length,
     empty: true,
     inspectionError: null,
@@ -568,6 +820,7 @@ test('conteúdo não inspecionado: a conversa é salva mesmo assim, e o relatór
     code: null,
     via: 'visible',
     staged: true,
+    late: false,
     size: truncatedZip.length,
     empty: false,
     inspectionError: result.inspectionError,
@@ -770,4 +1023,267 @@ test('intervalo entre conversas fica entre d e 1,5 × d, sem espera depois da ú
     const gap = arrivals[i] - arrivals[i - 1];
     assert.ok(gap >= sleeps[i - 1].ms - 5, `entre a conversa ${i} e a ${i + 1} passaram ${gap.toFixed(1)} ms`);
   }
+});
+
+test('interceptor só é armado depois do EXPORT_CAPTURE_ARMED: um download antes do aviso não é tomado', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const { fake, staging, archive } = setUp({ chats: sidebarChats(['Ana', 'Bia']) });
+  const orch = createOrchestrator();
+  const deliver = deliveringExport(orch);
+  fake.content.onFetchBlob = (message) => {
+    deliverFile(orch, message.captureId, chatBytes('Ana', 1536), { filename: message.filename, source: 'download' });
+    return { success: true };
+  };
+  fake.content.onExport = async (message) => {
+    if (message.chat.title !== 'Ana') return deliver(message);
+    // A conversa já foi pedida à aba, mas ela ainda não avisou que vai clicar em "Exportar"
+    fake.dispatchDownload(whatsAppDownload({ id: 11, filename: 'Conversa do WhatsApp com Fulano.zip' }));
+    armCapture(orch, message.captureId);
+    // Depois do aviso: o download do WhatsApp sem nome ainda, mas com tipo ZIP, é tomado
+    fake.dispatchDownload(whatsAppDownload({ id: 12, filename: '', mime: 'application/zip' }));
+    await waitUntil(() => fake.content.fetchRequests.length === 1, { description: 'leitura do download interceptado' });
+    return triggeredResponse();
+  };
+
+  await orch.start({ safeDelayMs: 0 });
+
+  assert.equal(orch.getState().state, WORKFLOW_STATES.COMPLETED);
+  const { runId } = orch.run;
+  // O download anterior ao aviso seguiu para a pasta Downloads: nem pausado, nem lido pela aba
+  assert.deepEqual(fake.downloadCallsFor(11), []);
+  assert.deepEqual(fake.content.fetchRequests.map(({ url, captureId, filename }) => ({ url, captureId, filename })), [
+    { url: whatsAppDownload({ id: 12 }).url, captureId: `${runId}-0`, filename: 'exportacao.zip' }
+  ]);
+  assert.deepEqual(fake.downloadCallsFor(12).map((call) => call.method), ['pause', 'search', 'cancel', 'erase']);
+
+  assert.deepEqual(staging.saves.map(({ chatTitle, filename }) => [chatTitle, filename]), [['Ana', 'exportacao.zip'], ['Bia', 'conversa.zip']]);
+  assert.deepEqual(orch.run.results.map((r) => r.status), ['saved', 'saved']);
+
+  // O download anterior ao aviso fica registrado como recebido fora de hora, durante a conversa
+  assert.equal(orch.run.unexpectedFiles.length, 1);
+  assert.match(orch.run.unexpectedFiles[0].at, /^\d{4}-\d{2}-\d{2}T/);
+  assert.deepEqual({ ...orch.run.unexpectedFiles[0], at: null }, {
+    at: null,
+    filename: 'Conversa do WhatsApp com Fulano.zip',
+    source: 'download',
+    duringChat: 'Ana'
+  });
+  const lines = archive.calls[0].report.split('\n');
+  assert.deepEqual(lines.slice(9, 11), ['', unexpectedFilesHeader(1)]);
+  assert.match(lines[11], unexpectedFileLine('chrome.downloads, "Conversa do WhatsApp com Fulano.zip", durante "Ana"'));
+});
+
+test('aviso de captura armada recusado: outra captura, outra aba ou conversa já encerrada; a conversa falha com CAPTURE_NOT_ARMED', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const { fake, staging } = setUp({ chats: sidebarChats(['Ana', 'Bia']) });
+  const orch = createOrchestrator();
+  const deliver = deliveringExport(orch);
+  const refusals = {};
+  const notArmedError = 'A exportação não foi confirmada: a captura do arquivo não foi armada. ' +
+    'A captura não é a da conversa em exportação (concluída, cancelada ou de outra execução).';
+
+  fake.content.onExport = (message) => {
+    const { chat, captureId } = message;
+    if (chat.title !== 'Ana') return deliver(message);
+    const { runId } = orch.run;
+    refusals.otherCapture = orch.armCapture({ captureId: `${runId}-1`, tabId: WHATSAPP_TAB_ID });
+    refusals.previousRun = orch.armCapture({ captureId: 'execucao-anterior-0', tabId: WHATSAPP_TAB_ID });
+    refusals.otherTab = orch.armCapture({ captureId, tabId: WHATSAPP_TAB_ID + 1 });
+    // Com as recusas, o interceptor continua desarmado: um download do WhatsApp agora não é tomado
+    fake.dispatchDownload(whatsAppDownload({ id: 21, filename: 'Conversa do WhatsApp com Ana.zip' }));
+    // Como o content real numa recusa: não clica em "Exportar", cancela o modal e responde a falha
+    return { success: false, cancelled: false, error: notArmedError, code: 'CAPTURE_NOT_ARMED' };
+  };
+
+  await orch.start({ safeDelayMs: 0 });
+
+  const otherCapture = 'A captura não é a da conversa em exportação (concluída, cancelada ou de outra execução).';
+  assert.deepEqual(refusals, {
+    otherCapture: { success: false, error: otherCapture },
+    previousRun: { success: false, error: otherCapture },
+    otherTab: { success: false, error: 'O aviso veio de outra aba, não da que está exportando a conversa.' }
+  });
+  // Depois que a conversa termina, a captura dela também é recusada
+  assert.deepEqual(orch.armCapture({ captureId: `${orch.run.runId}-0`, tabId: WHATSAPP_TAB_ID }), { success: false, error: otherCapture });
+
+  assert.deepEqual(fake.downloadCallsFor(21), []);
+  assert.deepEqual(fake.content.fetchRequests, []);
+  assert.deepEqual(orch.run.results[0], {
+    title: 'Ana',
+    status: 'failed',
+    code: 'CAPTURE_NOT_ARMED',
+    via: null,
+    staged: false,
+    late: false,
+    message: `"Ana": ${notArmedError}`
+  });
+  assert.deepEqual(staging.saves.map((s) => s.chatTitle), ['Bia']);
+  assert.deepEqual(orch.getState().summary, { saved: 1, empty: 0, savedToDisk: 0, notExportable: 0, failed: 1 });
+});
+
+test('arquivos recebidos fora de hora, da página e do chrome.downloads, vão para o relatório e não são salvos', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const { fake, staging, archive } = setUp({ chats: sidebarChats(['Ana', 'Bia', 'Caio']) });
+  const orch = createOrchestrator();
+  const deliver = deliveringExport(orch);
+
+  // Fora de uma execução, um arquivo do WhatsApp é download do próprio usuário: ignorado
+  assert.deepEqual(orch.recordUnexpectedFile({ filename: 'manual.zip', source: 'page' }), { success: true, recorded: false });
+
+  fake.content.onExport = (message) => {
+    if (message.chat.title === 'Bia') {
+      // Antes do clique em "Exportar" de Bia (captura desarmada), o content avisa como o service worker
+      // repassaria o EXPORT_UNEXPECTED_FILE, sem bloquear o download
+      orch.recordUnexpectedFile({ filename: 'Conversa do WhatsApp com Ana.zip', source: 'page' });
+    }
+    return deliver(message);
+  };
+
+  const loop = orch.start({ safeDelayMs: 150 });
+  // No intervalo entre Ana e Bia nenhuma captura está armada: o download do WhatsApp não é tomado
+  await waitUntil(() => orch.run?.results.length === 1, { description: 'fim da exportação de "Ana"' });
+  assert.equal(fake.content.exportRequests.length, 1, 'o download deveria ser disparado antes de pedir "Bia" à aba');
+  fake.dispatchDownload(whatsAppDownload({ id: 31, filename: '', mime: 'text/plain' }));
+  await loop;
+
+  const state = orch.getState();
+  assert.equal(state.state, WORKFLOW_STATES.COMPLETED);
+  assert.deepEqual(state.summary, { saved: 3, empty: 0, savedToDisk: 0, notExportable: 0, failed: 0 });
+  assert.deepEqual(staging.saves.map((s) => s.chatTitle), ['Ana', 'Bia', 'Caio']);
+  assert.deepEqual(fake.downloadCallsFor(31), []);
+  assert.deepEqual(fake.content.fetchRequests, []);
+
+  const unexpected = orch.run.unexpectedFiles.map(({ at, ...entry }) => entry);
+  assert.deepEqual(unexpected, [
+    { filename: null, source: 'download', duringChat: null },
+    { filename: 'Conversa do WhatsApp com Ana.zip', source: 'page', duringChat: 'Bia' }
+  ]);
+  // Persistido com o run, para sobreviver a um reinício do service worker
+  assert.deepEqual(fake.readStorage('extractionRun').unexpectedFiles, orch.run.unexpectedFiles);
+
+  const lines = archive.calls[0].report.split('\n');
+  assert.deepEqual(lines.slice(7, 12), [
+    '[OK] 1. "Ana" salvo (1.5 KB).',
+    '[OK] 2. "Bia" salvo (1.5 KB).',
+    '[OK] 3. "Caio" salvo (1.5 KB).',
+    '',
+    unexpectedFilesHeader(2)
+  ]);
+  assert.match(lines[12], unexpectedFileLine('chrome.downloads, nome ainda não definido pelo Chrome, entre conversas'));
+  assert.match(lines[13], unexpectedFileLine('página, "Conversa do WhatsApp com Ana.zip", durante "Bia"'));
+  assert.deepEqual(lines.slice(14), ['']);
+
+  // Popup: um aviso por arquivo
+  const warnings = fake.progressUpdates().map((m) => m.warningMessage).filter(Boolean);
+  assert.deepEqual(warnings, [
+    '⚠️ Arquivo recebido fora de hora (chrome.downloads, nome ainda não definido pelo Chrome, entre conversas): não foi salvo no ZIP e seguiu para a pasta Downloads.',
+    '⚠️ Arquivo recebido fora de hora (página, "Conversa do WhatsApp com Ana.zip", durante "Bia"): não foi salvo no ZIP e seguiu para a pasta Downloads.'
+  ]);
+
+  // Terminada a execução, volta a ser ignorado
+  assert.deepEqual(orch.recordUnexpectedFile({ filename: 'depois.zip', source: 'page' }), { success: true, recorded: false });
+  assert.equal(orch.run.unexpectedFiles.length, 2);
+});
+
+test('relatório sem arquivos fora de hora não tem a seção', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const { fake, archive } = setUp({ chats: sidebarChats(['Ana']) });
+  const orch = createOrchestrator();
+  fake.content.onExport = deliveringExport(orch);
+
+  await orch.start({ safeDelayMs: 0 });
+
+  assert.deepEqual(orch.run.unexpectedFiles, []);
+  assert.equal(archive.calls[0].report.includes('fora de hora'), false);
+  assert.deepEqual(archive.calls[0].report.split('\n').slice(7), ['[OK] 1. "Ana" salvo (1.5 KB).', '']);
+});
+
+/**
+ * Storage de uma execução interrompida no meio da fila, como a versão anterior da extensão o gravava:
+ * sem a lista `unexpectedFiles`. A instância A exporta Ana e Bia e fica presa em Caio, como se o
+ * Chrome encerrasse o service worker ali.
+ */
+async function snapshotWithoutUnexpectedFiles(fakeA) {
+  const orchA = createOrchestrator();
+  const deliverA = deliveringExport(orchA);
+  const stalled = createDeferred();
+  let snapshot = null;
+  fakeA.content.onExport = (message) => {
+    if (message.chat.title !== 'Caio') return deliverA(message);
+    snapshot = fakeA.snapshotStorage();
+    stalled.resolve();
+    return { success: true, triggered: true };
+  };
+
+  const loopA = orchA.start({ safeDelayMs: 0 });
+  await stalled.promise;
+  await orchA.cancel();
+  await loopA;
+
+  assert.equal(snapshot.extractionRun.nextIndex, 2);
+  assert.deepEqual(snapshot.extractionRun.unexpectedFiles, []);
+  delete snapshot.extractionRun.unexpectedFiles;
+  return snapshot;
+}
+
+test('execução gravada pela versão anterior, sem a lista de arquivos fora de hora: a retomada registra o arquivo e o relatório tem a seção', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const chats = sidebarChats(['Ana', 'Bia', 'Caio', 'Davi']);
+  const { fake: fakeA, archive } = setUp({ chats });
+  const snapshot = await snapshotWithoutUnexpectedFiles(fakeA);
+
+  const fakeB = createFakeChrome({ chats, storage: snapshot });
+  installFakeChrome(fakeB);
+  const orchB = createOrchestrator();
+  const deliverB = deliveringExport(orchB);
+  fakeB.content.onExport = (message) => {
+    // Antes do aviso de captura armada de Davi: o download do WhatsApp chega fora de hora
+    if (message.chat.title === 'Davi') {
+      fakeB.dispatchDownload(whatsAppDownload({ id: 51, filename: 'Conversa do WhatsApp com Fulano.zip' }));
+    }
+    return deliverB(message);
+  };
+
+  await orchB.restore();
+  assert.equal(orchB.run.unexpectedFiles, undefined);
+  assert.equal(orchB.resume(), true);
+  await orchB._loopPromise;
+
+  assert.equal(orchB.getState().state, WORKFLOW_STATES.COMPLETED);
+  assert.deepEqual(fakeB.content.exportRequests.map((m) => m.chat.title), ['Caio', 'Davi']);
+  assert.deepEqual(fakeB.downloadCallsFor(51), []);
+  assert.deepEqual(orchB.run.unexpectedFiles.map(({ at, ...entry }) => entry), [
+    { filename: 'Conversa do WhatsApp com Fulano.zip', source: 'download', duringChat: 'Davi' }
+  ]);
+  assert.deepEqual(fakeB.readStorage('extractionRun').unexpectedFiles, orchB.run.unexpectedFiles);
+
+  const lines = archive.calls[0].report.split('\n');
+  assert.deepEqual(lines.slice(7, 13), [
+    '[OK] 1. "Ana" salvo (1.5 KB).',
+    '[OK] 2. "Bia" salvo (1.5 KB).',
+    '[OK] 3. "Caio" salvo (1.5 KB).',
+    '[OK] 4. "Davi" salvo (1.5 KB).',
+    '',
+    unexpectedFilesHeader(1)
+  ]);
+  assert.match(lines[13], unexpectedFileLine('chrome.downloads, "Conversa do WhatsApp com Fulano.zip", durante "Davi"'));
+});
+
+test('execução gravada pela versão anterior, sem a lista e sem arquivo fora de hora: o relatório sai sem a seção', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const chats = sidebarChats(['Ana', 'Bia', 'Caio']);
+  const { fake: fakeA, archive } = setUp({ chats });
+  const snapshot = await snapshotWithoutUnexpectedFiles(fakeA);
+
+  const fakeB = createFakeChrome({ chats, storage: snapshot });
+  installFakeChrome(fakeB);
+  const orchB = createOrchestrator();
+  fakeB.content.onExport = deliveringExport(orchB);
+
+  await orchB.restore();
+  assert.equal(orchB.resume(), true);
+  await orchB._loopPromise;
+
+  assert.equal(orchB.getState().state, WORKFLOW_STATES.COMPLETED);
+  assert.equal(orchB.run.unexpectedFiles, undefined);
+  assert.deepEqual(archive.calls[0].report.split('\n').slice(7), [
+    '[OK] 1. "Ana" salvo (1.5 KB).',
+    '[OK] 2. "Bia" salvo (1.5 KB).',
+    '[OK] 3. "Caio" salvo (1.5 KB).',
+    ''
+  ]);
 });

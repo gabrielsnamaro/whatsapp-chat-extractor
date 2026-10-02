@@ -181,3 +181,32 @@ test('prazo de produção (10 min) aparece em minutos na mensagem', async () => 
   }
   assert.deepEqual(requested, [10 * 60 * 1000]);
 });
+
+test('prazo por chamada: captura registrada de novo depois do prazo esgotado espera com o prazo novo e recebe o arquivo atrasado', async () => {
+  const registry = new ExportCaptureRegistry();
+  registry.expect('a');
+  await assert.rejects(registry.waitFor('a', { timeoutMs: 20 }), { code: 'FILE_NOT_DELIVERED' });
+
+  // Como a quarentena do orquestrador: a mesma captura é registrada de novo e esperada com outro prazo
+  registry.expect('a');
+  const startedAt = performance.now();
+  const waiting = registry.waitFor('a', { timeoutMs: 1000 });
+  const bytes = encoder.encode('atrasado');
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  // O prazo da primeira espera (20 ms) já teria passado; o da segunda, não
+  assert.equal(start(registry, 'a', { size: bytes.length }).success, true);
+  assert.equal(chunk(registry, 'a', 0, bytes).success, true);
+  assert.equal(end(registry, 'a').success, true);
+  const captured = await waiting;
+  assert.equal(await captured.blob.text(), 'atrasado');
+  assert.ok(performance.now() - startedAt < 1000);
+
+  // E a segunda espera também expira no prazo dela, com a mensagem desse prazo
+  registry.expect('b');
+  await assert.rejects(registry.waitFor('b', { timeoutMs: 20 }), { code: 'FILE_NOT_DELIVERED' });
+  registry.expect('b');
+  await assert.rejects(
+    registry.waitFor('b', { timeoutMs: 40 }),
+    { message: 'O WhatsApp Web não entregou o arquivo exportado em 0.04 s.', code: 'FILE_NOT_DELIVERED' }
+  );
+});

@@ -4,7 +4,7 @@
  * selecionar o intervalo completo de mensagens e confirmar a geração do arquivo.
  */
 (function registerExportModalHandler() {
-  const { SELECTORS, TIMEOUTS, waitFor, sleep, isVisible, simulateClick, pressEscape } = window.DomUtils;
+  const { SELECTORS, TIMEOUTS, waitFor, sleep, throwIfAborted, isVisible, simulateClick, pressEscape } = window.DomUtils;
 
   class ExportModalHandler {
     /**
@@ -75,9 +75,13 @@
      * Confirma a exportação no modal (seleciona todas as mensagens e clica em Exportar)
      * @param {Object} [params]
      * @param {AbortSignal} [params.signal]
+     * @param {function(): Promise<void>} [params.onBeforeConfirm] Aguardado imediatamente antes do clique em
+     *   "Exportar"; se falhar (ou a operação for cancelada enquanto isso), o modal é cancelado sem o clique
+     *   e o erro é relançado. Depois dele o botão é localizado de novo no modal atual; se não estiver mais
+     *   lá, o modal é cancelado sem o clique e a exportação falha
      * @returns {Promise<{ success: boolean }>}
      */
-    async confirmExport({ signal } = {}) {
+    async confirmExport({ signal, onBeforeConfirm } = {}) {
       const modal = await waitFor(() => this.findModal(), {
         timeoutMs: this.timeouts.modalMs,
         description: 'o modal "Exportar conversa"',
@@ -93,8 +97,28 @@
         throw new Error('Botão "Exportar" não encontrado no modal de exportação.');
       }
 
+      let buttonToClick = confirmBtn;
+      if (onBeforeConfirm) {
+        try {
+          await onBeforeConfirm();
+          throwIfAborted(signal);
+        } catch (err) {
+          this.cancelExport();
+          throw err;
+        }
+
+        // O callback vai ao background e volta: nesse tempo o modal pode ter sido redesenhado, e um
+        // clique no botão antigo, já fora da página, não exportaria nada
+        const currentModal = this.findModal();
+        buttonToClick = currentModal && this.findButtonByText(currentModal, SELECTORS.EXPORT_CONFIRM_TEXT);
+        if (!buttonToClick) {
+          this.cancelExport();
+          throw new Error('Botão "Exportar" não encontrado no modal de exportação depois de armar a captura do arquivo.');
+        }
+      }
+
       // Clique único e sem retentativa: um segundo clique geraria um segundo download
-      simulateClick(confirmBtn);
+      simulateClick(buttonToClick);
 
       // Aguarda o modal fechar; se continuar aberto, segue mesmo assim (a captura do arquivo tem timeout próprio)
       try {

@@ -31,9 +31,11 @@ function urlPatternToRegExp(pattern) {
 
 /**
  * Content script simulado da aba do WhatsApp. Por padrão responde sucesso ao
- * EXPORT_CHAT_REQUEST sem entregar arquivo nenhum (como se o WhatsApp não gerasse o download);
- * cada cenário define `onExport` para entregar o arquivo (deliverFile) ou falhar (resposta de falha
- * ou exceção; um `code` em texto na exceção vai na resposta, como no content real).
+ * EXPORT_CHAT_REQUEST sem armar a captura nem entregar arquivo nenhum (como se o WhatsApp não gerasse
+ * o download); cada cenário define `onExport` para armar a captura (armCapture) e entregar o arquivo
+ * (deliverFile), ou falhar (resposta de falha ou exceção; um `code` em texto na exceção vai na
+ * resposta, como no content real). `onFetchBlob` simula a leitura de um download interceptado pelo
+ * chrome.downloads; sem ele, a leitura falha.
  */
 function createFakeContent({ chats, ready }) {
   const content = {
@@ -44,8 +46,11 @@ function createFakeContent({ chats, ready }) {
     readyChecks: 0,
     received: [],
     exportRequests: [],
+    fetchRequests: [],
     /** @type {null|function(Object): (Object|Promise<Object>)} */
     onExport: null,
+    /** @type {null|function(Object): (Object|Promise<Object>)} */
+    onFetchBlob: null,
 
     async handle(message) {
       switch (message.action) {
@@ -64,6 +69,15 @@ function createFakeContent({ chats, ready }) {
           // Como o content real: um erro na página vira resposta de falha, com o código dele, não exceção
           try {
             return await content.onExport(message);
+          } catch (err) {
+            return { success: false, cancelled: false, error: err.message, code: typeof err.code === 'string' ? err.code : null };
+          }
+
+        case ACTIONS.FETCH_BLOB_REQUEST:
+          content.fetchRequests.push(message);
+          if (!content.onFetchBlob) return { success: false, error: 'Leitura do arquivo não simulada neste cenário.' };
+          try {
+            return await content.onFetchBlob(message);
           } catch (err) {
             return { success: false, cancelled: false, error: err.message, code: typeof err.code === 'string' ? err.code : null };
           }
@@ -192,8 +206,44 @@ export function createFakeChrome({ chats = [], ready = true, storage = {} } = {}
     /** Mensagens WORKFLOW_PROGRESS_UPDATE enviadas ao popup */
     progressUpdates: () => runtimeMessages.filter((m) => m.action === ACTIONS.WORKFLOW_PROGRESS_UPDATE),
     /** Ações recebidas pela aba, na ordem */
-    receivedActions: () => content.received.map((m) => m.action)
+    receivedActions: () => content.received.map((m) => m.action),
+    /** Dispara chrome.downloads.onCreated, como o Chrome faz ao começar um download */
+    dispatchDownload: (item) => api.downloads.onCreated.dispatch(structuredClone(item)),
+    /** Chamadas a chrome.downloads (pause, resume, cancel...) feitas para este download */
+    downloadCallsFor: (downloadId) => downloadCalls.filter(({ args }) => args[0] === downloadId || args[0]?.id === downloadId)
   };
+}
+
+/**
+ * Download criado por um link `blob:` da página do WhatsApp Web. No onCreated o Chrome costuma
+ * ainda não ter definido o nome do arquivo, então `filename` vazio é o caso comum.
+ * @param {Object} params
+ * @param {number} params.id
+ * @param {string} [params.filename='']
+ * @param {string} [params.mime='application/zip']
+ * @returns {Object}
+ */
+export function whatsAppDownload({ id, filename = '', mime = 'application/zip' }) {
+  const url = `blob:${WHATSAPP_URL}download-${id}`;
+  return { id, url, finalUrl: url, referrer: WHATSAPP_URL, filename, mime, state: 'in_progress' };
+}
+
+/**
+ * Simula o onBeforeConfirm do content: avisa que vai clicar em "Exportar" (EXPORT_CAPTURE_ARMED)
+ * pelo mesmo método do orquestrador que o service worker chama, com o id da aba que enviou.
+ * Como o content real, lança erro se o background recusar (e aí não clica em "Exportar").
+ * @param {import('../../background/extraction-orchestrator.js').ExtractionOrchestrator} orch
+ * @param {string} captureId
+ * @param {Object} [options]
+ * @param {number} [options.tabId]
+ * @returns {Object} Resposta do orquestrador
+ */
+export function armCapture(orch, captureId, { tabId = WHATSAPP_TAB_ID } = {}) {
+  const response = orch.armCapture({ captureId, tabId });
+  if (!response?.success) {
+    throw new Error(response?.error || `O background recusou ${ACTIONS.EXPORT_CAPTURE_ARMED}.`);
+  }
+  return response;
 }
 
 /**
