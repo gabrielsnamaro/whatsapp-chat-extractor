@@ -98,6 +98,19 @@ export class ZipReader {
   }
 
   /**
+   * Descompacta uma entrada lida por readRawEntries, sem descompactar as demais do ZIP.
+   * Lança erro em método de compressão não suportado: devolver os bytes brutos faria quem lê o
+   * conteúdo tratar dados comprimidos como texto.
+   * @param {{ path: string, method: number, data: Uint8Array }} entry
+   * @returns {Promise<Uint8Array>}
+   */
+  static async decompressEntry(entry) {
+    if (entry.method === 0) return entry.data;
+    if (entry.method === 8) return this._decompressDeflate(entry.data);
+    throw new Error(`Método de compressão ${entry.method} não suportado para ${entry.path}.`);
+  }
+
+  /**
    * Extrai todos os arquivos contidos em um binário .ZIP, descompactados
    * @param {Blob|ArrayBuffer|Uint8Array} zipData
    * @returns {Promise<Array<{ path: string, content: Uint8Array, size: number }>>}

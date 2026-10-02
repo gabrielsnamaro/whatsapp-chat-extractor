@@ -2,6 +2,7 @@ import { WORKFLOW_STATES } from '../shared/constants/workflow-states.js';
 import { ACTIONS } from '../shared/constants/actions.js';
 import { StagingRepository } from '../shared/storage/staging-repository.js';
 import { StorageClient } from '../shared/clients/storage-client.js';
+import { inspectChatExport } from '../shared/archive/chat-export-inspector.js';
 import { findWhatsAppTab } from '../shared/utils/whatsapp-tab.js';
 import { Logger } from '../shared/utils/logger.js';
 import { DownloadInterceptor } from './download-interceptor.js';
@@ -34,6 +35,10 @@ const RESULT_STATUS = Object.freeze({
 // clássico não é importável aqui) quando o menu não oferece "Exportar conversa". O próprio WhatsApp
 // não exporta essa conversa, então ela é contada à parte e não como falha.
 const NOT_EXPORTABLE_CODE = 'EXPORT_OPTION_UNAVAILABLE';
+
+// Exportação vazia: o arquivo chegou e está no ZIP, mas o texto da conversa veio em branco. É um
+// SAVED com `empty: true`, não um status próprio, para continuar contando como "no ZIP"
+const EMPTY_EXPORT_LABEL = 'OK – VAZIA';
 
 class RunCancelledError extends Error {
   constructor() {
@@ -155,6 +160,7 @@ export class ExtractionOrchestrator {
       statusMessage: this.statusMessage,
       summary: {
         saved: results.filter((r) => r.status === RESULT_STATUS.SAVED).length,
+        empty: results.filter((r) => r.status === RESULT_STATUS.SAVED && r.empty).length,
         savedToDisk: results.filter((r) => r.status === RESULT_STATUS.SAVED_TO_DISK).length,
         notExportable: results.filter((r) => r.status === RESULT_STATUS.NOT_EXPORTABLE).length,
         failed: results.filter((r) => r.status === RESULT_STATUS.FAILED).length
@@ -504,6 +510,8 @@ export class ExtractionOrchestrator {
         this._notifyProgress({ warningMessage: `${prefix} ⚠️ ${result.message}` });
       } else if (result.status === RESULT_STATUS.NOT_EXPORTABLE) {
         this._notifyProgress({ warningMessage: `${prefix} ⚠️ [NÃO EXPORTÁVEL] ${result.message}` });
+      } else if (result.empty) {
+        this._notifyProgress({ warningMessage: `${prefix} ⚠️ [${EMPTY_EXPORT_LABEL}] ${result.message}` });
       } else {
         this._notifyProgress({ infoMessage: `${prefix} ✅ ${result.message}` });
       }
@@ -522,9 +530,11 @@ export class ExtractionOrchestrator {
   /**
    * Exporta uma conversa: dispara a exportação na aba e aguarda o arquivo pela página ou pelo download.
    * `code` é o código do erro (null sem erro ou sem código conhecido); `via` diz como a aba abriu a
-   * conversa (null se a aba não chegou a confirmar a exportação).
+   * conversa (null se a aba não chegou a confirmar a exportação); `staged` diz se o arquivo foi
+   * gravado no staging. Uma conversa salva traz também o resultado da inspeção do texto (`empty`,
+   * contagens e datas, null se o conteúdo não foi inspecionado, com o motivo em `inspectionError`).
    * @private
-   * @returns {Promise<{ title: string, status: string, code: string|null, via: string|null, message: string, size?: number }>}
+   * @returns {Promise<{ title: string, status: string, code: string|null, via: string|null, staged: boolean, message: string, size?: number }>}
    */
   async _exportChat(chat, index, signal) {
     const { runId, tabId } = this.run;
@@ -535,6 +545,7 @@ export class ExtractionOrchestrator {
       status: code === NOT_EXPORTABLE_CODE ? RESULT_STATUS.NOT_EXPORTABLE : RESULT_STATUS.FAILED,
       code,
       via,
+      staged: false,
       message: `"${chat.title}": ${message}`
     });
 
@@ -559,9 +570,12 @@ export class ExtractionOrchestrator {
           status: RESULT_STATUS.SAVED_TO_DISK,
           code: null,
           via,
+          staged: false,
           message: `"${chat.title}" foi baixado direto para a pasta Downloads (${captured.filename}) e não está no ZIP.`
         };
       }
+
+      const { inspection, inspectionError } = await this._inspectExport(chat, captured.blob);
 
       await StagingRepository.saveChatFile({
         chatId: String(index).padStart(6, '0'),
@@ -570,14 +584,28 @@ export class ExtractionOrchestrator {
         blob: captured.blob
       });
 
+      const details = [formatSize(captured.blob.size)];
+      if (inspection?.omittedMediaCount > 0) details.push(`${inspection.omittedMediaCount} anexo(s) omitido(s)`);
+      const formatUnrecognized = Boolean(inspection) && !inspection.isEmpty && inspection.messageCount === null;
+      const inspectionNote = inspectionError
+        ? ` Conteúdo não inspecionado: ${inspectionError}`
+        : formatUnrecognized ? ' Formato do texto não reconhecido: mensagens e anexos não contados.' : '';
       const homonymNote = chat.duplicateTitle ? ' Atenção: existe outra conversa com o mesmo nome, que não foi exportada.' : '';
       return {
         title: chat.title,
         status: RESULT_STATUS.SAVED,
         code: null,
         via,
+        staged: true,
         size: captured.blob.size,
-        message: `"${chat.title}" salvo (${formatSize(captured.blob.size)}).${homonymNote}`
+        empty: inspection?.isEmpty === true,
+        inspectionError,
+        messageCount: inspection?.messageCount ?? null,
+        systemEventCount: inspection?.systemEventCount ?? null,
+        omittedMediaCount: inspection?.omittedMediaCount ?? null,
+        firstTimestamp: inspection?.firstTimestamp ?? null,
+        lastTimestamp: inspection?.lastTimestamp ?? null,
+        message: `"${chat.title}" salvo (${details.join(', ')}).${inspectionNote}${homonymNote}`
       };
     } catch (err) {
       if (err instanceof RunCancelledError || signal.aborted) throw new RunCancelledError();
@@ -587,6 +615,21 @@ export class ExtractionOrchestrator {
       this.captures.discard(captureId);
       this.interceptor.disarm();
       chrome.tabs.sendMessage(tabId, { action: ACTIONS.DISARM_EXPORT_CAPTURE, captureId }).catch(() => {});
+    }
+  }
+
+  /**
+   * Inspeciona o texto do arquivo capturado. Uma falha aqui não impede salvar a conversa: o arquivo
+   * chegou e vai para o ZIP, e a falha fica no log e no resultado ("conteúdo não inspecionado").
+   * @private
+   * @returns {Promise<{ inspection: import('../shared/archive/chat-export-inspector.js').ChatExportInspection|null, inspectionError: string|null }>}
+   */
+  async _inspectExport(chat, blob) {
+    try {
+      return { inspection: await inspectChatExport(blob), inspectionError: null };
+    } catch (err) {
+      log.warn(`Conteúdo de "${chat.title}" não inspecionado; a conversa é salva mesmo assim:`, err);
+      return { inspection: null, inspectionError: err.message };
     }
   }
 
@@ -604,20 +647,27 @@ export class ExtractionOrchestrator {
       [RESULT_STATUS.NOT_EXPORTABLE]: 'NÃO EXPORTÁVEL',
       [RESULT_STATUS.FAILED]: 'FALHA'
     };
+    const omittedMedia = results.reduce((total, result) => total + (result?.omittedMediaCount ?? 0), 0);
+    // Conversa salva sem contagem (não inspecionada ou formato não reconhecido) deixa o total abaixo do real
+    const uncounted = results.filter((result) => result?.staged && !result.empty && result.omittedMediaCount == null).length;
+    const partialNote = uncounted ? `; total parcial: ${uncounted} conversa(s) sem contagem` : '';
 
     const lines = [
       'Relatório de extração - WhatsApp Web Extractor',
       `Início: ${new Date(startedAt).toLocaleString('pt-BR')}`,
       `Geração do ZIP: ${new Date().toLocaleString('pt-BR')}`,
-      `Modo: ${options.downloadAll ? 'todas as conversas' : `limite de ${options.maxChats} conversa(s)`}`,
-      `Conversas na fila: ${queue.length} | no ZIP: ${summary.saved} | na pasta Downloads: ${summary.savedToDisk} | ` +
-        `não exportáveis: ${summary.notExportable} | falhas: ${summary.failed}`,
+      // A varredura (chat-list-scanner.js) percorre só a lista principal e não abre "Arquivadas"
+      `Modo: ${options.downloadAll ? 'lista principal (arquivadas não incluídas)' : `limite de ${options.maxChats} conversa(s)`}`,
+      'Conteúdo: somente texto; o WhatsApp Web exporta sem mídia, e os anexos aparecem como marcadores ' +
+        `(${omittedMedia} anexo(s) omitido(s) nesta execução${partialNote}).`,
+      `Conversas na fila: ${queue.length} | no ZIP: ${summary.saved} (vazias: ${summary.empty}) | ` +
+        `na pasta Downloads: ${summary.savedToDisk} | não exportáveis: ${summary.notExportable} | falhas: ${summary.failed}`,
       ''
     ];
     queue.forEach((chat, i) => {
       const result = results[i];
       lines.push(result
-        ? `[${labels[result.status]}] ${i + 1}. ${result.message}`
+        ? `[${result.empty ? EMPTY_EXPORT_LABEL : labels[result.status]}] ${i + 1}. ${result.message}`
         : `[NÃO PROCESSADA] ${i + 1}. "${chat.title}"`);
     });
     return lines.join('\n') + '\n';
@@ -654,7 +704,8 @@ export class ExtractionOrchestrator {
     await StagingRepository.clear().catch((err) => log.warn('Falha ao limpar o staging após o download:', err));
     this._setPhase(WORKFLOW_STATES.COMPLETED);
     this.currentChatTitle = 'Concluído';
-    const counts = [`${summary.saved} conversa(s) no ZIP`, `${summary.failed} falha(s)`];
+    const inZip = `${summary.saved} conversa(s) no ZIP` + (summary.empty ? ` (${summary.empty} vazia(s))` : '');
+    const counts = [inZip, `${summary.failed} falha(s)`];
     if (summary.notExportable) counts.push(`${summary.notExportable} não exportável(is)`);
     if (summary.savedToDisk) counts.push(`${summary.savedToDisk} baixada(s) direto na pasta Downloads`);
     this.statusMessage = `Backup salvo: ${archiveFilename} (${formatSize(outcome.size)}). ${counts.join(', ')}.`;

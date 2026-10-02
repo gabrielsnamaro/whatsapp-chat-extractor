@@ -68,7 +68,8 @@ export class ArchivePackager {
 
       if (await ZipReader.isZipBlob(blob)) {
         try {
-          // Exportação com mídia: copia as entradas já comprimidas, sem descompactar e recompactar
+          // ZIP nativo (o WhatsApp Web exporta assim mesmo só com texto): copia as entradas como estão,
+          // sem descompactar e recompactar
           const usedInner = new Set();
           for (const entry of await ZipReader.readRawEntries(blob)) {
             const innerName = buildUniqueFolderName(normalizeInnerEntryName(entry.path), usedInner);

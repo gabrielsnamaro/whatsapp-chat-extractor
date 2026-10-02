@@ -51,7 +51,8 @@ export class ProgressView {
    * @param {string} [data.currentChatTitle='']
    * @param {string} [data.errorMessage=null]
    * @param {string} [data.statusMessage=null] Mensagem de estado (ex: execução interrompida, download não concluído)
-   * @param {{ saved: number, savedToDisk: number, notExportable: number, failed: number }} [data.summary]
+   * @param {{ saved: number, empty: number, savedToDisk: number, notExportable: number, failed: number }} [data.summary]
+   *   `empty` são as exportações vazias, já contadas em `saved`
    */
   renderProgress({ state, current = 0, total = 0, percentage = 0, currentChatTitle = '', errorMessage = null, statusMessage = null, summary = null }) {
     if (!this.container) return;
@@ -76,7 +77,8 @@ export class ProgressView {
       } else if (total > 0) {
         const failures = summary?.failed ? ` · ${summary.failed} falha(s)` : '';
         const notExportable = summary?.notExportable ? ` · ${summary.notExportable} não exportável(is)` : '';
-        this.label.textContent = `${current} de ${total} (${validPercent}%)${failures}${notExportable}`;
+        const empty = summary?.empty ? ` · ${summary.empty} vazia(s)` : '';
+        this.label.textContent = `${current} de ${total} (${validPercent}%)${failures}${notExportable}${empty}`;
       } else {
         this.label.textContent = `${validPercent}%`;
       }
