@@ -45,6 +45,7 @@
     EXPORT_MODAL_FALLBACK: 'div[role="dialog"]',
     EXPORT_RADIO_ALL_MSGS: 'input#date-range-all',
     EXPORT_RADIO_ALL_LABEL: 'label[for="date-range-all"]',
+    EXPORT_DATE_RANGE_RADIOS: 'input[name="date-range"]',
     EXPORT_MODAL_BUTTONS: 'button, div[role="button"]',
     EXPORT_CONFIRM_TEXT: 'Exportar',
     EXPORT_CANCEL_TEXT: 'Cancelar'

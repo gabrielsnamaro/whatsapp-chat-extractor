@@ -263,6 +263,7 @@ test('três conversas salvas: staging por posição na fila, ZIP e mensagem fina
     via: 'visible',
     staged: true,
     late: false,
+    warnings: [],
     size: 1536,
     empty: false,
     inspectionError: null,
@@ -301,6 +302,7 @@ test('falha no meio da fila não interrompe as conversas seguintes', { timeout: 
     via: null,
     staged: false,
     late: false,
+    warnings: [],
     message: '"Bia": Conversa não encontrada na lista.',
     attempts: 2,
     firstAttemptCode: null
@@ -430,6 +432,7 @@ test('conversa sem "Exportar conversa" no menu é não exportável, contada à p
     via: null,
     staged: false,
     late: false,
+    warnings: [],
     message: `"Bia": ${EXPORT_UNAVAILABLE_MESSAGE}`,
     attempts: 1
   });
@@ -489,6 +492,7 @@ test('arquivo não entregue no prazo nem na quarentena: falha FILE_NOT_DELIVERED
     via: 'search',
     staged: false,
     late: false,
+    warnings: [],
     message: `"Bia": ${notDelivered}`,
     attempts: 2,
     firstAttemptCode: 'FILE_NOT_DELIVERED'
@@ -632,6 +636,7 @@ test('outra falha na quarentena prevalece sobre o prazo esgotado: leitura falha 
       via: 'visible',
       staged: false,
       late: false,
+      warnings: [],
       message: '"Bia": HTTP 404 ao ler o arquivo exportado.',
       attempts: 2,
       firstAttemptCode: 'TRANSFER_FAILED'
@@ -643,6 +648,7 @@ test('outra falha na quarentena prevalece sobre o prazo esgotado: leitura falha 
       via: 'visible',
       staged: false,
       late: false,
+      warnings: [],
       message: '"Caio": Arquivo recebido com 5 bytes; esperados 10.',
       attempts: 2,
       firstAttemptCode: 'SIZE_MISMATCH'
@@ -806,6 +812,7 @@ test('exportação vazia: [OK – VAZIA] no relatório, contada no ZIP e gravada
     via: 'visible',
     staged: true,
     late: false,
+    warnings: [],
     size: emptyZip.length,
     empty: true,
     inspectionError: null,
@@ -872,6 +879,7 @@ test('conteúdo não inspecionado: a conversa é salva mesmo assim, e o relatór
     via: 'visible',
     staged: true,
     late: false,
+    warnings: [],
     size: truncatedZip.length,
     empty: false,
     inspectionError: result.inspectionError,
@@ -1169,6 +1177,7 @@ test('aviso de captura armada recusado: outra captura, outra aba ou conversa já
     via: null,
     staged: false,
     late: false,
+    warnings: [],
     message: `"Ana": ${notArmedError}`,
     attempts: 2,
     firstAttemptCode: 'CAPTURE_NOT_ARMED'
@@ -1487,6 +1496,7 @@ test('falha que persiste: uma única repescagem, sem segunda rodada, e fica a fa
     via: null,
     staged: false,
     late: false,
+    warnings: [],
     message: `"Bia": ${timeouts[2]}`,
     attempts: 2,
     firstAttemptCode: 'TIMEOUT'
@@ -1540,6 +1550,53 @@ test('fora da repescagem: exportação vazia, não exportável, homônimo e moda
   const updates = fake.progressUpdates();
   assert.equal(updates.some((m) => m.retry), false);
   assert.equal(updates.some((m) => m.infoMessage?.startsWith('Repescagem')), false);
+});
+
+test('modal sem "Todas as mensagens": aviso na linha e total no cabeçalho; com outro intervalo marcado, falha fora da repescagem', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const { fake, archive } = setUp({ chats: sidebarChats(['Ana', 'Bia', 'Caio', 'Davi']) });
+  const orch = createOrchestrator();
+  // Texto que o content (export-modal-handler.js) lança quando o modal tem outro intervalo marcado
+  const dateRangeNotAll = 'O modal de exportação não oferece "Todas as mensagens" e está com outro intervalo de datas marcado; ' +
+    'a conversa não foi exportada para não sair incompleta.';
+  const deliver = deliveringExport(orch, { failures: { Davi: { error: dateRangeNotAll, code: 'DATE_RANGE_NOT_ALL' } } });
+  // Ana e Caio: o modal não tinha o rádio nem outro intervalo marcado, e a aba exportou com o aviso
+  fake.content.onExport = (message) => {
+    const response = deliver(message);
+    return ['Ana', 'Caio'].includes(message.chat.title) ? { ...response, warnings: ['DATE_RANGE_UNCONFIRMED'] } : response;
+  };
+
+  // Espera de produção antes da repescagem (60 s): só não estoura o limite do teste se Davi ficar fora dela
+  const startedAt = performance.now();
+  await orch.start({ safeDelayMs: 0 });
+  const elapsed = performance.now() - startedAt;
+
+  assert.equal(orch.getState().state, WORKFLOW_STATES.COMPLETED);
+  assert.ok(elapsed < 1000, `a execução levou ${elapsed.toFixed(0)} ms: esperou por uma repescagem`);
+  assert.deepEqual(orch.getState().summary, { saved: 3, empty: 0, savedToDisk: 0, notExportable: 0, failed: 1 });
+  assert.deepEqual(fake.content.exportRequests.map((m) => m.chat.title), ['Ana', 'Bia', 'Caio', 'Davi']);
+  assert.deepEqual(orch.run.retry.indices, []);
+  assert.deepEqual(
+    orch.run.results.map(({ status, code, attempts, warnings }) => [status, code, attempts, warnings]),
+    [
+      ['saved', null, 1, ['DATE_RANGE_UNCONFIRMED']],
+      ['saved', null, 1, []],
+      ['saved', null, 1, ['DATE_RANGE_UNCONFIRMED']],
+      ['failed', 'DATE_RANGE_NOT_ALL', 1, []]
+    ]
+  );
+  assert.deepEqual(fake.readStorage('extractionRun').results[0].warnings, ['DATE_RANGE_UNCONFIRMED']);
+
+  const rangeNote = " Aviso: não foi possível confirmar a opção 'Todas as mensagens' no modal.";
+  const lines = archive.calls[0].report.split('\n');
+  assert.deepEqual(lines.slice(5, 12), [
+    'Conversas na fila: 4 | no ZIP: 3 (vazias: 0) | na pasta Downloads: 0 | não exportáveis: 0 | falhas: 1',
+    "Aviso: em 2 conversa(s) não foi possível confirmar a opção 'Todas as mensagens' no modal; confira se o histórico delas veio completo.",
+    '',
+    `[OK] 1. "Ana" salvo (1.5 KB).${rangeNote}`,
+    '[OK] 2. "Bia" salvo (1.5 KB).',
+    `[OK] 3. "Caio" salvo (1.5 KB).${rangeNote}`,
+    `[FALHA] 4. "Davi": ${dateRangeNotAll}`
+  ]);
 });
 
 test('entram na repescagem: falhas passageiras, captura não armada, falha sem código e código desconhecido', { timeout: TEST_TIMEOUT_MS }, async () => {

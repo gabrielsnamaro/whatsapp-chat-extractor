@@ -27,6 +27,10 @@
   // (DomUtils.ERROR_CODES): vem do aviso ao background antes do clique em "Exportar"
   const CAPTURE_NOT_ARMED_CODE = 'CAPTURE_NOT_ARMED';
 
+  // Aviso da conversa exportada sem a confirmação de "Todas as mensagens" no modal (sem o rádio dela e
+  // sem outro intervalo marcado). O background marca a conversa no relatório por este código
+  const DATE_RANGE_UNCONFIRMED_WARNING = 'DATE_RANGE_UNCONFIRMED';
+
   /** @type {AbortController|null} Operação DOM em andamento (scan ou exportação) */
   let currentOperation = null;
   /** @type {string|null} Captura aguardando o arquivo gerado pela exportação atual */
@@ -156,11 +160,12 @@
               await optionsMenu.triggerExportOption({ signal: operation.signal });
               // A captura só é armada imediatamente antes do clique em "Exportar" (o link de download só
               // existe depois dele): até lá, um arquivo atrasado da conversa anterior não é tomado como desta
-              await modalHandler.confirmExport({
+              const { allMessagesConfirmed } = await modalHandler.confirmExport({
                 signal: operation.signal,
                 onBeforeConfirm: () => armCaptureBeforeConfirm(captureId)
               });
-              sendResponse({ success: true, triggered: true, via, warnings: [] });
+              const warnings = allMessagesConfirmed ? [] : [DATE_RANGE_UNCONFIRMED_WARNING];
+              sendResponse({ success: true, triggered: true, via, warnings });
             } catch (err) {
               if (armedCaptureId === captureId) armedCaptureId = null;
               throw err;

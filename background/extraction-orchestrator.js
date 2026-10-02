@@ -54,6 +54,11 @@ const EMPTY_EXPORT_LABEL = 'OK – VAZIA';
 
 const LATE_FILE_NOTE = ' Chegou atrasado: o arquivo foi entregue na quarentena, depois do prazo de espera.';
 
+// Aviso que o content (content/content.js) devolve quando exportou sem confirmar "Todas as mensagens"
+// no modal: a conversa foi salva, mas pode não ter o histórico inteiro
+const DATE_RANGE_UNCONFIRMED_WARNING = 'DATE_RANGE_UNCONFIRMED';
+const DATE_RANGE_UNCONFIRMED_NOTE = " Aviso: não foi possível confirmar a opção 'Todas as mensagens' no modal.";
+
 const UNEXPECTED_FILE_SOURCE_LABELS = Object.freeze({ page: 'página', download: 'chrome.downloads' });
 
 class RunCancelledError extends Error {
@@ -779,7 +784,8 @@ export class ExtractionOrchestrator {
   /**
    * Exporta uma conversa: dispara a exportação na aba e aguarda o arquivo pela página ou pelo download.
    * `code` é o código do erro (null sem erro ou sem código conhecido); `via` diz como a aba abriu a
-   * conversa (null se a aba não chegou a confirmar a exportação); `staged` diz se o arquivo foi
+   * conversa e `warnings` traz os códigos de aviso da aba (null e vazio se a aba não chegou a confirmar
+   * a exportação); `staged` diz se o arquivo foi
    * gravado no staging; `late` diz se ele só chegou na quarentena. Uma conversa salva traz também o
    * resultado da inspeção do texto (`empty`, contagens e datas, null se o conteúdo não foi inspecionado,
    * com o motivo em `inspectionError`).
@@ -789,19 +795,21 @@ export class ExtractionOrchestrator {
    * @param {AbortSignal} signal
    * @param {Object} [options]
    * @param {number} [options.attempt=1] 1 na fila, 2 na repescagem
-   * @returns {Promise<{ title: string, status: string, code: string|null, via: string|null, staged: boolean, late: boolean, message: string, size?: number }>}
+   * @returns {Promise<{ title: string, status: string, code: string|null, via: string|null, warnings: string[], staged: boolean, late: boolean, message: string, size?: number }>}
    */
   async _exportChat(chat, index, signal, { attempt = 1 } = {}) {
     const { runId, tabId } = this.run;
     // Uma captura por tentativa: um bloco atrasado da transferência da 1ª é recusado na repescagem
     const captureId = attempt === 1 ? `${runId}-${index}` : `${runId}-${index}-r${attempt - 1}`;
     let via = null;
+    let warnings = [];
     let late = false;
     const failed = (message, code) => ({
       title: chat.title,
       status: code === NOT_EXPORTABLE_CODE ? RESULT_STATUS.NOT_EXPORTABLE : RESULT_STATUS.FAILED,
       code,
       via,
+      warnings,
       staged: false,
       late: false,
       message: `"${chat.title}": ${message}`
@@ -818,6 +826,7 @@ export class ExtractionOrchestrator {
         return failed(trigger?.error || 'erro desconhecido na página.', errorCodeOf(trigger));
       }
       via = trigger.via ?? null;
+      warnings = Array.isArray(trigger.warnings) ? trigger.warnings : [];
 
       this._setPhase(WORKFLOW_STATES.WAITING_DOWNLOAD);
       this._notifyProgress();
@@ -840,6 +849,7 @@ export class ExtractionOrchestrator {
           status: RESULT_STATUS.SAVED_TO_DISK,
           code: null,
           via,
+          warnings,
           staged: false,
           late,
           message: `"${chat.title}" foi baixado direto para a pasta Downloads (${captured.filename}) e não está no ZIP.${lateNote}`
@@ -867,6 +877,7 @@ export class ExtractionOrchestrator {
         status: RESULT_STATUS.SAVED,
         code: null,
         via,
+        warnings,
         staged: true,
         late,
         size: captured.blob.size,
@@ -943,6 +954,10 @@ export class ExtractionOrchestrator {
     // Conversa salva sem contagem (não inspecionada ou formato não reconhecido) deixa o total abaixo do real
     const uncounted = results.filter((result) => result?.staged && !result.empty && result.omittedMediaCount == null).length;
     const partialNote = uncounted ? `; total parcial: ${uncounted} conversa(s) sem contagem` : '';
+    // Só nas que receberam arquivo: numa falha não há histórico para conferir. Uma execução gravada por
+    // uma versão anterior da extensão não tem `warnings` nos resultados
+    const hasUnconfirmedRange = (result) => gotFile(result) && Boolean(result.warnings?.includes(DATE_RANGE_UNCONFIRMED_WARNING));
+    const unconfirmedRange = results.filter(hasUnconfirmedRange).length;
 
     const lines = [
       'Relatório de extração - WhatsApp Web Extractor',
@@ -955,6 +970,12 @@ export class ExtractionOrchestrator {
       `Conversas na fila: ${queue.length} | no ZIP: ${summary.saved} (vazias: ${summary.empty}) | ` +
         `na pasta Downloads: ${summary.savedToDisk} | não exportáveis: ${summary.notExportable} | falhas: ${summary.failed}`
     ];
+    if (unconfirmedRange) {
+      lines.push(
+        `Aviso: em ${unconfirmedRange} conversa(s) não foi possível confirmar a opção 'Todas as mensagens' no modal; ` +
+          'confira se o histórico delas veio completo.'
+      );
+    }
     if (retry?.indices.length) {
       const recovered = retry.indices.filter((index) => gotFile(results[index])).length;
       lines.push(
@@ -972,7 +993,10 @@ export class ExtractionOrchestrator {
         return;
       }
       const attemptsNote = result.attempts > 1 ? ` Tentativas: ${result.attempts}.` : '';
-      lines.push(`[${result.empty ? EMPTY_EXPORT_LABEL : labels[result.status]}] ${i + 1}. ${result.message}${attemptsNote}${checkNotes.get(i) ?? ''}`);
+      const rangeNote = hasUnconfirmedRange(result) ? DATE_RANGE_UNCONFIRMED_NOTE : '';
+      lines.push(
+        `[${result.empty ? EMPTY_EXPORT_LABEL : labels[result.status]}] ${i + 1}. ${result.message}${rangeNote}${attemptsNote}${checkNotes.get(i) ?? ''}`
+      );
     });
 
     const unexpectedFiles = this.run.unexpectedFiles ?? [];

@@ -4,7 +4,9 @@
  * selecionar o intervalo completo de mensagens e confirmar a geração do arquivo.
  */
 (function registerExportModalHandler() {
-  const { SELECTORS, TIMEOUTS, waitFor, sleep, throwIfAborted, isVisible, simulateClick, pressEscape } = window.DomUtils;
+  const {
+    SELECTORS, TIMEOUTS, ERROR_CODES, DomAutomationError, waitFor, sleep, throwIfAborted, isVisible, simulateClick, pressEscape
+  } = window.DomUtils;
 
   class ExportModalHandler {
     /**
@@ -20,8 +22,9 @@
     }
 
     /**
-     * Localiza o modal de exportação visível. O fallback por role="dialog" só aceita
-     * diálogos que contenham o rádio "Todas as mensagens", para não confundir com outros modais.
+     * Localiza o modal de exportação visível. O fallback por role="dialog" só aceita diálogos com um
+     * rádio de intervalo de datas ou o botão "Exportar", para não confundir com outros modais e ainda
+     * achar o de exportação se o WhatsApp tirar o data-testid ou o rádio "Todas as mensagens".
      * @returns {HTMLElement|null}
      */
     findModal() {
@@ -29,7 +32,8 @@
       if (isVisible(modal)) return modal;
 
       for (const dialog of document.querySelectorAll(SELECTORS.EXPORT_MODAL_FALLBACK)) {
-        if (isVisible(dialog) && dialog.querySelector(SELECTORS.EXPORT_RADIO_ALL_MSGS)) {
+        if (!isVisible(dialog)) continue;
+        if (dialog.querySelector(SELECTORS.EXPORT_DATE_RANGE_RADIOS) || this.findButtonByText(dialog, SELECTORS.EXPORT_CONFIRM_TEXT)) {
           return dialog;
         }
       }
@@ -37,14 +41,28 @@
     }
 
     /**
-     * Garante a seleção da opção "Todas as mensagens" no modal
+     * Garante a seleção da opção "Todas as mensagens" no modal. Sem o rádio dela, um outro intervalo
+     * marcado exportaria só parte da conversa: o modal é cancelado e a conversa falha. Sem nenhum
+     * intervalo marcado, a exportação segue, mas sem a confirmação de que vem completa.
      * @private
      * @param {HTMLElement} modal
      * @param {AbortSignal} [signal]
+     * @returns {Promise<boolean>} Se "Todas as mensagens" ficou confirmada
      */
     async _selectAllMessagesOption(modal, signal) {
       const radio = modal.querySelector(SELECTORS.EXPORT_RADIO_ALL_MSGS);
-      if (!radio || radio.checked) return;
+      if (!radio) {
+        const otherRangeChecked = [...modal.querySelectorAll(SELECTORS.EXPORT_DATE_RANGE_RADIOS)].some((input) => input.checked);
+        if (otherRangeChecked) {
+          this.cancelExport();
+          throw new DomAutomationError(
+            ERROR_CODES.DATE_RANGE_NOT_ALL,
+            'O modal de exportação não oferece "Todas as mensagens" e está com outro intervalo de datas marcado; a conversa não foi exportada para não sair incompleta.'
+          );
+        }
+        return false;
+      }
+      if (radio.checked) return true;
 
       const label = modal.querySelector(SELECTORS.EXPORT_RADIO_ALL_LABEL);
       (label || radio).click();
@@ -53,6 +71,7 @@
       if (!radio.checked) {
         throw new Error('Não foi possível selecionar "Todas as mensagens" no modal de exportação.');
       }
+      return true;
     }
 
     /**
@@ -79,7 +98,8 @@
      *   "Exportar"; se falhar (ou a operação for cancelada enquanto isso), o modal é cancelado sem o clique
      *   e o erro é relançado. Depois dele o botão é localizado de novo no modal atual; se não estiver mais
      *   lá, o modal é cancelado sem o clique e a exportação falha
-     * @returns {Promise<{ success: boolean }>}
+     * @returns {Promise<{ success: boolean, allMessagesConfirmed: boolean }>} `allMessagesConfirmed` é false
+     *   quando o modal não tinha a opção "Todas as mensagens" nem outro intervalo marcado
      */
     async confirmExport({ signal, onBeforeConfirm } = {}) {
       const modal = await waitFor(() => this.findModal(), {
@@ -89,7 +109,7 @@
       });
       await sleep(200, signal);
 
-      await this._selectAllMessagesOption(modal, signal);
+      const allMessagesConfirmed = await this._selectAllMessagesOption(modal, signal);
 
       const confirmBtn = this.findButtonByText(modal, SELECTORS.EXPORT_CONFIRM_TEXT);
       if (!confirmBtn) {
@@ -131,7 +151,7 @@
         if (err instanceof window.DomUtils.OperationCancelledError) throw err;
       }
 
-      return { success: true };
+      return { success: true, allMessagesConfirmed };
     }
 
     /**
