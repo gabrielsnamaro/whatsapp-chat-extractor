@@ -72,6 +72,9 @@ const NOT_RETRIED_CODES = new Set([NOT_EXPORTABLE_CODE, 'AMBIGUOUS_TITLE', 'DATE
 // SAVED com `empty: true`, não um status próprio, para continuar contando como "no ZIP"
 const EMPTY_EXPORT_LABEL = 'OK – VAZIA';
 
+// Conversa da fila sem resultado, no relatório e no índice
+const NOT_PROCESSED_LABEL = 'NÃO PROCESSADA';
+
 const LATE_FILE_NOTE = ' Chegou atrasado: o arquivo foi entregue na quarentena, depois do prazo de espera.';
 
 // Aviso que o content (content/content.js) devolve quando exportou sem confirmar "Todas as mensagens"
@@ -140,10 +143,11 @@ function stagingKeyOf(index) {
  * @param {import('../shared/archive/archive-packager.js').ArchiveCheck} check
  * @returns {string|null} null quando confere
  */
-function describeCheckDivergence({ missingKeys, unreadable, unexpected }) {
+function describeCheckDivergence({ missingKeys, unreadable, unexpected, crcMismatch }) {
   const issues = [];
   if (missingKeys.length) issues.push(`${missingKeys.length} conversa(s) esperada(s) não está(ão) no ZIP`);
   if (unreadable.length) issues.push(`${unreadable.length} com o ZIP do WhatsApp ilegível, gravado(s) como o arquivo original`);
+  if (crcMismatch.length) issues.push(`${crcMismatch.length} com texto de CRC que não confere, copiado como estava, sem compressão`);
   if (unexpected.length) issues.push(`${unexpected.length} no ZIP sem ser esperada(s)`);
   if (!issues.length) return null;
   return `Conferência do ZIP: ${issues.join('; ')}. Veja a seção "Conferência do ZIP" no ${REPORT_FILENAME}.`;
@@ -1179,7 +1183,7 @@ export class ExtractionOrchestrator {
     queue.forEach((chat, i) => {
       const result = results[i];
       if (!result) {
-        lines.push(`[NÃO PROCESSADA] ${i + 1}. "${chat.title}"`);
+        lines.push(`[${NOT_PROCESSED_LABEL}] ${i + 1}. "${chat.title}"`);
         return;
       }
       const attemptsNote = result.attempts > 1 ? ` Tentativas: ${result.attempts}.` : '';
@@ -1339,6 +1343,57 @@ export class ExtractionOrchestrator {
   }
 
   /**
+   * Linhas do _indice.csv, uma por conversa da fila, inclusive as que não foram para o ZIP (falha, não
+   * exportável, pasta Downloads). A pasta só se conhece no empacotamento, que a acha pela chave do
+   * staging (`chatId`); sem arquivo no staging, a chave é null e a pasta fica vazia.
+   * @private
+   * @returns {import('../shared/archive/archive-packager.js').IndexRow[]}
+   */
+  _buildIndexRows() {
+    const { queue, results } = this.run;
+    return queue.map((chat, index) => {
+      const result = results[index];
+      const row = {
+        chatId: null,
+        order: index + 1,
+        title: chat.title,
+        status: NOT_PROCESSED_LABEL,
+        code: null,
+        attempts: null,
+        bytes: null,
+        messageCount: null,
+        systemEventCount: null,
+        omittedMediaCount: null,
+        firstTimestamp: null,
+        lastTimestamp: null,
+        durationMs: null,
+        via: null
+      };
+      if (!result) return row;
+
+      const history = historyOf(result);
+      const durations = history.map((entry) => entry.durationMs);
+      const { via } = history.at(-1);
+      return {
+        ...row,
+        chatId: result.staged ? stagingKeyOf(index) : null,
+        status: result.empty ? EMPTY_EXPORT_LABEL : (RESULT_LABELS[result.status] ?? result.status),
+        code: result.code ?? null,
+        attempts: history.length,
+        bytes: result.size ?? null,
+        messageCount: result.messageCount ?? null,
+        systemEventCount: result.systemEventCount ?? null,
+        omittedMediaCount: result.omittedMediaCount ?? null,
+        firstTimestamp: result.firstTimestamp ?? null,
+        lastTimestamp: result.lastTimestamp ?? null,
+        // Uma tentativa sem duração (registrada por uma versão anterior da extensão) deixaria a soma abaixo do real
+        durationMs: durations.every(Number.isFinite) ? durations.reduce((total, ms) => total + ms, 0) : null,
+        via: via ? (VIA_LABELS[via] ?? via) : null
+      };
+    });
+  }
+
+  /**
    * FASE DE EMPACOTAMENTO (PACKAGING) e download único do ZIP master
    * @private
    * @param {AbortSignal} signal
@@ -1360,6 +1415,7 @@ export class ExtractionOrchestrator {
       archiveFilename,
       report: this._buildReport(),
       executionLog: this._buildExecutionLog(),
+      indexRows: this._buildIndexRows(),
       expectedKeys,
       signal
     });

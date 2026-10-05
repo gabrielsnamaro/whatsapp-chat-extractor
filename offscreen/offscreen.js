@@ -20,7 +20,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           const { blob, chatCount, check } = await ArchivePackager.build({
             report: message.report,
             expectedKeys: message.expectedKeys,
-            executionLog: message.executionLog
+            executionLog: message.executionLog,
+            indexRows: message.indexRows
           });
           const url = URL.createObjectURL(blob);
           sendResponse({ success: true, url, size: blob.size, chatCount, check });

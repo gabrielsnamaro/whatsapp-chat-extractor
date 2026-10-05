@@ -105,10 +105,12 @@ export class ZipWriter {
    * @param {string|Uint8Array|ArrayBuffer|Blob} content
    * @param {Object} [options]
    * @param {boolean} [options.compress] Força (true) ou impede (false) a compressão; padrão por extensão
+   * @param {number} [options.crc32] CRC32 do conteúdo, já conferido por quem chama (ex: o de uma entrada
+   *   copiada de outro ZIP, conferido contra os dados dela), gravado sem recalcular
    */
-  async addFile(path, content, { compress } = {}) {
+  async addFile(path, content, { compress, crc32: checkedCrc32 } = {}) {
     const bytes = await toUint8Array(content);
-    const crc32 = calculateCrc32(bytes);
+    const crc32 = checkedCrc32 ?? calculateCrc32(bytes);
     const shouldCompress = (compress ?? !isPrecompressedPath(path)) && bytes.length > 0;
 
     let data = bytes;

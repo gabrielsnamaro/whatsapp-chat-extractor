@@ -355,19 +355,20 @@ export function stubStaging() {
  * Troca o ArchiveDownloader.buildAndDownload (offscreen document + chrome.downloads) por um
  * stub que guarda o que recebeu e o que havia no staging naquele momento. Por padrão o download é
  * concluído, e a conferência compara as chaves esperadas com as do staging, como o ArchivePackager
- * faria (sem ZIP nativo ilegível: o stub não lê os arquivos).
+ * faria (sem ZIP nativo ilegível nem CRC divergente: o stub não lê os arquivos).
  * @param {Object} [options]
  * @param {{ files: Map<string, Object> }} [options.staging]
  * @param {Object} [options.outcome] Resposta fixa, no lugar da padrão
- * @returns {{ calls: Array<{ archiveFilename: string, report: string, executionLog: string, expectedKeys: string[], stagedKeys: string[] }>, restore: function(): void }}
+ * @returns {{ calls: Array<{ archiveFilename: string, report: string, executionLog: string, indexRows: Array<Object>, expectedKeys: string[], stagedKeys: string[] }>, restore: function(): void }}
  */
 export function stubArchiveDownloader({ staging, outcome } = {}) {
   const original = ArchiveDownloader.buildAndDownload;
   const calls = [];
 
-  ArchiveDownloader.buildAndDownload = async ({ archiveFilename, report, executionLog, expectedKeys }) => {
+  ArchiveDownloader.buildAndDownload = async ({ archiveFilename, report, executionLog, indexRows, expectedKeys }) => {
     const stagedKeys = staging ? [...staging.files.keys()].sort() : [];
-    calls.push({ archiveFilename, report, executionLog, expectedKeys: [...expectedKeys], stagedKeys });
+    // Clonadas como no envio ao offscreen document (chrome.runtime.sendMessage)
+    calls.push({ archiveFilename, report, executionLog, indexRows: structuredClone(indexRows), expectedKeys: [...expectedKeys], stagedKeys });
     if (outcome) return outcome;
 
     const expected = new Set(expectedKeys);
@@ -377,7 +378,8 @@ export function stubArchiveDownloader({ staging, outcome } = {}) {
       packed: stagedKeys.length,
       missingKeys: [...expected].filter((key) => !staged.has(key)),
       unreadable: [],
-      unexpected: stagedKeys.filter((key) => !expected.has(key))
+      unexpected: stagedKeys.filter((key) => !expected.has(key)),
+      crcMismatch: []
     };
     return { completed: true, size: 2048, chatCount: stagedKeys.length, check };
   };

@@ -2315,10 +2315,10 @@ test('conferência do ZIP: esperadas são as conversas com arquivo no staging, e
   );
 });
 
-test('conferência do ZIP com ZIP nativo ilegível e chave fora das esperadas: a mensagem final usa a contagem empacotada e o aviso diz cada divergência', { timeout: TEST_TIMEOUT_MS }, async () => {
+test('conferência do ZIP com ZIP nativo ilegível, CRC divergente e chave fora das esperadas: a mensagem final usa a contagem empacotada e o aviso diz cada divergência', { timeout: TEST_TIMEOUT_MS }, async () => {
   const { fake, staging } = setUp({ chats: sidebarChats(['Ana', 'Bia']) });
-  // Como o ArchivePackager responde quando o ZIP nativo de Bia está ilegível (vai como o arquivo original)
-  // e o staging tem uma chave que não era esperada
+  // Como o ArchivePackager responde quando o ZIP nativo de Bia está ilegível (vai como o arquivo original),
+  // o texto de Ana tem um CRC que não confere (vai como estava) e o staging tem uma chave que não era esperada
   harness.archive.restore();
   const archive = stubArchiveDownloader({
     staging,
@@ -2326,7 +2326,7 @@ test('conferência do ZIP com ZIP nativo ilegível e chave fora das esperadas: a
       completed: true,
       size: 4096,
       chatCount: 3,
-      check: { expected: 2, packed: 3, missingKeys: [], unreadable: ['000001'], unexpected: ['000007'] }
+      check: { expected: 2, packed: 3, missingKeys: [], unreadable: ['000001'], unexpected: ['000007'], crcMismatch: ['000000'] }
     }
   });
   harness.archive = archive;
@@ -2341,7 +2341,8 @@ test('conferência do ZIP com ZIP nativo ilegível e chave fora das esperadas: a
   assert.equal(state.statusMessage, `Backup salvo: ${archive.calls[0].archiveFilename} (4.0 KB). 3 conversa(s) no ZIP, 0 falha(s).`);
   assert.equal(
     fake.progressUpdates().at(-1).warningMessage,
-    '⚠️ Conferência do ZIP: 1 com o ZIP do WhatsApp ilegível, gravado(s) como o arquivo original; 1 no ZIP sem ser esperada(s). ' +
+    '⚠️ Conferência do ZIP: 1 com o ZIP do WhatsApp ilegível, gravado(s) como o arquivo original; ' +
+      '1 com texto de CRC que não confere, copiado como estava, sem compressão; 1 no ZIP sem ser esperada(s). ' +
       'Veja a seção "Conferência do ZIP" no _relatorio.txt.'
   );
 });
@@ -2465,4 +2466,70 @@ test('_execucao.log de execução gravada por uma versão anterior, sem históri
     `nº 2 "Bia" \\| tentativa 2 \\| ${DURATION} \\| abertura: lista visível \\| OK`,
     `nº 4 "Davi" \\| tentativa 2 \\| ${DURATION} \\| abertura: lista visível \\| OK`
   ], executionLog);
+});
+
+// Índice da execução (_indice.csv): as linhas que o orquestrador monta; o CSV é testado no packager
+
+test('linhas do _indice.csv: uma por conversa da fila, também as fora do ZIP, com a chave do staging só nas que têm arquivo nele', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const { fake, archive } = setUp({ chats: sidebarChats(['Ana', 'Bia', 'Caio', 'Davi', 'Eva', 'Fabi']) });
+  const orch = createOrchestrator();
+  const anaZip = await nativeExportZip([
+    '[01/02/2026, 09:00:00] - Ana criou o grupo "Família"',
+    '[01/02/2026, 09:01:00] Ana: <imagem ocultada>',
+    '[01/02/2026, 09:02:00] Bia: <documento omitido>',
+    'legenda do documento',
+    '[01/02/2026, 09:03:00] Ana: bom dia',
+    ''
+  ].join('\n'));
+  const emptyZip = await nativeExportZip('\n');
+  const deliver = deliveringExport(orch, {
+    files: { Ana: anaZip, Caio: emptyZip },
+    firstAttemptFailures: { Bia: notFound('Bia') },
+    failures: {
+      Eva: { error: EXPORT_UNAVAILABLE_MESSAGE, code: 'EXPORT_OPTION_UNAVAILABLE' },
+      Fabi: { error: 'Timeout de 15s aguardando o menu de opções da conversa.', code: 'TIMEOUT' }
+    }
+  });
+  fake.content.onExport = (message) => {
+    const { chat, captureId } = message;
+    if (chat.title === 'Davi') {
+      armCapture(orch, captureId);
+      orch.captures.resolveSavedToDisk(captureId, { filename: 'Conversa do WhatsApp com Davi.zip', downloadId: 4 });
+      return triggeredResponse();
+    }
+    // Bia é recuperada na repescagem, aberta pela busca
+    const response = deliver(message);
+    return response.success && chat.title === 'Bia' ? { ...response, via: 'search' } : response;
+  };
+
+  await orch.start({ safeDelayMs: 0, retryCooldownMs: 0 });
+
+  assert.equal(orch.getState().state, WORKFLOW_STATES.COMPLETED);
+  const [{ indexRows, expectedKeys }] = archive.calls;
+  // A duração é a soma das tentativas da conversa, com a repescagem
+  indexRows.forEach((row, index) => {
+    const history = orch.run.results[index].history;
+    assert.ok(Number.isInteger(row.durationMs), `duração inválida na linha ${index + 1}: ${row.durationMs}`);
+    assert.equal(row.durationMs, history.reduce((total, entry) => total + entry.durationMs, 0));
+  });
+  const noFile = { bytes: null, messageCount: null, systemEventCount: null, omittedMediaCount: null, firstTimestamp: null, lastTimestamp: null };
+  assert.deepEqual(indexRows.map(({ durationMs, ...row }) => row), [
+    {
+      chatId: '000000', order: 1, title: 'Ana', status: 'OK', code: null, attempts: 1, bytes: anaZip.length, messageCount: 3,
+      systemEventCount: 1, omittedMediaCount: 2, firstTimestamp: '01/02/2026, 09:00:00', lastTimestamp: '01/02/2026, 09:03:00', via: 'lista visível'
+    },
+    {
+      chatId: '000001', order: 2, title: 'Bia', status: 'OK', code: null, attempts: 2, bytes: 1536, messageCount: 1, systemEventCount: 0,
+      omittedMediaCount: 0, firstTimestamp: '01/01/2026, 09:00:00', lastTimestamp: '01/01/2026, 09:00:00', via: 'busca'
+    },
+    {
+      chatId: '000002', order: 3, title: 'Caio', status: 'OK – VAZIA', code: null, attempts: 1, bytes: emptyZip.length, messageCount: 0,
+      systemEventCount: 0, omittedMediaCount: 0, firstTimestamp: null, lastTimestamp: null, via: 'lista visível'
+    },
+    { chatId: null, order: 4, title: 'Davi', status: 'NA PASTA DOWNLOADS', code: null, attempts: 1, ...noFile, via: 'lista visível' },
+    { chatId: null, order: 5, title: 'Eva', status: 'NÃO EXPORTÁVEL', code: 'EXPORT_OPTION_UNAVAILABLE', attempts: 1, ...noFile, via: null },
+    { chatId: null, order: 6, title: 'Fabi', status: 'FALHA', code: 'TIMEOUT', attempts: 2, ...noFile, via: null }
+  ]);
+  // As chaves das linhas são as das conversas esperadas no ZIP: o empacotamento acha a pasta de cada uma por ela
+  assert.deepEqual(indexRows.flatMap((row) => row.chatId ?? []), expectedKeys);
 });
