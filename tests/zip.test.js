@@ -107,3 +107,77 @@ test('nomes de pasta únicos, sem diferenciar maiúsculas, e seguros no Windows'
   assert.equal(buildUniqueFolderName('Pai/Mãe: casa.', used), 'Pai_Mãe_ casa');
   assert.equal(buildUniqueFolderName('', used), 'conversa');
 });
+
+/** Posição no arquivo de cada entrada do diretório central (ZIP sem comentário e sem ZIP64) */
+function centralEntryOffsets(bytes) {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const eocd = bytes.length - 22;
+  const offsets = [];
+  let cursor = view.getUint32(eocd + 16, true);
+  for (let i = 0; i < view.getUint16(eocd + 10, true); i++) {
+    offsets.push(cursor);
+    cursor += 46 + view.getUint16(cursor + 28, true) + view.getUint16(cursor + 30, true) + view.getUint16(cursor + 32, true);
+  }
+  return offsets;
+}
+
+test('entrada truncada lança erro na leitura, pelo diretório central e pelos cabeçalhos locais', async () => {
+  const bytes = new Uint8Array(await (await ZipBuilder.buildArchive([
+    { path: 'Grupo/conversa.txt', content: sampleText },
+    { path: 'Grupo/foto.jpg', content: fakeJpeg }
+  ])).arrayBuffer());
+  assert.equal((await ZipReader.readRawEntries(bytes)).length, 2);
+  const [, photoCentral] = centralEntryOffsets(bytes);
+  const photoLocal = new DataView(bytes.buffer).getUint32(photoCentral + 42, true);
+  const photoDataStart = photoLocal + 30 + encoder.encode('Grupo/foto.jpg').length;
+
+  // Com o diretório central: ele declara para a foto mais bytes do que o arquivo tem depois dela
+  const declaredTooLong = bytes.slice();
+  new DataView(declaredTooLong.buffer).setUint32(photoCentral + 20, bytes.length, true);
+  await assert.rejects(ZipReader.readRawEntries(declaredTooLong), {
+    message: `A entrada "Grupo/foto.jpg" está truncada: declara ${bytes.length} byte(s) de dados a partir do byte ${photoDataStart}, ` +
+      `mas o ZIP tem ${bytes.length} byte(s).`
+  });
+
+  // Sem o diretório central (download cortado no meio da foto): a leitura cai nos cabeçalhos locais
+  const cut = bytes.slice(0, photoDataStart + 100);
+  await assert.rejects(ZipReader.extractEntries(cut), {
+    message: `A entrada "Grupo/foto.jpg" está truncada: declara ${fakeJpeg.length} byte(s) de dados a partir do byte ${photoDataStart}, ` +
+      `mas o ZIP tem ${cut.length} byte(s).`
+  });
+});
+
+test('sem o diretório central, entrada com tamanho só no diretório central (bit 3) lança erro em vez de virar conversa vazia', async () => {
+  const bytes = new Uint8Array(await (await ZipBuilder.buildArchive([
+    { path: '_chat.txt', content: sampleText }
+  ])).arrayBuffer());
+  const withDescriptorFlag = bytes.slice();
+  const view = new DataView(withDescriptorFlag.buffer);
+  view.setUint16(6, view.getUint16(6, true) | 0x0008, true);
+  view.setUint32(18, 0, true);
+  // Download cortado antes do diretório central: a leitura cai nos cabeçalhos locais
+  const cut = withDescriptorFlag.slice(0, 30 + '_chat.txt'.length + 5);
+  await assert.rejects(ZipReader.readRawEntries(cut), {
+    message: 'A entrada "_chat.txt" guarda o tamanho só no diretório central, que não existe neste ZIP: o arquivo está truncado.'
+  });
+});
+
+test('addRawEntry recusa dados de tamanho diferente do declarado, antes de gravar qualquer parte da entrada', async () => {
+  const writer = new ZipWriter();
+  const text = encoder.encode('oi');
+  const entry = { path: 'Grupo/conversa.txt', method: 0, crc32: calculateCrc32(text), compressedSize: text.length, uncompressedSize: text.length };
+
+  // Como a cópia de uma entrada truncada (menos bytes) ou de dados de outra entrada (mais bytes)
+  assert.throws(() => writer.addRawEntry({ ...entry, data: text.subarray(0, 1) }), {
+    message: 'A entrada "Grupo/conversa.txt" foi recusada: o tamanho comprimido declarado é 2 byte(s), mas os dados têm 1 byte(s).'
+  });
+  assert.throws(() => writer.addRawEntry({ ...entry, data: new Blob([encoder.encode('oi!')]) }), {
+    message: 'A entrada "Grupo/conversa.txt" foi recusada: o tamanho comprimido declarado é 2 byte(s), mas os dados têm 3 byte(s).'
+  });
+  assert.equal(writer.entryCount, 0);
+
+  // Sem nada da entrada recusada no arquivo, a entrada válida seguinte e o diretório central ficam no lugar certo
+  writer.addRawEntry({ ...entry, data: text });
+  const entries = await ZipReader.extractEntries(writer.finish());
+  assert.deepEqual(entries.map(({ path, content }) => [path, decoder.decode(content)]), [['Grupo/conversa.txt', 'oi']]);
+});

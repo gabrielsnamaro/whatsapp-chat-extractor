@@ -135,12 +135,13 @@ test('ZIP sem _chat.txt: a inspeção falha com o motivo, em vez de afirmar uma 
   await assert.rejects(inspectChatExport(zip), { message: 'O ZIP exportado não contém o texto da conversa (_chat.txt).' });
 });
 
-test('ZIP truncado: a inspeção falha dizendo que o texto está ilegível', async () => {
+test('ZIP truncado: a inspeção falha dizendo que o ZIP está ilegível e qual entrada está truncada', async () => {
   const zip = new Uint8Array(await (await exportZip({ '_chat.txt': CHAT_TEXT.repeat(20), 'chat.md': CHAT_MD })).arrayBuffer());
   // Cabeçalho local (30 bytes + nome) e só o começo dos dados comprimidos
   const truncated = new Blob([zip.subarray(0, 30 + '_chat.txt'.length + 10)]);
   assert.equal(await ZipReader.isZipBlob(truncated), true);
-  await assert.rejects(inspectChatExport(truncated), /^Error: O texto da conversa \(_chat\.txt\) está ilegível no ZIP exportado \(.+\)\.$/);
+  // A leitura recusa a entrada que declara mais bytes do que o arquivo tem, antes de tentar descompactá-la
+  await assert.rejects(inspectChatExport(truncated), /^Error: O ZIP exportado está ilegível \(A entrada "_chat\.txt" está truncada: .+\)\.$/);
 });
 
 test('formato não reconhecido: texto sem nenhuma linha "[data] ..." deixa contagens e datas em null', async () => {

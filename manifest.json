@@ -5,6 +5,7 @@
   "description": "Extensão para extração e sincronização de dados e chats diretamente do WhatsApp Web.",
   "permissions": [
     "storage",
+    "unlimitedStorage",
     "tabs",
     "scripting",
     "downloads",

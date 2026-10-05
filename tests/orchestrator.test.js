@@ -874,7 +874,7 @@ test('conteúdo não inspecionado: a conversa é salva mesmo assim, e o relatór
   assert.deepEqual(state.summary, { saved: 3, empty: 0, savedToDisk: 0, notExportable: 0, failed: 0 });
 
   const result = orch.run.results[1];
-  assert.match(result.inspectionError, /^O texto da conversa \(_chat\.txt\) está ilegível no ZIP exportado \(.+\)\.$/);
+  assert.match(result.inspectionError, /^O ZIP exportado está ilegível \(A entrada "_chat\.txt" está truncada: .+\)\.$/);
   assert.deepEqual(result, {
     title: 'Bia',
     status: 'saved',
@@ -1987,7 +1987,7 @@ test('download do ZIP não concluído: "Retomar" gera o ZIP de novo sem repetir 
 
   // Depois de reinício, com o storage do momento da pausa: a fase restaurada é a de empacotamento, e a
   // aba não é usada. O staging já foi limpo pelo download da instância anterior, mas o substituto do
-  // download não depende dele
+  // download conclui mesmo assim (só a conferência dele, que este teste não olha, depende do staging)
   const fakeB = createFakeChrome({ chats, storage: snapshot });
   installFakeChrome(fakeB);
   const orchB = createOrchestrator();
@@ -2162,5 +2162,101 @@ test('EXPORT_CHAT_REQUEST leva a posição da conversa na fila, também na repes
   assert.deepEqual(
     fake.content.exportRequests.map((m) => [m.chat.title, m.queueIndex, isRetryAttempt(m)]),
     [['Ana', 0, false], ['Bia', 1, false], ['Caio', 2, false], ['Bia', 1, true]]
+  );
+});
+
+// Conferência do ZIP: as conversas esperadas nele, a mensagem final pela contagem empacotada e o aviso de divergência
+
+test('conferência do ZIP: esperadas são as conversas com arquivo no staging, e a mensagem final usa a contagem empacotada e avisa a divergência', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const { fake, staging, archive } = setUp({ chats: sidebarChats(['Ana', 'Bia', 'Caio', 'Davi', 'Eva', 'Fabi']) });
+  const orch = createOrchestrator({ timings: { captureTimeoutMs: 40, quarantineMs: 2000 } });
+  const emptyZip = await nativeExportZip('\n');
+  const deliver = deliveringExport(orch, {
+    files: { Bia: emptyZip },
+    failures: { Eva: { error: EXPORT_UNAVAILABLE_MESSAGE, code: 'EXPORT_OPTION_UNAVAILABLE' } }
+  });
+  fake.content.onExport = (message) => {
+    const { chat, captureId } = message;
+    if (chat.title === 'Caio') {
+      // O arquivo chega depois do prazo, na quarentena
+      armCapture(orch, captureId);
+      setTimeout(() => deliverFile(orch, captureId, chatBytes('Caio', 2048)), 100);
+      return triggeredResponse();
+    }
+    if (chat.title === 'Davi') {
+      armCapture(orch, captureId);
+      orch.captures.resolveSavedToDisk(captureId, { filename: 'Conversa do WhatsApp com Davi.zip', downloadId: 6 });
+      return triggeredResponse();
+    }
+    // Como o Chrome limpando o IndexedDB sob pressão de espaço: o arquivo de Ana some do staging antes do ZIP
+    if (chat.title === 'Fabi') staging.files.delete('000000');
+    return deliver(message);
+  };
+
+  await orch.start({ safeDelayMs: 0, retryCooldownMs: 0 });
+
+  const state = orch.getState();
+  assert.equal(state.state, WORKFLOW_STATES.COMPLETED);
+  assert.deepEqual(
+    orch.run.results.map(({ status, staged, empty, late }) => [status, staged, empty ?? null, late]),
+    [
+      ['saved', true, false, false],
+      ['saved', true, true, false],
+      ['saved', true, false, true],
+      ['saved_to_disk', false, null, false],
+      ['not_exportable', false, null, false],
+      ['saved', true, false, false]
+    ]
+  );
+  // Para o orquestrador, quatro conversas foram salvas
+  assert.deepEqual(state.summary, { saved: 4, empty: 1, savedToDisk: 1, notExportable: 1, failed: 0 });
+
+  // Esperadas no ZIP: a salva, a vazia, a atrasada e a última; a da pasta Downloads e a não exportável, não
+  const [{ archiveFilename, expectedKeys, stagedKeys }] = archive.calls;
+  assert.deepEqual(expectedKeys, ['000000', '000001', '000002', '000005']);
+  assert.deepEqual(stagedKeys, ['000001', '000002', '000005']);
+
+  // A mensagem final conta as três empacotadas, e o aviso da divergência vai ao popup junto com ela
+  assert.equal(
+    state.statusMessage,
+    `Backup salvo: ${archiveFilename} (2.0 KB). 3 conversa(s) no ZIP (1 vazia(s)), 0 falha(s), 1 não exportável(is), ` +
+      '1 baixada(s) direto na pasta Downloads.'
+  );
+  const final = fake.progressUpdates().at(-1);
+  assert.equal(final.infoMessage, `🎉 ${state.statusMessage}`);
+  assert.equal(
+    final.warningMessage,
+    '⚠️ Conferência do ZIP: 1 conversa(s) esperada(s) não está(ão) no ZIP. Veja a seção "Conferência do ZIP" no _relatorio.txt.'
+  );
+});
+
+test('conferência do ZIP com ZIP nativo ilegível e chave fora das esperadas: a mensagem final usa a contagem empacotada e o aviso diz cada divergência', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const { fake, staging } = setUp({ chats: sidebarChats(['Ana', 'Bia']) });
+  // Como o ArchivePackager responde quando o ZIP nativo de Bia está ilegível (vai como o arquivo original)
+  // e o staging tem uma chave que não era esperada
+  harness.archive.restore();
+  const archive = stubArchiveDownloader({
+    staging,
+    outcome: {
+      completed: true,
+      size: 4096,
+      chatCount: 3,
+      check: { expected: 2, packed: 3, missingKeys: [], unreadable: ['000001'], unexpected: ['000007'] }
+    }
+  });
+  harness.archive = archive;
+  const orch = createOrchestrator();
+  fake.content.onExport = deliveringExport(orch);
+
+  await orch.start({ safeDelayMs: 0 });
+
+  const state = orch.getState();
+  assert.equal(state.state, WORKFLOW_STATES.COMPLETED);
+  assert.deepEqual(archive.calls[0].expectedKeys, ['000000', '000001']);
+  assert.equal(state.statusMessage, `Backup salvo: ${archive.calls[0].archiveFilename} (4.0 KB). 3 conversa(s) no ZIP, 0 falha(s).`);
+  assert.equal(
+    fake.progressUpdates().at(-1).warningMessage,
+    '⚠️ Conferência do ZIP: 1 com o ZIP do WhatsApp ilegível, gravado(s) como o arquivo original; 1 no ZIP sem ser esperada(s). ' +
+      'Veja a seção "Conferência do ZIP" no _relatorio.txt.'
   );
 });

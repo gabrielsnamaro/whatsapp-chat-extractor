@@ -130,6 +130,28 @@ export class ZipReader {
   }
 
   /**
+   * Dados de uma entrada, conferindo que o arquivo tem todos os bytes declarados. Recortar em silêncio
+   * devolveria uma entrada truncada, e uma entrada truncada copiada para outro ZIP deixa o ZIP inteiro
+   * ilegível.
+   * @private
+   * @param {Uint8Array} bytes
+   * @param {string} path
+   * @param {number} dataStart
+   * @param {number} compressedSize
+   * @returns {Uint8Array}
+   */
+  static _entryData(bytes, path, dataStart, compressedSize) {
+    const dataEnd = dataStart + compressedSize;
+    if (dataEnd > bytes.byteLength) {
+      throw new Error(
+        `A entrada "${path}" está truncada: declara ${compressedSize} byte(s) de dados a partir do byte ${dataStart}, ` +
+          `mas o ZIP tem ${bytes.byteLength} byte(s).`
+      );
+    }
+    return bytes.subarray(dataStart, dataEnd);
+  }
+
+  /**
    * Leitura padrão a partir do Diretório Central. É a fonte confiável de tamanhos
    * quando as entradas usam data descriptor (bit 3), comum em ZIPs gerados em streaming.
    * @private
@@ -162,7 +184,7 @@ export class ZipReader {
           crc32,
           compressedSize,
           uncompressedSize,
-          data: bytes.subarray(dataStart, dataStart + compressedSize)
+          data: this._entryData(bytes, path, dataStart, compressedSize)
         });
       }
 
@@ -188,17 +210,17 @@ export class ZipReader {
       const fnLen = view.getUint16(offset + 26, true);
       const extraLen = view.getUint16(offset + 28, true);
       const path = decoder.decode(bytes.subarray(offset + 30, offset + 30 + fnLen));
+      // Com o bit 3, o cabeçalho local traz tamanho 0 e o real só existe no diretório central, que não foi
+      // achado: aceitar a entrada gravaria uma conversa vazia como se estivesse íntegra
+      if (view.getUint16(offset + 6, true) & 0x0008) {
+        throw new Error(`A entrada "${path}" guarda o tamanho só no diretório central, que não existe neste ZIP: o arquivo está truncado.`);
+      }
       const dataStart = offset + 30 + fnLen + extraLen;
+      // Conferido também numa pasta: o tamanho dela decide onde começa a entrada seguinte
+      const data = this._entryData(bytes, path, dataStart, compressedSize);
 
       if (!path.endsWith('/')) {
-        entries.push({
-          path,
-          method,
-          crc32,
-          compressedSize,
-          uncompressedSize,
-          data: bytes.subarray(dataStart, dataStart + compressedSize)
-        });
+        entries.push({ path, method, crc32, compressedSize, uncompressedSize, data });
       }
       offset = dataStart + compressedSize;
     }

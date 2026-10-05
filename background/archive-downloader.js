@@ -15,10 +15,11 @@ export class ArchiveDownloader {
    * @param {Object} params
    * @param {string} params.archiveFilename
    * @param {string} params.report Relatório gravado na raiz do ZIP
+   * @param {string[]} params.expectedKeys Chaves do staging que devem estar no ZIP, para a conferência
    * @param {AbortSignal} [params.signal]
-   * @returns {Promise<{ completed: boolean, error?: string, size?: number, chatCount?: number }>}
+   * @returns {Promise<{ completed: boolean, error?: string, size?: number, chatCount?: number, check?: import('../shared/archive/archive-packager.js').ArchiveCheck }>}
    */
-  static async buildAndDownload({ archiveFilename, report, signal }) {
+  static async buildAndDownload({ archiveFilename, report, expectedKeys, signal }) {
     await this._ensureOffscreenDocument();
     let url = null;
 
@@ -26,7 +27,8 @@ export class ArchiveDownloader {
       const built = await chrome.runtime.sendMessage({
         target: OFFSCREEN_TARGET,
         action: OFFSCREEN_ACTIONS.BUILD_ARCHIVE,
-        report
+        report,
+        expectedKeys
       });
       if (!built?.success) {
         throw new Error(built?.error || 'O offscreen document não conseguiu montar o ZIP.');
@@ -38,12 +40,12 @@ export class ArchiveDownloader {
       try {
         downloadId = await chrome.downloads.download({ url, filename: archiveFilename, saveAs: true, conflictAction: 'uniquify' });
       } catch (err) {
-        return { completed: false, error: err.message, size: built.size, chatCount: built.chatCount };
+        return { completed: false, error: err.message, size: built.size, chatCount: built.chatCount, check: built.check };
       }
 
       // A URL de Blob só pode ser revogada depois que o download terminar
       const outcome = await this._waitForDownloadEnd(downloadId, signal);
-      return { ...outcome, size: built.size, chatCount: built.chatCount };
+      return { ...outcome, size: built.size, chatCount: built.chatCount, check: built.check };
     } finally {
       if (url) {
         await chrome.runtime.sendMessage({ target: OFFSCREEN_TARGET, action: OFFSCREEN_ACTIONS.REVOKE_ARCHIVE_URL, url }).catch(() => {});

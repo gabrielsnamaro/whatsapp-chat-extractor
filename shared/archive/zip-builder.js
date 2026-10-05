@@ -129,7 +129,8 @@ export class ZipWriter {
   }
 
   /**
-   * Adiciona uma entrada cujos dados já estão no formato final (ex: copiada de outro ZIP)
+   * Adiciona uma entrada cujos dados já estão no formato final (ex: copiada de outro ZIP).
+   * Lança erro, sem gravar nada, se o tamanho dos dados diferir de `compressedSize`.
    * @param {Object} entry
    * @param {string} entry.path
    * @param {number} entry.method 0 = store, 8 = deflate
@@ -139,6 +140,16 @@ export class ZipWriter {
    * @param {Uint8Array|Blob} entry.data
    */
   addRawEntry({ path, method, crc32, compressedSize, uncompressedSize, data }) {
+    // Os offsets das entradas seguintes e do diretório central são somados pelo tamanho declarado: dados
+    // de outro tamanho desalinham todos eles, e o ZIP inteiro fica ilegível
+    const dataSize = data instanceof Blob ? data.size : data?.byteLength;
+    if (dataSize !== compressedSize) {
+      const actual = Number.isInteger(dataSize) ? `${dataSize} byte(s)` : 'tamanho desconhecido';
+      throw new Error(
+        `A entrada "${path}" foi recusada: o tamanho comprimido declarado é ${compressedSize} byte(s), mas os dados têm ${actual}.`
+      );
+    }
+
     const pathBytes = this._encoder.encode(sanitizeZipPath(path));
     const localOffset = this._offset;
     const zip64 = this._forceZip64 || compressedSize >= UINT32_MAX || uncompressedSize >= UINT32_MAX;

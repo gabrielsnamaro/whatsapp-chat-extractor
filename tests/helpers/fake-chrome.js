@@ -353,20 +353,33 @@ export function stubStaging() {
 
 /**
  * Troca o ArchiveDownloader.buildAndDownload (offscreen document + chrome.downloads) por um
- * stub que guarda o que recebeu e o que havia no staging naquele momento.
+ * stub que guarda o que recebeu e o que havia no staging naquele momento. Por padrão o download é
+ * concluído, e a conferência compara as chaves esperadas com as do staging, como o ArchivePackager
+ * faria (sem ZIP nativo ilegível: o stub não lê os arquivos).
  * @param {Object} [options]
  * @param {{ files: Map<string, Object> }} [options.staging]
- * @param {Object} [options.outcome] Resposta fixa; por padrão, download concluído
- * @returns {{ calls: Array<{ archiveFilename: string, report: string, stagedKeys: string[] }>, restore: function(): void }}
+ * @param {Object} [options.outcome] Resposta fixa, no lugar da padrão
+ * @returns {{ calls: Array<{ archiveFilename: string, report: string, expectedKeys: string[], stagedKeys: string[] }>, restore: function(): void }}
  */
 export function stubArchiveDownloader({ staging, outcome } = {}) {
   const original = ArchiveDownloader.buildAndDownload;
   const calls = [];
 
-  ArchiveDownloader.buildAndDownload = async ({ archiveFilename, report }) => {
+  ArchiveDownloader.buildAndDownload = async ({ archiveFilename, report, expectedKeys }) => {
     const stagedKeys = staging ? [...staging.files.keys()].sort() : [];
-    calls.push({ archiveFilename, report, stagedKeys });
-    return outcome ?? { completed: true, size: 2048, chatCount: stagedKeys.length };
+    calls.push({ archiveFilename, report, expectedKeys: [...expectedKeys], stagedKeys });
+    if (outcome) return outcome;
+
+    const expected = new Set(expectedKeys);
+    const staged = new Set(stagedKeys);
+    const check = {
+      expected: expected.size,
+      packed: stagedKeys.length,
+      missingKeys: [...expected].filter((key) => !staged.has(key)),
+      unreadable: [],
+      unexpected: stagedKeys.filter((key) => !expected.has(key))
+    };
+    return { completed: true, size: 2048, chatCount: stagedKeys.length, check };
   };
 
   return {

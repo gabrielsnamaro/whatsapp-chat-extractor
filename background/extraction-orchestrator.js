@@ -3,6 +3,7 @@ import { ACTIONS } from '../shared/constants/actions.js';
 import { StagingRepository } from '../shared/storage/staging-repository.js';
 import { StorageClient } from '../shared/clients/storage-client.js';
 import { inspectChatExport } from '../shared/archive/chat-export-inspector.js';
+import { REPORT_FILENAME } from '../shared/archive/archive-packager.js';
 import { findWhatsAppTab } from '../shared/utils/whatsapp-tab.js';
 import { Logger } from '../shared/utils/logger.js';
 import { DownloadInterceptor } from './download-interceptor.js';
@@ -88,6 +89,30 @@ function gotFile(result) {
 
 function formatSize(bytes) {
   return bytes >= 1024 * 1024 ? `${(bytes / 1024 / 1024).toFixed(1)} MB` : `${(bytes / 1024).toFixed(1)} KB`;
+}
+
+/**
+ * Chave do arquivo de uma conversa no staging. Com 6 dígitos, a ordem das chaves (que é a das pastas no
+ * ZIP) é a da fila; a conferência do ZIP usa a mesma chave para saber quais conversas devem estar nele.
+ * @param {number} index Posição na fila
+ * @returns {string}
+ */
+function stagingKeyOf(index) {
+  return String(index).padStart(6, '0');
+}
+
+/**
+ * Aviso para o popup quando o ZIP montado não confere com as conversas esperadas nele
+ * @param {import('../shared/archive/archive-packager.js').ArchiveCheck} check
+ * @returns {string|null} null quando confere
+ */
+function describeCheckDivergence({ missingKeys, unreadable, unexpected }) {
+  const issues = [];
+  if (missingKeys.length) issues.push(`${missingKeys.length} conversa(s) esperada(s) não está(ão) no ZIP`);
+  if (unreadable.length) issues.push(`${unreadable.length} com o ZIP do WhatsApp ilegível, gravado(s) como o arquivo original`);
+  if (unexpected.length) issues.push(`${unexpected.length} no ZIP sem ser esperada(s)`);
+  if (!issues.length) return null;
+  return `Conferência do ZIP: ${issues.join('; ')}. Veja a seção "Conferência do ZIP" no ${REPORT_FILENAME}.`;
 }
 
 /**
@@ -915,7 +940,7 @@ export class ExtractionOrchestrator {
       const { inspection, inspectionError } = await this._inspectExport(chat, captured.blob);
 
       await StagingRepository.saveChatFile({
-        chatId: String(index).padStart(6, '0'),
+        chatId: stagingKeyOf(index),
         chatTitle: chat.title,
         filename: captured.filename,
         blob: captured.blob
@@ -1142,7 +1167,9 @@ export class ExtractionOrchestrator {
     }
 
     const archiveFilename = `whatsapp_backup_${new Date().toISOString().slice(0, 10)}.zip`;
-    const outcome = await ArchiveDownloader.buildAndDownload({ archiveFilename, report: this._buildReport(), signal });
+    // Toda conversa com arquivo gravado no staging deve estar no ZIP, inclusive as vazias e as atrasadas
+    const expectedKeys = this.run.results.flatMap((result, index) => (result?.staged ? [stagingKeyOf(index)] : []));
+    const outcome = await ArchiveDownloader.buildAndDownload({ archiveFilename, report: this._buildReport(), expectedKeys, signal });
 
     if (!outcome.completed) {
       // Mantém o staging: o usuário pode gerar o download de novo sem refazer as exportações
@@ -1157,12 +1184,19 @@ export class ExtractionOrchestrator {
     await StagingRepository.clear().catch((err) => log.warn('Falha ao limpar o staging após o download:', err));
     this._setPhase(WORKFLOW_STATES.COMPLETED);
     this.currentChatTitle = 'Concluído';
-    const inZip = `${summary.saved} conversa(s) no ZIP` + (summary.empty ? ` (${summary.empty} vazia(s))` : '');
+    // Conta o que foi empacotado, não o que foi salvo: um arquivo que sumiu do staging não está no ZIP
+    const { check } = outcome;
+    const inZip = `${check.packed} conversa(s) no ZIP` + (summary.empty ? ` (${summary.empty} vazia(s))` : '');
     const counts = [inZip, `${summary.failed} falha(s)`];
     if (summary.notExportable) counts.push(`${summary.notExportable} não exportável(is)`);
     if (summary.savedToDisk) counts.push(`${summary.savedToDisk} baixada(s) direto na pasta Downloads`);
     this.statusMessage = `Backup salvo: ${archiveFilename} (${formatSize(outcome.size)}). ${counts.join(', ')}.`;
     log.info('Fluxo de extração em lote concluído com sucesso!');
-    this._notifyProgress({ infoMessage: `🎉 ${this.statusMessage}` });
+    const divergence = describeCheckDivergence(check);
+    if (divergence) log.warn(divergence);
+    this._notifyProgress({
+      infoMessage: `🎉 ${this.statusMessage}`,
+      ...(divergence ? { warningMessage: `⚠️ ${divergence}` } : {})
+    });
   }
 }

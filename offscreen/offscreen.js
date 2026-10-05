@@ -17,9 +17,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     try {
       switch (message.action) {
         case OFFSCREEN_ACTIONS.BUILD_ARCHIVE: {
-          const { blob, chatCount } = await ArchivePackager.build({ report: message.report });
+          const { blob, chatCount, check } = await ArchivePackager.build({
+            report: message.report,
+            expectedKeys: message.expectedKeys
+          });
           const url = URL.createObjectURL(blob);
-          sendResponse({ success: true, url, size: blob.size, chatCount });
+          sendResponse({ success: true, url, size: blob.size, chatCount, check });
           return;
         }
         case OFFSCREEN_ACTIONS.REVOKE_ARCHIVE_URL: {
