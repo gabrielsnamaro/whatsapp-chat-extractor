@@ -359,15 +359,15 @@ export function stubStaging() {
  * @param {Object} [options]
  * @param {{ files: Map<string, Object> }} [options.staging]
  * @param {Object} [options.outcome] Resposta fixa, no lugar da padrão
- * @returns {{ calls: Array<{ archiveFilename: string, report: string, expectedKeys: string[], stagedKeys: string[] }>, restore: function(): void }}
+ * @returns {{ calls: Array<{ archiveFilename: string, report: string, executionLog: string, expectedKeys: string[], stagedKeys: string[] }>, restore: function(): void }}
  */
 export function stubArchiveDownloader({ staging, outcome } = {}) {
   const original = ArchiveDownloader.buildAndDownload;
   const calls = [];
 
-  ArchiveDownloader.buildAndDownload = async ({ archiveFilename, report, expectedKeys }) => {
+  ArchiveDownloader.buildAndDownload = async ({ archiveFilename, report, executionLog, expectedKeys }) => {
     const stagedKeys = staging ? [...staging.files.keys()].sort() : [];
-    calls.push({ archiveFilename, report, expectedKeys: [...expectedKeys], stagedKeys });
+    calls.push({ archiveFilename, report, executionLog, expectedKeys: [...expectedKeys], stagedKeys });
     if (outcome) return outcome;
 
     const expected = new Set(expectedKeys);

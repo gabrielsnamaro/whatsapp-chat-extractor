@@ -19,7 +19,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         case OFFSCREEN_ACTIONS.BUILD_ARCHIVE: {
           const { blob, chatCount, check } = await ArchivePackager.build({
             report: message.report,
-            expectedKeys: message.expectedKeys
+            expectedKeys: message.expectedKeys,
+            executionLog: message.executionLog
           });
           const url = URL.createObjectURL(blob);
           sendResponse({ success: true, url, size: blob.size, chatCount, check });

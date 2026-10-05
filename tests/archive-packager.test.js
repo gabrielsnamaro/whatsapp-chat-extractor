@@ -127,6 +127,25 @@ test('ZIP nativo ilegível (entrada truncada) vai para a pasta da conversa como 
   ].join('\n'));
 });
 
+test('_execucao.log vai para a raiz do ZIP, e uma conversa chamada _execucao.log, em qualquer caixa, vai para outra pasta', async () => {
+  staging = stubStaging();
+  await stage('000000', '_execucao.log', '[01/02/2026, 09:00:00] Ana: oi\n', 'conversa.txt');
+  await stage('000001', '_EXECUCAO.LOG', '[01/02/2026, 10:00:00] Bia: oi\n', 'conversa.txt');
+  const executionLog = 'Log da execução - WhatsApp Web Extractor\n\n09:00:00 nº 1 "_execucao.log" | tentativa 1 | 4.2 s | abertura: busca | OK\n';
+
+  const { blob, chatCount, check } = await ArchivePackager.build({ report: REPORT, expectedKeys: ['000000', '000001'], executionLog });
+
+  assert.equal(chatCount, 2);
+  assert.deepEqual(check, { expected: 2, packed: 2, missingKeys: [], unreadable: [], unexpected: [] });
+  const files = await readZip(blob);
+  assert.deepEqual(
+    [...files.keys()],
+    ['_execucao.log_1/conversa.txt', '_EXECUCAO.LOG_2/conversa.txt', REPORT_FILENAME, '_execucao.log']
+  );
+  assert.equal(decoder.decode(files.get('_execucao.log')), executionLog);
+  assert.equal(decoder.decode(files.get('_execucao.log_1/conversa.txt')), '[01/02/2026, 09:00:00] Ana: oi\n');
+});
+
 test('sem a lista das conversas esperadas, o empacotamento falha em vez de montar o ZIP sem conferência', async () => {
   staging = stubStaging();
   await stage('000000', 'Ana', '[01/02/2026, 09:00:00] Ana: oi\n', 'conversa.txt');

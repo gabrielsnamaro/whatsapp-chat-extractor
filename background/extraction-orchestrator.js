@@ -38,6 +38,25 @@ const RESULT_STATUS = Object.freeze({
   FAILED: 'failed'
 });
 
+const RESULT_LABELS = Object.freeze({
+  [RESULT_STATUS.SAVED]: 'OK',
+  [RESULT_STATUS.SAVED_TO_DISK]: 'NA PASTA DOWNLOADS',
+  [RESULT_STATUS.NOT_EXPORTABLE]: 'NÃO EXPORTÁVEL',
+  [RESULT_STATUS.FAILED]: 'FALHA'
+});
+
+// Como a aba abriu a conversa, pelo `via` que o content devolve (ChatNavigator.openChat em
+// content/dom/chat-navigator.js; content script clássico não é importável aqui)
+const VIA_LABELS = Object.freeze({
+  'already-open': 'já estava aberta',
+  visible: 'lista visível',
+  search: 'busca',
+  scroll: 'rolagem da lista'
+});
+
+// Horário no log de uma tentativa registrada por uma versão anterior da extensão, que não o guardava
+const UNTIMED_CLOCK = '--:--:--';
+
 // Código lançado pelo content (DomUtils.ERROR_CODES em content/dom/dom-utils.js; content script
 // clássico não é importável aqui) quando o menu não oferece "Exportar conversa". O próprio WhatsApp
 // não exporta essa conversa, então ela é contada à parte e não como falha.
@@ -91,6 +110,21 @@ function formatSize(bytes) {
   return bytes >= 1024 * 1024 ? `${(bytes / 1024 / 1024).toFixed(1)} MB` : `${(bytes / 1024).toFixed(1)} KB`;
 }
 
+/** Milissegundos em segundos, com uma casa decimal só quando ela não é zero (ex: "2 s", "4.2 s") */
+function formatSeconds(ms) {
+  return `${Number((ms / 1000).toFixed(1))} s`;
+}
+
+/**
+ * Modo da execução, no relatório e no log. A varredura (chat-list-scanner.js) percorre só a lista
+ * principal e não abre "Arquivadas"
+ * @param {{ downloadAll: boolean, maxChats: number|null }} options
+ * @returns {string}
+ */
+function describeMode({ downloadAll, maxChats }) {
+  return downloadAll ? 'lista principal (arquivadas não incluídas)' : `limite de ${maxChats} conversa(s)`;
+}
+
 /**
  * Chave do arquivo de uma conversa no staging. Com 6 dígitos, a ordem das chaves (que é a das pastas no
  * ZIP) é a da fila; a conferência do ZIP usa a mesma chave para saber quais conversas devem estar nele.
@@ -123,6 +157,59 @@ function describeCheckDivergence({ missingKeys, unreadable, unexpected }) {
  */
 function errorCodeOf(source) {
   return typeof source?.code === 'string' ? source.code : null;
+}
+
+/**
+ * @typedef {Object} AttemptRecord Uma tentativa de exportar a conversa, no histórico do resultado dela
+ * @property {number} attempt 1 na fila, 2 na repescagem
+ * @property {string|null} startedAt Início, em ISO; null numa tentativa registrada por uma versão anterior da extensão
+ * @property {number|null} durationMs Duração da tentativa inteira, com a espera do arquivo e a quarentena; null como o início
+ * @property {string} status Resultado desta tentativa (RESULT_STATUS)
+ * @property {string|null} code Código do erro
+ * @property {string|null} via Como a aba abriu a conversa; null quando ela não confirmou a exportação
+ * @property {string|null} reason Texto do erro, sem o título da conversa; null quando a tentativa recebeu o arquivo
+ * @property {boolean} quarantined O prazo de espera do arquivo esgotou e a tentativa passou pela quarentena
+ * @property {boolean} late O arquivo chegou na quarentena
+ */
+
+/**
+ * Histórico de tentativas de uma conversa. Uma execução gravada por uma versão anterior da extensão só tem
+ * o resultado final, e o histórico é reconstituído dele, sem horário nem duração.
+ * @param {Object} result
+ * @returns {AttemptRecord[]}
+ */
+function historyOf(result) {
+  if (Array.isArray(result.history)) return result.history;
+
+  const prefix = `"${result.title}": `;
+  const message = result.message ?? '';
+  const final = {
+    attempt: result.attempts ?? 1,
+    startedAt: null,
+    durationMs: null,
+    status: result.status,
+    code: result.code ?? null,
+    via: result.via ?? null,
+    // A mensagem de uma falha começa pelo título, que a linha do log já mostra
+    reason: gotFile(result) ? null : (message.startsWith(prefix) ? message.slice(prefix.length) : message) || null,
+    // Só um arquivo atrasado prova a quarentena; sem ele, não há como saber
+    quarantined: Boolean(result.late),
+    late: Boolean(result.late)
+  };
+  if (final.attempt < 2) return [final];
+  // Da 1ª tentativa de uma conversa repescada, o resultado só guardava o código
+  const first = {
+    attempt: 1,
+    startedAt: null,
+    durationMs: null,
+    status: RESULT_STATUS.FAILED,
+    code: result.firstAttemptCode ?? null,
+    via: null,
+    reason: null,
+    quarantined: false,
+    late: false
+  };
+  return [first, final];
 }
 
 /**
@@ -795,11 +882,18 @@ export class ExtractionOrchestrator {
       this._notifyProgress();
       log.info(`[repescagem ${position}] Exportando de novo a conversa "${chat.title}" (${index + 1}/${queue.length})...`);
 
-      const firstAttemptCode = this.run.results[index]?.code ?? null;
+      const previous = this.run.results[index];
+      const firstAttemptCode = previous?.code ?? null;
       const result = await this._exportChat(chat, index, signal, { attempt: 2 });
       // Fica o resultado da repescagem, sucesso ou falha: a 1ª tentativa falhou sem deixar arquivo no
-      // staging. O código dela fica para o relatório reconstituir a ordem real das tentativas
-      this.run.results[index] = { ...result, attempts: 2, firstAttemptCode };
+      // staging. O código dela fica para o relatório reconstituir a ordem real das tentativas, e o
+      // histórico guarda as duas para o log da execução
+      this.run.results[index] = {
+        ...result,
+        attempts: 2,
+        firstAttemptCode,
+        history: [...(previous ? historyOf(previous) : []), ...result.history]
+      };
       retry.cursor++;
       this._notifyResult(`[Repescagem ${position}]`, this.run.results[index]);
 
@@ -868,23 +962,40 @@ export class ExtractionOrchestrator {
    * a exportação); `staged` diz se o arquivo foi
    * gravado no staging; `late` diz se ele só chegou na quarentena. Uma conversa salva traz também o
    * resultado da inspeção do texto (`empty`, contagens e datas, null se o conteúdo não foi inspecionado,
-   * com o motivo em `inspectionError`).
+   * com o motivo em `inspectionError`). `history` traz só esta tentativa, com o início, a duração e se ela
+   * passou pela quarentena; a repescagem a junta à da fila.
    * @private
    * @param {{ title: string, duplicateTitle: boolean }} chat
    * @param {number} index Posição na fila
    * @param {AbortSignal} signal
    * @param {Object} [options]
    * @param {number} [options.attempt=1] 1 na fila, 2 na repescagem
-   * @returns {Promise<{ title: string, status: string, code: string|null, via: string|null, warnings: string[], staged: boolean, late: boolean, message: string, size?: number }>}
+   * @returns {Promise<{ title: string, status: string, code: string|null, via: string|null, warnings: string[], staged: boolean, late: boolean, message: string, size?: number, history: AttemptRecord[] }>}
    */
   async _exportChat(chat, index, signal, { attempt = 1 } = {}) {
     const { runId, tabId } = this.run;
     // Uma captura por tentativa: um bloco atrasado da transferência da 1ª é recusado na repescagem
     const captureId = attempt === 1 ? `${runId}-${index}` : `${runId}-${index}-r${attempt - 1}`;
+    const startedAt = new Date();
     let via = null;
     let warnings = [];
     let late = false;
-    const failed = (message, code) => ({
+    let quarantined = false;
+    const withHistory = (result, reason = null) => ({
+      ...result,
+      history: [{
+        attempt,
+        startedAt: startedAt.toISOString(),
+        durationMs: Date.now() - startedAt.getTime(),
+        status: result.status,
+        code: result.code,
+        via: result.via,
+        reason,
+        quarantined,
+        late: result.late
+      }]
+    });
+    const failed = (message, code) => withHistory({
       title: chat.title,
       status: code === NOT_EXPORTABLE_CODE ? RESULT_STATUS.NOT_EXPORTABLE : RESULT_STATUS.FAILED,
       code,
@@ -893,7 +1004,7 @@ export class ExtractionOrchestrator {
       staged: false,
       late: false,
       message: `"${chat.title}": ${message}`
-    });
+    }, message);
 
     // As duas fontes só são armadas quando a aba avisa que vai clicar em "Exportar" (armCapture)
     this.captures.expect(captureId);
@@ -916,6 +1027,7 @@ export class ExtractionOrchestrator {
         captured = await this.captures.waitFor(captureId, { timeoutMs: this.timings.captureTimeoutMs, signal });
       } catch (err) {
         if (errorCodeOf(err) !== CAPTURE_ERROR_CODES.FILE_NOT_DELIVERED) throw err;
+        quarantined = true;
         // O registry apagou a captura ao esgotar o prazo. Registrá-la de novo sem nenhum await no meio
         // não deixa brecha para o arquivo atrasado chegar e ser recusado como captura não esperada
         this.captures.expect(captureId);
@@ -925,7 +1037,7 @@ export class ExtractionOrchestrator {
       const lateNote = late ? LATE_FILE_NOTE : '';
 
       if (captured.savedToDisk) {
-        return {
+        return withHistory({
           title: chat.title,
           status: RESULT_STATUS.SAVED_TO_DISK,
           code: null,
@@ -934,7 +1046,7 @@ export class ExtractionOrchestrator {
           staged: false,
           late,
           message: `"${chat.title}" foi baixado direto para a pasta Downloads (${captured.filename}) e não está no ZIP.${lateNote}`
-        };
+        });
       }
 
       const { inspection, inspectionError } = await this._inspectExport(chat, captured.blob);
@@ -953,7 +1065,7 @@ export class ExtractionOrchestrator {
         ? ` Conteúdo não inspecionado: ${inspectionError}`
         : formatUnrecognized ? ' Formato do texto não reconhecido: mensagens e anexos não contados.' : '';
       const homonymNote = chat.duplicateTitle ? ' Atenção: existe outra conversa com o mesmo nome, que não foi exportada.' : '';
-      return {
+      return withHistory({
         title: chat.title,
         status: RESULT_STATUS.SAVED,
         code: null,
@@ -970,7 +1082,7 @@ export class ExtractionOrchestrator {
         firstTimestamp: inspection?.firstTimestamp ?? null,
         lastTimestamp: inspection?.lastTimestamp ?? null,
         message: `"${chat.title}" salvo (${details.join(', ')}).${inspectionNote}${homonymNote}${lateNote}`
-      };
+      });
     } catch (err) {
       if (err instanceof RunCancelledError || signal.aborted) throw new RunCancelledError();
       log.warn(`Falha na conversa "${chat.title}":`, err);
@@ -1025,12 +1137,6 @@ export class ExtractionOrchestrator {
   _buildReport() {
     const { queue, results, options, retry, scan, startedAt } = this.run;
     const summary = this.getState().summary;
-    const labels = {
-      [RESULT_STATUS.SAVED]: 'OK',
-      [RESULT_STATUS.SAVED_TO_DISK]: 'NA PASTA DOWNLOADS',
-      [RESULT_STATUS.NOT_EXPORTABLE]: 'NÃO EXPORTÁVEL',
-      [RESULT_STATUS.FAILED]: 'FALHA'
-    };
     const omittedMedia = results.reduce((total, result) => total + (result?.omittedMediaCount ?? 0), 0);
     // Conversa salva sem contagem (não inspecionada ou formato não reconhecido) deixa o total abaixo do real
     const uncounted = results.filter((result) => result?.staged && !result.empty && result.omittedMediaCount == null).length;
@@ -1044,8 +1150,7 @@ export class ExtractionOrchestrator {
       'Relatório de extração - WhatsApp Web Extractor',
       `Início: ${new Date(startedAt).toLocaleString('pt-BR')}`,
       `Geração do ZIP: ${new Date().toLocaleString('pt-BR')}`,
-      // A varredura (chat-list-scanner.js) percorre só a lista principal e não abre "Arquivadas"
-      `Modo: ${options.downloadAll ? 'lista principal (arquivadas não incluídas)' : `limite de ${options.maxChats} conversa(s)`}`
+      `Modo: ${describeMode(options)}`
     ];
     // Uma execução gravada por uma versão anterior da extensão não tem as estatísticas da varredura
     if (scan) lines.push(this._describeScan(scan));
@@ -1080,7 +1185,7 @@ export class ExtractionOrchestrator {
       const attemptsNote = result.attempts > 1 ? ` Tentativas: ${result.attempts}.` : '';
       const rangeNote = hasUnconfirmedRange(result) ? DATE_RANGE_UNCONFIRMED_NOTE : '';
       lines.push(
-        `[${result.empty ? EMPTY_EXPORT_LABEL : labels[result.status]}] ${i + 1}. ${result.message}${rangeNote}${attemptsNote}${checkNotes.get(i) ?? ''}`
+        `[${result.empty ? EMPTY_EXPORT_LABEL : RESULT_LABELS[result.status]}] ${i + 1}. ${result.message}${rangeNote}${attemptsNote}${checkNotes.get(i) ?? ''}`
       );
     });
 
@@ -1099,8 +1204,8 @@ export class ExtractionOrchestrator {
   }
 
   /**
-   * Linha da varredura no relatório: quantas conversas ela achou, por que parou e a data/hora exibida na
-   * última conversa da lista, que mostra se ela chegou mesmo ao fim
+   * Linha da varredura no relatório e no log da execução: quantas conversas ela achou, por que parou e a
+   * data/hora exibida na última conversa da lista, que mostra se ela chegou mesmo ao fim
    * @private
    * @param {{ found: number, durationMs: number, stopReason: string, lastChatTimestamp: string|null }} scan
    * @returns {string}
@@ -1152,6 +1257,88 @@ export class ExtractionOrchestrator {
   }
 
   /**
+   * Log da execução gravado na raiz do ZIP (_execucao.log), para diagnosticar falhas sem o DevTools
+   * aberto. É montado só com o que fica persistido no run, então sobrevive a um reinício do service worker
+   * (o console do background, não): cabeçalho, linha da varredura e uma linha por evento, em ordem
+   * cronológica — cada tentativa de cada conversa, o início da repescagem e os arquivos recebidos fora de hora.
+   * @private
+   * @returns {string}
+   */
+  _buildExecutionLog() {
+    const { runId, queue, results, options, retry, scan, startedAt } = this.run;
+
+    const attemptEvents = (belongs) => queue.flatMap((chat, index) => {
+      const result = results[index];
+      if (!result) return [];
+      const history = historyOf(result);
+      return history.filter(belongs).map((entry) => ({
+        at: entry.startedAt,
+        text: this._describeAttempt(index, chat.title, entry, entry === history.at(-1) && result.empty === true)
+      }));
+    });
+    // Montados na ordem em que acontecem (fila, início da repescagem, repescagem), para dois eventos no
+    // mesmo milissegundo não saírem invertidos da ordenação, que é estável
+    const events = [
+      ...attemptEvents((entry) => entry.attempt === 1),
+      ...(retry?.indices.length
+        ? [{ at: retry.startsAt, text: `Repescagem: rodada prevista para este horário (fim da espera; uma pausa a adia), com ${retry.indices.length} conversa(s) que falharam na fila.` }]
+        : []),
+      ...attemptEvents((entry) => entry.attempt !== 1),
+      // Uma execução gravada por uma versão anterior da extensão não tem a lista
+      ...(this.run.unexpectedFiles ?? []).map((entry) => ({
+        at: entry.at,
+        text: `Arquivo recebido fora de hora (${this._describeUnexpectedFile(entry)}): não foi salvo no ZIP e seguiu para a pasta Downloads.`
+      }))
+    ].map((event) => ({ ...event, at: Date.parse(event.at) }));
+    // Sem horário, só tentativas registradas antes da atualização da extensão: vêm antes de todas as outras
+    const untimed = events.filter((event) => !Number.isFinite(event.at));
+    const timed = events.filter((event) => Number.isFinite(event.at)).sort((a, b) => a.at - b.at);
+
+    const lines = [
+      'Log da execução - WhatsApp Web Extractor',
+      `Execução: ${runId} | início: ${new Date(startedAt).toLocaleString('pt-BR')} | versão da extensão: ${chrome.runtime.getManifest().version}`,
+      `Modo: ${describeMode(options)} | intervalo entre conversas: ${formatSeconds(options.safeDelayMs)}, com variação de até +50%`,
+      scan ? this._describeScan(scan) : 'Varredura: sem estatísticas registradas nesta execução.'
+    ];
+    if (untimed.length) {
+      lines.push(`As linhas com ${UNTIMED_CLOCK} foram registradas por uma versão anterior da extensão, sem horário nem duração, e vêm antes das demais.`);
+    }
+    lines.push(
+      '',
+      ...untimed.map(({ text }) => `${UNTIMED_CLOCK} ${text}`),
+      ...timed.map(({ at, text }) => `${new Date(at).toLocaleTimeString('pt-BR')} ${text}`)
+    );
+    return lines.join('\n') + '\n';
+  }
+
+  /**
+   * Linha de uma tentativa no log da execução, sem o horário
+   * @private
+   * @param {number} index Posição na fila
+   * @param {string} title
+   * @param {AttemptRecord} entry
+   * @param {boolean} emptyExport A tentativa salvou o arquivo e o texto da conversa veio em branco
+   * @returns {string}
+   */
+  _describeAttempt(index, title, entry, emptyExport) {
+    const label = emptyExport ? EMPTY_EXPORT_LABEL : (RESULT_LABELS[entry.status] ?? entry.status);
+    // Uma falha sem código conhecido entra na repescagem; o log diz que ela veio assim
+    const code = entry.code ?? (gotFile(entry) ? null : 'sem código');
+    const parts = [
+      `nº ${index + 1} "${title}"`,
+      `tentativa ${entry.attempt}`,
+      Number.isFinite(entry.durationMs) ? formatSeconds(entry.durationMs) : 'duração não registrada',
+      `abertura: ${entry.via ? (VIA_LABELS[entry.via] ?? entry.via) : 'não informada'}`,
+      code ? `${label} (${code})` : label
+    ];
+    if (entry.quarantined) {
+      parts.push(`quarentena: ${entry.late ? 'o arquivo chegou nela, atrasado' : 'o arquivo não foi recebido nela'}`);
+    }
+    if (entry.reason) parts.push(`motivo: ${entry.reason}`);
+    return parts.join(' | ');
+  }
+
+  /**
    * FASE DE EMPACOTAMENTO (PACKAGING) e download único do ZIP master
    * @private
    * @param {AbortSignal} signal
@@ -1169,7 +1356,13 @@ export class ExtractionOrchestrator {
     const archiveFilename = `whatsapp_backup_${new Date().toISOString().slice(0, 10)}.zip`;
     // Toda conversa com arquivo gravado no staging deve estar no ZIP, inclusive as vazias e as atrasadas
     const expectedKeys = this.run.results.flatMap((result, index) => (result?.staged ? [stagingKeyOf(index)] : []));
-    const outcome = await ArchiveDownloader.buildAndDownload({ archiveFilename, report: this._buildReport(), expectedKeys, signal });
+    const outcome = await ArchiveDownloader.buildAndDownload({
+      archiveFilename,
+      report: this._buildReport(),
+      executionLog: this._buildExecutionLog(),
+      expectedKeys,
+      signal
+    });
 
     if (!outcome.completed) {
       // Mantém o staging: o usuário pode gerar o download de novo sem refazer as exportações

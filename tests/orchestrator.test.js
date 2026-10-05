@@ -125,6 +125,28 @@ function isRetryAttempt(message) {
   return /-r\d+$/.test(message.captureId);
 }
 
+const ISO_DATE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+
+/** Tentativa como fica no histórico da conversa, sem o início e a duração, que mudam a cada execução */
+function attemptRecord({ attempt = 1, status, code = null, via = null, reason = null, quarantined = false, late = false }) {
+  return { attempt, status, code, via, reason, quarantined, late };
+}
+
+/**
+ * Resultado com o histórico sem o início e a duração de cada tentativa, para comparar com attemptRecord.
+ * Antes de tirá-los, confere que o início é uma data ISO e a duração um número inteiro de ms ≥ 0.
+ */
+function withoutAttemptTimes(result) {
+  return {
+    ...result,
+    history: result.history.map(({ startedAt, durationMs, ...entry }) => {
+      assert.match(startedAt, ISO_DATE);
+      assert.ok(Number.isInteger(durationMs) && durationMs >= 0, `duração inválida: ${durationMs}`);
+      return entry;
+    })
+  };
+}
+
 let harness = null;
 const originalConsole = { log: console.log, warn: console.warn, debug: console.debug };
 
@@ -255,8 +277,9 @@ test('três conversas salvas: staging por posição na fila, ZIP e mensagem fina
   // Sem erro não há código; o `via` vem da resposta da aba
   assert.deepEqual(persisted.results.map((r) => [r.code, r.via]), [[null, 'visible'], [null, 'visible'], [null, 'visible']]);
   // Os bytes arbitrários foram inspecionados como texto puro: não estão em branco, mas o formato não
-  // foi reconhecido, então não há contagens nem datas (e nada é somado aos anexos omitidos)
-  assert.deepEqual(persisted.results[0], {
+  // foi reconhecido, então não há contagens nem datas (e nada é somado aos anexos omitidos). O
+  // histórico tem a única tentativa, persistida com o resultado
+  assert.deepEqual(withoutAttemptTimes(persisted.results[0]), {
     title: 'Ana',
     status: 'saved',
     code: null,
@@ -273,7 +296,8 @@ test('três conversas salvas: staging por posição na fila, ZIP e mensagem fina
     firstTimestamp: '01/01/2026, 09:00:00',
     lastTimestamp: '01/01/2026, 09:00:00',
     message: '"Ana" salvo (1.5 KB).',
-    attempts: 1
+    attempts: 1,
+    history: [attemptRecord({ status: 'saved', via: 'visible' })]
   });
   assert.deepEqual(persisted.results.map((r) => r.staged), [true, true, true]);
   // Sem falha não há repescagem: nenhuma conversa é pedida de novo e a lista lateral não é mexida
@@ -295,7 +319,7 @@ test('falha no meio da fila não interrompe as conversas seguintes', { timeout: 
   assert.deepEqual(fake.content.exportRequests.map((m) => m.chat.title), ['Ana', 'Bia', 'Caio', 'Bia']);
   assert.deepEqual(orch.run.results.map((r) => r.status), ['saved', 'failed', 'saved']);
   // Falha sem código conhecido: `code` null; a aba não confirmou a exportação, então `via` também
-  assert.deepEqual(orch.run.results[1], {
+  assert.deepEqual(withoutAttemptTimes(orch.run.results[1]), {
     title: 'Bia',
     status: 'failed',
     code: null,
@@ -305,7 +329,11 @@ test('falha no meio da fila não interrompe as conversas seguintes', { timeout: 
     warnings: [],
     message: '"Bia": Conversa não encontrada na lista.',
     attempts: 2,
-    firstAttemptCode: null
+    firstAttemptCode: null,
+    history: [
+      attemptRecord({ attempt: 1, status: 'failed', reason: 'Conversa não encontrada na lista.' }),
+      attemptRecord({ attempt: 2, status: 'failed', reason: 'Conversa não encontrada na lista.' })
+    ]
   });
 
   // A conversa seguinte mantém a chave da sua posição na fila
@@ -428,7 +456,7 @@ test('conversa sem "Exportar conversa" no menu é não exportável, contada à p
   assert.equal(state.state, WORKFLOW_STATES.COMPLETED);
   assert.deepEqual(state.summary, { saved: 2, empty: 0, savedToDisk: 0, notExportable: 1, failed: 0 });
   assert.deepEqual(fake.content.exportRequests.map((m) => m.chat.title), ['Ana', 'Bia', 'Caio']);
-  assert.deepEqual(orch.run.results[1], {
+  assert.deepEqual(withoutAttemptTimes(orch.run.results[1]), {
     title: 'Bia',
     status: 'not_exportable',
     code: 'EXPORT_OPTION_UNAVAILABLE',
@@ -437,7 +465,8 @@ test('conversa sem "Exportar conversa" no menu é não exportável, contada à p
     late: false,
     warnings: [],
     message: `"Bia": ${EXPORT_UNAVAILABLE_MESSAGE}`,
-    attempts: 1
+    attempts: 1,
+    history: [attemptRecord({ status: 'not_exportable', code: 'EXPORT_OPTION_UNAVAILABLE', reason: EXPORT_UNAVAILABLE_MESSAGE })]
   });
 
   const lines = archive.calls[0].report.split('\n');
@@ -486,9 +515,12 @@ test('arquivo não entregue no prazo nem na quarentena: falha FILE_NOT_DELIVERED
   assert.deepEqual(state.summary, { saved: 3, empty: 0, savedToDisk: 0, notExportable: 0, failed: 1 });
   assert.deepEqual(fake.content.exportRequests.map((m) => m.chat.title), ['Ana', 'Bia', 'Caio', 'Davi', 'Bia']);
 
-  // A mensagem é a do prazo original, não a da quarentena
+  // A mensagem é a do prazo original, não a da quarentena; as duas tentativas passaram por ela sem o arquivo
   const notDelivered = 'O WhatsApp Web não entregou o arquivo exportado em 0.05 s.';
-  assert.deepEqual(orch.run.results[1], {
+  const notDeliveredAttempt = (attempt) => attemptRecord({
+    attempt, status: 'failed', code: 'FILE_NOT_DELIVERED', via: 'search', reason: notDelivered, quarantined: true
+  });
+  assert.deepEqual(withoutAttemptTimes(orch.run.results[1]), {
     title: 'Bia',
     status: 'failed',
     code: 'FILE_NOT_DELIVERED',
@@ -498,8 +530,20 @@ test('arquivo não entregue no prazo nem na quarentena: falha FILE_NOT_DELIVERED
     warnings: [],
     message: `"Bia": ${notDelivered}`,
     attempts: 2,
-    firstAttemptCode: 'FILE_NOT_DELIVERED'
+    firstAttemptCode: 'FILE_NOT_DELIVERED',
+    history: [notDeliveredAttempt(1), notDeliveredAttempt(2)]
   });
+  // A duração de cada tentativa inclui o prazo e a quarentena
+  for (const { durationMs } of orch.run.results[1].history) {
+    assert.ok(durationMs >= captureTimeoutMs + quarantineMs - 10, `tentativa de ${durationMs} ms, menor que o prazo mais a quarentena`);
+  }
+
+  // No log, cada tentativa de Bia diz que passou pela quarentena sem receber o arquivo
+  const bia = archive.calls[0].executionLog.split('\n').filter((line) => line.includes(' nº 2 "Bia" '));
+  assert.deepEqual(bia.map((line) => line.replace(/^\d{2}:\d{2}:\d{2} /, '').replace(/ \| \d+(?:\.\d)? s \| /, ' | <duração> | ')), [1, 2].map((attempt) => (
+    `nº 2 "Bia" | tentativa ${attempt} | <duração> | abertura: busca | FALHA (FILE_NOT_DELIVERED) | ` +
+      `quarentena: o arquivo não foi recebido nela | motivo: ${notDelivered}`
+  )));
 
   // Um arquivo atrasado de Bia que chegasse depois do clique em "Exportar" de Caio seria tomado como de
   // Caio: o relatório marca só a conversa seguinte a um FILE_NOT_DELIVERED e diz qual tentativa foi
@@ -563,6 +607,16 @@ test('arquivo atrasado chega na quarentena, pela página ou pelo chrome.download
     { status: 'saved', code: null, staged: true, late: false }
   ]);
   assert.equal(orch.run.results[1].message, `"Bia" salvo (2.0 KB).${LATE_NOTE}`);
+  // O histórico de cada tentativa diz se ela passou pela quarentena e se o arquivo chegou nela
+  assert.deepEqual(
+    orch.run.results.map((r) => r.history.map(({ attempt, quarantined, late }) => ({ attempt, quarantined, late }))),
+    [
+      [{ attempt: 1, quarantined: false, late: false }],
+      [{ attempt: 1, quarantined: true, late: true }],
+      [{ attempt: 1, quarantined: true, late: true }],
+      [{ attempt: 1, quarantined: false, late: false }]
+    ]
+  );
   // Chegou na quarentena: a conversa foi salva e não é repescada
   assert.deepEqual(orch.run.results.map((r) => r.attempts), [1, 1, 1, 1]);
   assert.equal(fake.content.exportRequests.length, 4);
@@ -630,8 +684,10 @@ test('outra falha na quarentena prevalece sobre o prazo esgotado: leitura falha 
   assert.ok(elapsed < 1500, `a execução levou ${elapsed.toFixed(0)} ms: a quarentena não terminou com a falha`);
   assert.deepEqual(fake.content.exportRequests.map((m) => m.chat.title), ['Ana', 'Bia', 'Caio', 'Davi', 'Bia', 'Caio']);
 
-  // O código e a mensagem são os da falha que chegou, não os do prazo esgotado; as duas falham igual na repescagem
-  assert.deepEqual(orch.run.results.slice(1, 3), [
+  // O código e a mensagem são os da falha que chegou, não os do prazo esgotado; as duas falham igual na
+  // repescagem, e cada tentativa passou pela quarentena
+  const quarantinedFailure = (attempt, code, reason) => attemptRecord({ attempt, status: 'failed', code, via: 'visible', reason, quarantined: true });
+  assert.deepEqual(orch.run.results.slice(1, 3).map(withoutAttemptTimes), [
     {
       title: 'Bia',
       status: 'failed',
@@ -642,7 +698,8 @@ test('outra falha na quarentena prevalece sobre o prazo esgotado: leitura falha 
       warnings: [],
       message: '"Bia": HTTP 404 ao ler o arquivo exportado.',
       attempts: 2,
-      firstAttemptCode: 'TRANSFER_FAILED'
+      firstAttemptCode: 'TRANSFER_FAILED',
+      history: [1, 2].map((attempt) => quarantinedFailure(attempt, 'TRANSFER_FAILED', 'HTTP 404 ao ler o arquivo exportado.'))
     },
     {
       title: 'Caio',
@@ -654,7 +711,8 @@ test('outra falha na quarentena prevalece sobre o prazo esgotado: leitura falha 
       warnings: [],
       message: '"Caio": Arquivo recebido com 5 bytes; esperados 10.',
       attempts: 2,
-      firstAttemptCode: 'SIZE_MISMATCH'
+      firstAttemptCode: 'SIZE_MISMATCH',
+      history: [1, 2].map((attempt) => quarantinedFailure(attempt, 'SIZE_MISMATCH', 'Arquivo recebido com 5 bytes; esperados 10.'))
     }
   ]);
   assert.deepEqual(staging.saves.map((s) => s.chatTitle), ['Ana', 'Davi']);
@@ -729,6 +787,25 @@ test('"conferir" só marca a conversa seguinte que recebeu arquivo, não uma fal
     `[OK] 8. "Hugo" salvo (2.0 KB).${LATE_NOTE}${notDeliveredCheckNote(7, 'Gil', 1)}`,
     `[FALHA] 9. "Ivo": ${notDeliveredMessage} Tentativas: 2.`,
     `[NÃO EXPORTÁVEL] 10. "Juca": ${EXPORT_UNAVAILABLE_MESSAGE}`
+  ]);
+
+  // No log, cada tentativa da fila leva a marcação do relatório, o código (ou "sem código", numa falha
+  // sem ele), a quarentena e o motivo; depois do resultado vêm só esses campos
+  const queueAttempts = archive.calls[0].executionLog.split('\n')
+    .filter((line) => line.includes(' | tentativa 1 | '))
+    .map((line) => line.split(' | ').slice(4).join(' | '));
+  const notDeliveredAttempt = `FALHA (FILE_NOT_DELIVERED) | quarentena: o arquivo não foi recebido nela | motivo: ${notDeliveredMessage}`;
+  assert.deepEqual(queueAttempts, [
+    notDeliveredAttempt,
+    'FALHA (sem código) | motivo: Conversa não encontrada na lista.',
+    notDeliveredAttempt,
+    'NA PASTA DOWNLOADS',
+    notDeliveredAttempt,
+    'OK – VAZIA',
+    notDeliveredAttempt,
+    'OK | quarentena: o arquivo chegou nela, atrasado',
+    notDeliveredAttempt,
+    `NÃO EXPORTÁVEL (EXPORT_OPTION_UNAVAILABLE) | motivo: ${EXPORT_UNAVAILABLE_MESSAGE}`
   ]);
 });
 
@@ -808,7 +885,7 @@ test('exportação vazia: [OK – VAZIA] no relatório, contada no ZIP e gravada
   assert.equal(state.state, WORKFLOW_STATES.COMPLETED);
   // A vazia está no ZIP: conta em `saved` e, à parte, em `empty`
   assert.deepEqual(state.summary, { saved: 3, empty: 1, savedToDisk: 0, notExportable: 0, failed: 0 });
-  assert.deepEqual(orch.run.results[1], {
+  assert.deepEqual(withoutAttemptTimes(orch.run.results[1]), {
     title: 'Bia',
     status: 'saved',
     code: null,
@@ -825,7 +902,8 @@ test('exportação vazia: [OK – VAZIA] no relatório, contada no ZIP e gravada
     firstTimestamp: null,
     lastTimestamp: null,
     message: `"Bia" salvo (${sizeLabel(emptyZip)}).`,
-    attempts: 1
+    attempts: 1,
+    history: [attemptRecord({ status: 'saved', via: 'visible' })]
   });
 
   // O arquivo vazio vai para o staging e para o ZIP como os outros
@@ -875,7 +953,7 @@ test('conteúdo não inspecionado: a conversa é salva mesmo assim, e o relatór
 
   const result = orch.run.results[1];
   assert.match(result.inspectionError, /^O ZIP exportado está ilegível \(A entrada "_chat\.txt" está truncada: .+\)\.$/);
-  assert.deepEqual(result, {
+  assert.deepEqual(withoutAttemptTimes(result), {
     title: 'Bia',
     status: 'saved',
     code: null,
@@ -892,7 +970,8 @@ test('conteúdo não inspecionado: a conversa é salva mesmo assim, e o relatór
     firstTimestamp: null,
     lastTimestamp: null,
     message: `"Bia" salvo (${sizeLabel(truncatedZip)}). Conteúdo não inspecionado: ${result.inspectionError}`,
-    attempts: 1
+    attempts: 1,
+    history: [attemptRecord({ status: 'saved', via: 'visible' })]
   });
 
   // O arquivo vai para o staging como chegou
@@ -1197,7 +1276,7 @@ test('aviso de captura armada recusado: outra captura, outra aba ou conversa já
 
   assert.deepEqual(fake.downloadCallsFor(21), []);
   assert.deepEqual(fake.content.fetchRequests, []);
-  assert.deepEqual(orch.run.results[0], {
+  assert.deepEqual(withoutAttemptTimes(orch.run.results[0]), {
     title: 'Ana',
     status: 'failed',
     code: 'CAPTURE_NOT_ARMED',
@@ -1207,7 +1286,8 @@ test('aviso de captura armada recusado: outra captura, outra aba ou conversa já
     warnings: [],
     message: `"Ana": ${notArmedError}`,
     attempts: 2,
-    firstAttemptCode: 'CAPTURE_NOT_ARMED'
+    firstAttemptCode: 'CAPTURE_NOT_ARMED',
+    history: [1, 2].map((attempt) => attemptRecord({ attempt, status: 'failed', code: 'CAPTURE_NOT_ARMED', reason: notArmedError }))
   });
   assert.deepEqual(staging.saves.map((s) => s.chatTitle), ['Bia']);
   assert.deepEqual(orch.getState().summary, { saved: 1, empty: 0, savedToDisk: 0, notExportable: 0, failed: 1 });
@@ -1516,7 +1596,8 @@ test('falha que persiste: uma única repescagem, sem segunda rodada, e fica a fa
   assert.deepEqual(state.summary, { saved: 2, empty: 0, savedToDisk: 0, notExportable: 0, failed: 1 });
   assert.deepEqual(fake.content.exportRequests.map((m) => m.chat.title), ['Ana', 'Bia', 'Caio', 'Bia']);
   assert.equal(countAction(fake, ACTIONS.RESET_SIDEBAR), 1);
-  assert.deepEqual(orch.run.results[1], {
+  // O resultado é o da repescagem, e o histórico guarda o motivo de cada tentativa
+  assert.deepEqual(withoutAttemptTimes(orch.run.results[1]), {
     title: 'Bia',
     status: 'failed',
     code: 'TIMEOUT',
@@ -1526,7 +1607,11 @@ test('falha que persiste: uma única repescagem, sem segunda rodada, e fica a fa
     warnings: [],
     message: `"Bia": ${timeouts[2]}`,
     attempts: 2,
-    firstAttemptCode: 'TIMEOUT'
+    firstAttemptCode: 'TIMEOUT',
+    history: [
+      attemptRecord({ attempt: 1, status: 'failed', code: 'TIMEOUT', reason: timeouts[1] }),
+      attemptRecord({ attempt: 2, status: 'failed', code: 'TIMEOUT', reason: timeouts[2] })
+    ]
   });
   assert.deepEqual(orch.run.retry, { indices: [1], cursor: 1, startsAt: orch.run.retry.startsAt });
   assert.deepEqual(staging.saves.map((s) => s.chatTitle), ['Ana', 'Caio']);
@@ -2259,4 +2344,125 @@ test('conferência do ZIP com ZIP nativo ilegível e chave fora das esperadas: a
     '⚠️ Conferência do ZIP: 1 com o ZIP do WhatsApp ilegível, gravado(s) como o arquivo original; 1 no ZIP sem ser esperada(s). ' +
       'Veja a seção "Conferência do ZIP" no _relatorio.txt.'
   );
+});
+
+// Log da execução (_execucao.log): uma linha por evento, montado só com o que fica persistido no run
+
+const CLOCK = String.raw`\d{2}:\d{2}:\d{2}`;
+const DURATION = String.raw`\d+(?:\.\d)? s`;
+
+/** Texto para usar dentro de uma expressão regular, sem caracteres especiais */
+function literal(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/** Confere cada linha de evento do log contra o padrão da mesma posição, precedido do horário hh:mm:ss */
+function assertTimedEvents(lines, patterns, log) {
+  assert.equal(lines.length, patterns.length, log);
+  lines.forEach((line, i) => assert.match(line, new RegExp(`^${CLOCK} ${patterns[i]}$`)));
+}
+
+test('_execucao.log: uma linha por tentativa, em ordem cronológica, com horário, duração, via e código; a conversa repescada tem as duas', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const { fake, archive } = setUp({ chats: sidebarChats(['Ana', 'Bia', 'Caio']) });
+  const orch = createOrchestrator();
+  fake.content.scanStats = { steps: 4, durationMs: 3200, stopReason: 'end-of-list', lastChatTimestamp: '12/03/2021' };
+  const deliver = deliveringExport(orch, { firstAttemptFailures: { Bia: notFound('Bia') } });
+  // Cada conversa é aberta de um jeito; Bia, na repescagem, pela busca
+  const vias = { Ana: 'visible', Bia: 'search', Caio: 'scroll' };
+  fake.content.onExport = async (message) => {
+    if (message.chat.title === 'Caio') {
+      orch.recordUnexpectedFile({ filename: 'Conversa do WhatsApp com Fulano.zip', source: 'page' });
+      // Para o arquivo fora de hora não cair no mesmo milissegundo do início da repescagem
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const response = deliver(message);
+    return response.success ? { ...response, via: vias[message.chat.title] } : response;
+  };
+
+  await orch.start({ safeDelayMs: 0, retryCooldownMs: 0 });
+
+  assert.equal(orch.getState().state, WORKFLOW_STATES.COMPLETED);
+  const { runId, results } = orch.run;
+  // O resultado de Bia é o da repescagem, e o histórico guarda as duas tentativas, na ordem
+  assert.deepEqual(withoutAttemptTimes(results[1]).history, [
+    attemptRecord({ attempt: 1, status: 'failed', code: 'CHAT_NOT_FOUND', reason: notFound('Bia').error }),
+    attemptRecord({ attempt: 2, status: 'saved', via: 'search' })
+  ]);
+  assert.deepEqual(fake.readStorage('extractionRun').results[1].history, results[1].history);
+
+  const [{ executionLog }] = archive.calls;
+  assert.ok(executionLog.endsWith('\n'));
+  const lines = executionLog.split('\n');
+  assert.equal(lines[0], 'Log da execução - WhatsApp Web Extractor');
+  assert.match(
+    lines[1],
+    new RegExp(`^Execução: ${literal(runId)} \\| início: ${DATE_PT_BR} \\| versão da extensão: ${literal(fake.api.runtime.getManifest().version)}$`)
+  );
+  assert.deepEqual(lines.slice(2, 5), [
+    'Modo: lista principal (arquivadas não incluídas) | intervalo entre conversas: 0 s, com variação de até +50%',
+    'Varredura: 3 conversa(s) encontrada(s) em 3 s; parou no fim da lista; data/hora exibida na última conversa: 12/03/2021.',
+    ''
+  ]);
+
+  // Na ordem real: as três tentativas da fila (o arquivo fora de hora chegou durante Caio), o início da
+  // repescagem e a 2ª tentativa de Bia. Sem `via`, a aba não chegou a confirmar a exportação
+  const events = lines.slice(5, -1);
+  assertTimedEvents(events, [
+    `nº 1 "Ana" \\| tentativa 1 \\| ${DURATION} \\| abertura: lista visível \\| OK`,
+    `nº 2 "Bia" \\| tentativa 1 \\| ${DURATION} \\| abertura: não informada \\| FALHA \\(CHAT_NOT_FOUND\\) \\| motivo: ${literal(notFound('Bia').error)}`,
+    `nº 3 "Caio" \\| tentativa 1 \\| ${DURATION} \\| abertura: rolagem da lista \\| OK`,
+    literal('Arquivo recebido fora de hora (página, "Conversa do WhatsApp com Fulano.zip", durante "Caio"): não foi salvo no ZIP e seguiu para a pasta Downloads.'),
+    literal('Repescagem: rodada prevista para este horário (fim da espera; uma pausa a adia), com 1 conversa(s) que falharam na fila.'),
+    `nº 2 "Bia" \\| tentativa 2 \\| ${DURATION} \\| abertura: busca \\| OK`
+  ], executionLog);
+  // O horário de cada tentativa é o do início dela, no fuso local
+  assert.ok(events[5].startsWith(new Date(results[1].history[1].startedAt).toLocaleTimeString('pt-BR')));
+  assert.ok(events[1].startsWith(new Date(results[1].history[0].startedAt).toLocaleTimeString('pt-BR')));
+});
+
+test('_execucao.log de execução gravada por uma versão anterior, sem histórico: as tentativas dela vêm primeiro, sem horário, e as da retomada com horário', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const chats = sidebarChats(['Ana', 'Bia', 'Caio', 'Davi']);
+  const { fake: fakeA, archive } = setUp({ chats });
+  const snapshot = await snapshotDuringRetry(fakeA, { stallAt: 1 });
+  // A versão anterior não gravava o histórico de tentativas
+  for (const result of snapshot.extractionRun.results) delete result.history;
+
+  const fakeB = createFakeChrome({ chats, storage: snapshot });
+  installFakeChrome(fakeB);
+  const orchB = createOrchestrator();
+  fakeB.content.onExport = deliveringExport(orchB);
+  await orchB.restore();
+  assert.equal(orchB.resume(), true);
+  await orchB._loopPromise;
+
+  assert.equal(orchB.getState().state, WORKFLOW_STATES.COMPLETED);
+  // Bia e Davi: a 1ª tentativa é reconstituída do resultado da versão anterior, sem horário, e a 2ª é a
+  // da retomada; Ana e Caio continuam sem histórico
+  assert.deepEqual(
+    orchB.run.results.map((r) => r.history?.map(({ attempt, startedAt, status, code }) => [attempt, startedAt !== null, status, code])),
+    [
+      undefined,
+      [[1, false, 'failed', 'CHAT_NOT_FOUND'], [2, true, 'saved', null]],
+      undefined,
+      [[1, false, 'failed', 'TIMEOUT'], [2, true, 'saved', null]]
+    ]
+  );
+
+  const { executionLog } = archive.calls[0];
+  const lines = executionLog.split('\n');
+  // O content simulado não manda as estatísticas da varredura
+  assert.deepEqual(lines.slice(3, 10), [
+    'Varredura: sem estatísticas registradas nesta execução.',
+    'As linhas com --:--:-- foram registradas por uma versão anterior da extensão, sem horário nem duração, e vêm antes das demais.',
+    '',
+    '--:--:-- nº 1 "Ana" | tentativa 1 | duração não registrada | abertura: lista visível | OK',
+    `--:--:-- nº 2 "Bia" | tentativa 1 | duração não registrada | abertura: não informada | FALHA (CHAT_NOT_FOUND) | motivo: ${notFound('Bia').error}`,
+    '--:--:-- nº 3 "Caio" | tentativa 1 | duração não registrada | abertura: lista visível | OK',
+    '--:--:-- nº 4 "Davi" | tentativa 1 | duração não registrada | abertura: não informada | FALHA (TIMEOUT) | motivo: Timeout de 30s aguardando o menu.'
+  ]);
+  assertTimedEvents(lines.slice(10, -1), [
+    literal('Repescagem: rodada prevista para este horário (fim da espera; uma pausa a adia), com 2 conversa(s) que falharam na fila.'),
+    `nº 2 "Bia" \\| tentativa 2 \\| ${DURATION} \\| abertura: lista visível \\| OK`,
+    `nº 4 "Davi" \\| tentativa 2 \\| ${DURATION} \\| abertura: lista visível \\| OK`
+  ], executionLog);
 });

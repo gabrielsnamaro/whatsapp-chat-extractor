@@ -6,6 +6,7 @@ import { Logger } from '../utils/logger.js';
 const log = new Logger('ArchivePackager');
 
 export const REPORT_FILENAME = '_relatorio.txt';
+export const EXECUTION_LOG_FILENAME = '_execucao.log';
 
 /**
  * Nome de pasta seguro e único (sem diferenciar maiúsculas) para uma conversa dentro do ZIP
@@ -102,16 +103,18 @@ export class ArchivePackager {
    * @param {Object} params
    * @param {string} [params.report] Conteúdo do relatório gravado na raiz do ZIP
    * @param {string[]} params.expectedKeys Chaves do staging que devem estar no ZIP
+   * @param {string} [params.executionLog] Log da execução, gravado na raiz do ZIP quando houver
    * @returns {Promise<{ blob: Blob, chatCount: number, check: ArchiveCheck }>}
    */
-  static async build({ report, expectedKeys } = {}) {
+  static async build({ report, expectedKeys, executionLog } = {}) {
     // Sem a lista, uma conversa que sumiu do staging sairia do ZIP sem nenhum aviso
     if (!Array.isArray(expectedKeys)) {
       throw new Error('O empacotamento não recebeu a lista das conversas esperadas no ZIP (expectedKeys).');
     }
     const expected = new Set(expectedKeys);
     const writer = new ZipWriter();
-    const usedFolders = new Set([REPORT_FILENAME.toLowerCase()]);
+    // Os arquivos da raiz ficam reservados: uma conversa com o mesmo nome vai para outra pasta
+    const usedFolders = new Set([REPORT_FILENAME, EXECUTION_LOG_FILENAME].map((name) => name.toLowerCase()));
     const keys = await StagingRepository.listKeys();
     const packedKeys = new Set();
     const unreadable = [];
@@ -162,6 +165,7 @@ export class ArchivePackager {
     const reportHead = report ? `${report.endsWith('\n') ? report : `${report}\n`}\n` : '';
     const checkSection = buildCheckSection(check, { unreadable, unexpected }).join('\n');
     await writer.addFile(REPORT_FILENAME, `${reportHead}${checkSection}\n`);
+    if (executionLog) await writer.addFile(EXECUTION_LOG_FILENAME, executionLog);
 
     return { blob: writer.finish(), chatCount: packedKeys.size, check };
   }

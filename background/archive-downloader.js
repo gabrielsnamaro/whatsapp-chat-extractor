@@ -15,11 +15,12 @@ export class ArchiveDownloader {
    * @param {Object} params
    * @param {string} params.archiveFilename
    * @param {string} params.report Relatório gravado na raiz do ZIP
+   * @param {string} [params.executionLog] Log da execução gravado na raiz do ZIP
    * @param {string[]} params.expectedKeys Chaves do staging que devem estar no ZIP, para a conferência
    * @param {AbortSignal} [params.signal]
    * @returns {Promise<{ completed: boolean, error?: string, size?: number, chatCount?: number, check?: import('../shared/archive/archive-packager.js').ArchiveCheck }>}
    */
-  static async buildAndDownload({ archiveFilename, report, expectedKeys, signal }) {
+  static async buildAndDownload({ archiveFilename, report, executionLog, expectedKeys, signal }) {
     await this._ensureOffscreenDocument();
     let url = null;
 
@@ -28,6 +29,7 @@ export class ArchiveDownloader {
         target: OFFSCREEN_TARGET,
         action: OFFSCREEN_ACTIONS.BUILD_ARCHIVE,
         report,
+        executionLog,
         expectedKeys
       });
       if (!built?.success) {
