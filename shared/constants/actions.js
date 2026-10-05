@@ -28,6 +28,9 @@ export const ACTIONS = Object.freeze({
   EXPORT_CAPTURE_ARMED: 'EXPORT_CAPTURE_ARMED',
   EXPORT_UNEXPECTED_FILE: 'EXPORT_UNEXPECTED_FILE',
 
+  // Andamento da varredura da lista lateral (Content Script -> Background)
+  SCAN_PROGRESS: 'SCAN_PROGRESS',
+
   // Controle de fluxo de lote (Popup -> Background)
   START_BATCH_EXTRACTION: 'START_BATCH_EXTRACTION',
   PAUSE_BATCH_EXTRACTION: 'PAUSE_BATCH_EXTRACTION',

@@ -62,6 +62,17 @@
   }
 
   /**
+   * Avisa o background de quantas conversas a varredura já encontrou, para o popup mostrar. Não espera a
+   * resposta: um aviso perdido não atrapalha a varredura, e o seguinte traz o total atualizado.
+   * @param {number} found
+   */
+  function reportScanProgress(found) {
+    chrome.runtime.sendMessage({ action: 'SCAN_PROGRESS', found }).catch((err) => {
+      console.warn('[WhatsApp Web Extractor] Falha ao avisar o background do andamento da varredura:', err);
+    });
+  }
+
+  /**
    * Avisa o background, que arma a captura pelo chrome.downloads, e só depois da confirmação arma a
    * do clique no link. Sem a confirmação (recusa ou falha de comunicação), "Exportar" não é clicado.
    * @param {string} captureId
@@ -133,9 +144,15 @@
           case 'SCAN_CHATS_REQUEST': {
             const operation = beginOperation();
             try {
-              const chats = await scanner.scanAllChats({ maxLimit: message.maxLimit ?? null, signal: operation.signal });
-              console.log(`[WhatsApp Web Extractor] Escaneamento concluído: ${chats.length} conversas localizadas.`);
-              sendResponse({ success: true, chats });
+              // Com uma busca digitada na lista lateral, a varredura leria só os resultados dela
+              chatNavigator.clearSearch();
+              const { chats, stats } = await scanner.scanAllChats({
+                maxLimit: message.maxLimit ?? null,
+                onProgress: reportScanProgress,
+                signal: operation.signal
+              });
+              console.log(`[WhatsApp Web Extractor] Escaneamento concluído: ${chats.length} conversas localizadas (parada: ${stats.stopReason}).`);
+              sendResponse({ success: true, chats, stats });
             } finally {
               endOperation(operation);
             }
@@ -148,7 +165,7 @@
             // conversa anterior armada até o onBeforeConfirm desta, e um arquivo nesse intervalo seria
             // bloqueado na página e recusado pelo background, sem ir para o ZIP nem para a pasta Downloads
             armedCaptureId = null;
-            const { chat, captureId } = message;
+            const { chat, captureId, queueIndex } = message;
             if (!chat?.title || !captureId) {
               sendResponse({ success: false, error: 'Parâmetros inválidos para exportação.' });
               return;
@@ -156,7 +173,7 @@
 
             const operation = beginOperation();
             try {
-              const { via } = await chatNavigator.openChat(chat, { signal: operation.signal });
+              const { via } = await chatNavigator.openChat(chat, { signal: operation.signal, queueIndex });
               await optionsMenu.triggerExportOption({ signal: operation.signal });
               // A captura só é armada imediatamente antes do clique em "Exportar" (o link de download só
               // existe depois dele): até lá, um arquivo atrasado da conversa anterior não é tomado como desta

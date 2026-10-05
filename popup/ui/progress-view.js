@@ -55,8 +55,9 @@ export class ProgressView {
    *   `empty` são as exportações vazias, já contadas em `saved`
    * @param {{ current: number, total: number }|null} [data.retry] Andamento da repescagem, enquanto ela
    *   tem conversas por exportar; aí `percentage` é o da rodada, e não o da fila
+   * @param {number} [data.scanFound=0] Conversas encontradas até agora pela varredura da lista
    */
-  renderProgress({ state, current = 0, total = 0, percentage = 0, currentChatTitle = '', errorMessage = null, statusMessage = null, summary = null, retry = null }) {
+  renderProgress({ state, current = 0, total = 0, percentage = 0, currentChatTitle = '', errorMessage = null, statusMessage = null, summary = null, retry = null, scanFound = 0 }) {
     if (!this.container) return;
 
     if (state === WORKFLOW_STATES.IDLE && current === 0) {
@@ -78,7 +79,7 @@ export class ProgressView {
       const notExportable = summary?.notExportable ? ` · ${summary.notExportable} não exportável(is)` : '';
       const empty = summary?.empty ? ` · ${summary.empty} vazia(s)` : '';
       if (state === WORKFLOW_STATES.SCANNING) {
-        this.label.textContent = 'Buscando lista de chats...';
+        this.label.textContent = scanFound > 0 ? `${scanFound} conversa(s) encontrada(s)` : 'Buscando lista de chats...';
       } else if (retry) {
         this.label.textContent = `Repescagem ${retry.current} de ${retry.total} (${validPercent}%)${failures}${notExportable}${empty}`;
       } else if (total > 0) {

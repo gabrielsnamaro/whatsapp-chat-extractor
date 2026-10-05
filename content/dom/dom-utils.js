@@ -159,6 +159,23 @@
     return `${base} (${failedAttempts.map(describeFailedAttempt).join('; ')}).`;
   }
 
+  /**
+   * Posição da lista lateral em que a varredura de abertura começa: uma tela acima da linha estimada
+   * da conversa (posição na fila × altura de uma linha). A tela de folga cobre a conversa que subiu um
+   * pouco desde a varredura e a pasta "Arquivadas" acima da grade; a que desceu é achada na descida.
+   * Não toca no DOM, para ser testada no Node.
+   * @param {{ index: number, rowHeight: number, viewportHeight: number }} params
+   * @returns {number} scrollTop inicial, nunca negativo
+   */
+  function estimateScrollStart({ index, rowHeight, viewportHeight }) {
+    for (const [name, value] of Object.entries({ index, rowHeight, viewportHeight })) {
+      if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+        throw new Error(`Valor inválido para estimar a posição da conversa na lista: ${name} = ${String(value)}`);
+      }
+    }
+    return Math.max(0, Math.floor(index * rowHeight - viewportHeight));
+  }
+
   function throwIfAborted(signal) {
     if (signal?.aborted) throw new OperationCancelledError();
   }
@@ -290,7 +307,9 @@
 
   /**
    * Normaliza títulos para comparação exata: forma NFC, sem caracteres invisíveis
-   * (inclusive seletores de variação de emoji), espaços colapsados e caixa baixa
+   * (inclusive seletores de variação de emoji) e espaços colapsados. A caixa é mantida:
+   * "João" e "joão" são conversas diferentes, e igualá-las fazia o scanner guardar só uma
+   * e a abertura poder pegar uma no lugar da outra.
    * @param {string} str
    * @returns {string}
    */
@@ -300,8 +319,7 @@
       .normalize('NFC')
       .replace(/[​-‍﻿‎‏‪-‮︎️]/g, '')
       .replace(/\s+/g, ' ')
-      .trim()
-      .toLowerCase();
+      .trim();
   }
 
   /**
@@ -325,6 +343,7 @@
     OperationTimeoutError,
     DomAutomationError,
     buildChatNotFoundMessage,
+    estimateScrollStart,
     throwIfAborted,
     sleep,
     waitFor,

@@ -380,6 +380,8 @@ test('relatório: cabeçalho, datas e uma linha por conversa', { timeout: TEST_T
     chats: sidebarChats(['Ana', 'Bia', 'Caio', 'Davi'], { duplicates: ['Caio'] })
   });
   const orch = createOrchestrator();
+  // Como o content real: a varredura parou no limite, e a última conversa lida exibia "Ontem"
+  fake.content.scanStats = { steps: 1, durationMs: 1400, stopReason: 'limit-reached', lastChatTimestamp: 'Ontem' };
   fake.content.onExport = deliveringExport(orch, {
     sizes: { Ana: 1536, Caio: 3072 },
     failures: { Bia: 'Conversa não encontrada na lista.' }
@@ -394,13 +396,14 @@ test('relatório: cabeçalho, datas e uma linha por conversa', { timeout: TEST_T
   const { report } = archive.calls[0];
   assert.ok(report.endsWith('\n'));
   const lines = report.split('\n');
-  assert.equal(lines.length, 12);
+  assert.equal(lines.length, 13);
   assert.equal(lines[0], 'Relatório de extração - WhatsApp Web Extractor');
   // As datas dependem do fuso de quem roda o teste
   assert.match(lines[1], new RegExp(`^Início: ${DATE_PT_BR}$`));
   assert.match(lines[2], new RegExp(`^Geração do ZIP: ${DATE_PT_BR}$`));
   assert.deepEqual(lines.slice(3), [
     'Modo: limite de 3 conversa(s)',
+    'Varredura: 3 conversa(s) encontrada(s) em 1 s; parou ao atingir o limite escolhido; data/hora exibida na última conversa: Ontem.',
     `${CONTENT_LINE_PREFIX} (0 anexo(s) omitido(s) nesta execução).`,
     'Conversas na fila: 3 | no ZIP: 2 (vazias: 0) | na pasta Downloads: 0 | não exportáveis: 0 | falhas: 1',
     retryHeader(1, 0),
@@ -1997,4 +2000,167 @@ test('download do ZIP não concluído: "Retomar" gera o ZIP de novo sem repetir 
   assert.equal(orchB.getState().state, WORKFLOW_STATES.COMPLETED);
   assert.deepEqual(fakeB.receivedActions(), []);
   assert.equal(archive.calls.length, 2);
+});
+
+// Varredura da lista: estatísticas no relatório, andamento no popup e posição da conversa na fila
+
+for (const { stopReason, durationMs, lastChatTimestamp, summary } of [
+  {
+    stopReason: 'end-of-list',
+    durationMs: 21400,
+    lastChatTimestamp: '12/03/2021',
+    summary: 'em 21 s; parou no fim da lista; data/hora exibida na última conversa: 12/03/2021'
+  },
+  {
+    stopReason: 'scroll-stalled',
+    durationMs: 9600,
+    lastChatTimestamp: 'Ontem',
+    summary: 'em 10 s; parou porque a rolagem travou antes do fim da lista, que pode ter ficado incompleta; ' +
+      'data/hora exibida na última conversa: Ontem'
+  },
+  {
+    stopReason: 'time-limit',
+    durationMs: 240000,
+    lastChatTimestamp: null,
+    summary: 'em 240 s; parou no tempo máximo da varredura, e a lista pode ter ficado incompleta; ' +
+      'a última conversa não tinha data/hora legível'
+  },
+  {
+    stopReason: 'motivo-de-uma-versao-futura',
+    durationMs: 500,
+    lastChatTimestamp: '10:42',
+    summary: 'em 1 s; parou por um motivo desconhecido (motivo-de-uma-versao-futura); data/hora exibida na última conversa: 10:42'
+  }
+]) {
+  test(`linha da varredura no relatório, logo depois do modo: ${stopReason}`, { timeout: TEST_TIMEOUT_MS }, async () => {
+    const { fake, archive } = setUp({ chats: sidebarChats(['Ana', 'Bia']) });
+    const orch = createOrchestrator();
+    fake.content.scanStats = { steps: 7, durationMs, stopReason, lastChatTimestamp };
+    fake.content.onExport = deliveringExport(orch);
+
+    await orch.start({ safeDelayMs: 0 });
+
+    assert.equal(orch.getState().state, WORKFLOW_STATES.COMPLETED);
+    assert.deepEqual(orch.run.scan, { found: 2, steps: 7, durationMs, stopReason, lastChatTimestamp });
+    assert.deepEqual(fake.readStorage('extractionRun').scan, orch.run.scan);
+    const lines = archive.calls[0].report.split('\n');
+    assert.deepEqual(lines.slice(3, 5), [
+      'Modo: lista principal (arquivadas não incluídas)',
+      `Varredura: 2 conversa(s) encontrada(s) ${summary}.`
+    ]);
+    assert.ok(lines[5].startsWith(CONTENT_LINE_PREFIX));
+  });
+}
+
+test('estatísticas da varredura sobrevivem a um reinício; execução gravada antes delas sai sem a linha da varredura', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const chats = sidebarChats(['Ana', 'Bia', 'Caio']);
+  const { fake: fakeA, archive } = setUp({ chats });
+  const stats = { steps: 3, durationMs: 4200, stopReason: 'end-of-list', lastChatTimestamp: '05/01/2024' };
+  fakeA.content.scanStats = stats;
+  const orchA = createOrchestrator();
+  const deliverA = deliveringExport(orchA);
+  const stalled = createDeferred();
+  let snapshot = null;
+  // Em Bia, o storage é copiado como estaria se o Chrome encerrasse o service worker ali
+  fakeA.content.onExport = (message) => {
+    if (message.chat.title !== 'Bia') return deliverA(message);
+    snapshot = fakeA.snapshotStorage();
+    stalled.resolve();
+    return { success: true, triggered: true };
+  };
+
+  const loopA = orchA.start({ safeDelayMs: 0 });
+  await stalled.promise;
+  await orchA.cancel();
+  await loopA;
+  assert.deepEqual(snapshot.extractionRun.scan, { found: 3, ...stats });
+
+  /** Nova instância com o storage dado, retomada até o fim; devolve as linhas do relatório */
+  async function resumeFrom(storage) {
+    const fake = createFakeChrome({ chats, storage });
+    installFakeChrome(fake);
+    const orch = createOrchestrator();
+    fake.content.onExport = deliveringExport(orch);
+    await orch.restore();
+    assert.equal(orch.resume(), true);
+    await orch._loopPromise;
+    assert.equal(orch.getState().state, WORKFLOW_STATES.COMPLETED);
+    // A retomada não refaz a varredura: a linha vem do que foi persistido
+    assert.equal(fake.receivedActions().includes(ACTIONS.SCAN_CHATS_REQUEST), false);
+    return archive.calls.at(-1).report.split('\n');
+  }
+
+  const resumed = await resumeFrom(snapshot);
+  assert.equal(
+    resumed[4],
+    'Varredura: 3 conversa(s) encontrada(s) em 4 s; parou no fim da lista; data/hora exibida na última conversa: 05/01/2024.'
+  );
+
+  const previousVersion = structuredClone(snapshot);
+  delete previousVersion.extractionRun.scan;
+  const withoutStats = await resumeFrom(previousVersion);
+  assert.equal(withoutStats.some((line) => line.startsWith('Varredura:')), false);
+  assert.ok(withoutStats[4].startsWith(CONTENT_LINE_PREFIX));
+});
+
+test('andamento da varredura: o popup recebe o total encontrado a cada aviso da aba, sem gravar o storage', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const { fake } = setUp({ chats: sidebarChats(['Ana', 'Bia', 'Caio']) });
+  const orch = createOrchestrator();
+  const realSet = fake.api.storage.local.set;
+  let storageWrites = 0;
+  fake.api.storage.local.set = (items) => {
+    storageWrites++;
+    return realSet(items);
+  };
+
+  // Durante a varredura, a aba avisa o andamento pelo mesmo método do orquestrador que o service worker chama
+  const duringScan = {};
+  fake.content.onScan = () => {
+    const writesBefore = storageWrites;
+    const updatesBefore = fake.progressUpdates().length;
+    duringScan.responses = [1, 2, 3].map((found) => orch.recordScanProgress({ found, tabId: WHATSAPP_TAB_ID }));
+    duringScan.otherTab = orch.recordScanProgress({ found: 9, tabId: WHATSAPP_TAB_ID + 1 });
+    duringScan.invalid = orch.recordScanProgress({ found: -1, tabId: WHATSAPP_TAB_ID });
+    duringScan.writes = storageWrites - writesBefore;
+    duringScan.updates = fake.progressUpdates().slice(updatesBefore).map((m) => [m.state, m.scanFound]);
+  };
+  // Um aviso atrasado, que chegue depois da resposta da varredura, não volta o popup para ela
+  const deliver = deliveringExport(orch);
+  let lateProgress = null;
+  fake.content.onExport = (message) => {
+    lateProgress ??= orch.recordScanProgress({ found: 2, tabId: WHATSAPP_TAB_ID });
+    return deliver(message);
+  };
+
+  await orch.start({ safeDelayMs: 0 });
+
+  assert.equal(orch.getState().state, WORKFLOW_STATES.COMPLETED);
+  assert.deepEqual(duringScan.responses, [1, 2, 3].map(() => ({ success: true, recorded: true })));
+  assert.deepEqual(duringScan.otherTab, { success: true, recorded: false });
+  assert.deepEqual(duringScan.invalid, { success: false, error: 'Andamento da varredura inválido: -1.' });
+  // Um aviso ao popup por aviso aceito da aba, e nenhuma gravação no storage
+  assert.deepEqual(duringScan.updates, [
+    [WORKFLOW_STATES.SCANNING, 1], [WORKFLOW_STATES.SCANNING, 2], [WORKFLOW_STATES.SCANNING, 3]
+  ]);
+  assert.equal(duringScan.writes, 0);
+  assert.deepEqual(lateProgress, { success: true, recorded: false });
+  // O total da fila montada fica no estado, e as conversas seguem para a exportação
+  assert.equal(orch.getState().scanFound, 3);
+  assert.equal(fake.content.exportRequests.length, 3);
+  assert.ok(storageWrites > 0, 'o estado da execução continua sendo persistido fora dos avisos da varredura');
+});
+
+test('EXPORT_CHAT_REQUEST leva a posição da conversa na fila, também na repescagem', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const { fake } = setUp({ chats: sidebarChats(['Ana', 'Bia', 'Caio']) });
+  const orch = createOrchestrator();
+  fake.content.onExport = deliveringExport(orch, { firstAttemptFailures: { Bia: notFound('Bia') } });
+
+  await orch.start({ safeDelayMs: 0, retryCooldownMs: 0 });
+
+  assert.equal(orch.getState().state, WORKFLOW_STATES.COMPLETED);
+  // A aba começa a rolagem da lista perto dessa posição; a conversa repescada mantém a da fila
+  assert.deepEqual(
+    fake.content.exportRequests.map((m) => [m.chat.title, m.queueIndex, isRetryAttempt(m)]),
+    [['Ana', 0, false], ['Bia', 1, false], ['Caio', 2, false], ['Bia', 1, true]]
+  );
 });

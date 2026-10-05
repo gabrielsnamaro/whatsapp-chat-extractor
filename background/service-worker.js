@@ -23,7 +23,7 @@ chrome.runtime.onInstalled.addListener((details) => {
   log.info(`Extensão instalada/atualizada: ${details.reason}`);
 });
 
-/** Mensagens sobre o arquivo exportado só valem vindas do content script da aba do WhatsApp Web */
+/** Mensagens sobre o arquivo exportado e a varredura só valem vindas do content script da aba do WhatsApp Web */
 function isFromWhatsAppTab(sender) {
   return Boolean(sender.tab?.url?.startsWith('https://web.whatsapp.com/'));
 }
@@ -56,6 +56,12 @@ async function handleMessage(message, sender) {
         return { success: false, error: 'Origem não autorizada para avisar de arquivo exportado.' };
       }
       return orchestrator.recordUnexpectedFile({ filename: message.filename, source: 'page' });
+
+    case ACTIONS.SCAN_PROGRESS:
+      if (!isFromWhatsAppTab(sender)) {
+        return { success: false, error: 'Origem não autorizada para avisar o andamento da varredura.' };
+      }
+      return orchestrator.recordScanProgress({ found: message.found, tabId: sender.tab.id });
 
     case ACTIONS.GET_WORKFLOW_STATE:
       return { success: true, data: orchestrator.getState() };

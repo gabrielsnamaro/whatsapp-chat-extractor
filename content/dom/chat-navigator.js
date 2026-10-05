@@ -6,7 +6,7 @@
 (function registerChatNavigator() {
   const {
     SELECTORS, TIMEOUTS, ERROR_CODES, LOCATE_FAILURES, OperationTimeoutError, DomAutomationError,
-    buildChatNotFoundMessage, waitFor, sleep, throwIfAborted, simulateClick, pressEscape,
+    buildChatNotFoundMessage, estimateScrollStart, waitFor, sleep, throwIfAborted, simulateClick, pressEscape,
     readTextWithEmojis, readCellTitle, isTitleMatch
   } = window.DomUtils;
 
@@ -166,20 +166,62 @@
     }
 
     /**
-     * Varre a lista inteira do topo ao fim. Passos menores que a altura visível
-     * garantem que nenhuma linha da lista virtual seja pulada.
+     * Altura de uma linha da lista, medida na primeira conversa renderizada (a pasta "Arquivadas" fica
+     * fora da grade e não conta)
+     * @private
+     * @param {HTMLElement} pane
+     * @returns {number} 0 se nenhuma linha tiver altura
+     */
+    _measureRowHeight(pane) {
+      for (const cell of pane.querySelectorAll(SELECTORS.CHAT_CELL)) {
+        if (cell.closest(SELECTORS.ARCHIVED_BUTTON)) continue;
+        const height = cell.closest(SELECTORS.CHAT_ROW)?.getBoundingClientRect().height;
+        if (height > 0) return height;
+      }
+      return 0;
+    }
+
+    /**
+     * Procura a conversa rolando a lista. Começa uma tela acima de onde ela estava na varredura (posição
+     * na fila × altura de uma linha) e desce até o fim; sem achar ali (ela subiu na lista, por exemplo
+     * ao receber uma mensagem) ou sem estimativa, varre a lista inteira a partir do topo.
      * @private
      * @param {string} targetTitle
-     * @param {AbortSignal} [signal]
-     * @returns {Promise<{ cell: HTMLElement|null, failure: Object|null }>} `failure` diz por que a célula não foi achada
+     * @param {Object} [params]
+     * @param {number} [params.queueIndex] Posição da conversa na fila da varredura
+     * @param {AbortSignal} [params.signal]
+     * @returns {Promise<{ cell: HTMLElement|null, failure: Object|null }>} `failure` diz por que a célula
+     *   não foi achada na varredura a partir do topo
      */
-    async _locateCellWithScroll(targetTitle, signal) {
+    async _locateCellWithScroll(targetTitle, { queueIndex, signal } = {}) {
       const pane = document.querySelector(SELECTORS.PANE_SIDE);
       if (!pane) {
         return { cell: null, failure: { via: 'scroll', reason: LOCATE_FAILURES.LIST_MISSING } };
       }
 
-      pane.scrollTop = 0;
+      const rowHeight = Number.isInteger(queueIndex) && queueIndex > 0 ? this._measureRowHeight(pane) : 0;
+      const estimatedTop = rowHeight > 0
+        ? estimateScrollStart({ index: queueIndex, rowHeight, viewportHeight: pane.clientHeight })
+        : 0;
+      if (estimatedTop > 0) {
+        const nearby = await this._scrollDownFrom(pane, estimatedTop, targetTitle, signal);
+        if (nearby.cell) return nearby;
+      }
+      return this._scrollDownFrom(pane, 0, targetTitle, signal);
+    }
+
+    /**
+     * Desce a lista a partir de `startTop` até o fim. Passos menores que a altura visível
+     * garantem que nenhuma linha da lista virtual seja pulada.
+     * @private
+     * @param {HTMLElement} pane
+     * @param {number} startTop
+     * @param {string} targetTitle
+     * @param {AbortSignal} [signal]
+     * @returns {Promise<{ cell: HTMLElement|null, failure: Object|null }>}
+     */
+    async _scrollDownFrom(pane, startTop, targetTitle, signal) {
+      pane.scrollTop = startTop;
       await sleep(300, signal);
 
       const step = Math.max(100, Math.floor(pane.clientHeight * 0.7));
@@ -215,9 +257,10 @@
      * @param {string} [chat.title]
      * @param {Object} [params]
      * @param {AbortSignal} [params.signal]
+     * @param {number} [params.queueIndex] Posição da conversa na fila da varredura, para a rolagem começar perto dela
      * @returns {Promise<{ success: boolean, title: string, via: string }>}
      */
-    async openChat(chat, { signal } = {}) {
+    async openChat(chat, { signal, queueIndex } = {}) {
       const targetTitle = typeof chat === 'string' ? chat : chat?.title;
       if (!targetTitle) {
         throw new Error('Título da conversa não fornecido ao ChatNavigator.');
@@ -234,7 +277,7 @@
         return { success: true, title: targetTitle, via: 'already-open' };
       }
 
-      // 3. Localiza a célula: visível agora → busca → varredura completa da lista
+      // 3. Localiza a célula: visível agora → busca → rolagem da lista (perto da posição estimada, depois inteira)
       let via = 'visible';
       let cellElement = this.findVisibleCellByTitle(targetTitle);
       const failedAttempts = [];
@@ -246,7 +289,7 @@
       }
       if (!cellElement) {
         via = 'scroll';
-        const scroll = await this._locateCellWithScroll(targetTitle, signal);
+        const scroll = await this._locateCellWithScroll(targetTitle, { queueIndex, signal });
         cellElement = scroll.cell;
         if (scroll.failure) failedAttempts.push(scroll.failure);
       }

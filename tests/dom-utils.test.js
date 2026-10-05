@@ -8,7 +8,7 @@ import vm from 'node:vm';
 const context = vm.createContext({ window: {} });
 vm.runInContext(readFileSync(new URL('../content/dom/dom-utils.js', import.meta.url), 'utf8'), context);
 const {
-  isTitleMatch, normalizeTitle, buildChatNotFoundMessage, waitFor,
+  isTitleMatch, normalizeTitle, buildChatNotFoundMessage, estimateScrollStart, waitFor,
   ERROR_CODES, LOCATE_FAILURES, DomAutomationError, OperationTimeoutError
 } = context.window.DomUtils;
 // Os erros são criados no contexto do vm, com o Error de lá
@@ -20,11 +20,20 @@ test('títulos parciais não casam (evita exportar a conversa errada)', () => {
   assert.equal(isTitleMatch('+55 11 99999-0000', '5511'), false);
 });
 
-test('igualdade tolera caixa, espaços, marcas invisíveis e seletores de variação', () => {
-  assert.equal(isTitleMatch('  ana ', 'Ana'), true);
+test('igualdade tolera espaços, marcas invisíveis e seletores de variação', () => {
+  assert.equal(isTitleMatch('  Ana ', 'Ana'), true);
   assert.equal(isTitleMatch('‎João‏', 'João'), true);
   assert.equal(isTitleMatch('Casa ☺️', 'Casa ☺'), true);
-  assert.equal(isTitleMatch('Grupo   da   Família', 'grupo da família'), true);
+  assert.equal(isTitleMatch('Grupo   da   Família', 'Grupo da Família'), true);
+});
+
+test('igualdade diferencia maiúsculas: "João" e "joão" são conversas diferentes', () => {
+  assert.equal(isTitleMatch('joão', 'João'), false);
+  assert.equal(isTitleMatch('  ana ', 'Ana'), false);
+  assert.equal(isTitleMatch('Grupo da Família', 'grupo da família'), false);
+  // A chave de deduplicação do scanner também mantém a caixa: as duas conversas entram na fila
+  assert.notEqual(normalizeTitle('João'), normalizeTitle('joão'));
+  assert.equal(normalizeTitle(' João '), 'João');
 });
 
 test('normalização NFC iguala acentos compostos e decompostos', () => {
@@ -62,6 +71,26 @@ test('mensagem "não encontrada" traz o motivo de cada tentativa, na ordem em qu
     `${base} (busca: sem resultado em 1.5 s; rolagem: lista lateral não encontrada).`
   );
   assert.equal(buildChatNotFoundMessage('Ana', []), `${base}.`);
+});
+
+test('rolagem de abertura começa uma tela acima da linha estimada, nunca antes do topo', () => {
+  // Posição 100 da fila (contada do zero), linhas de 76 px (como no snapshot da lista) e 700 px de altura visível
+  assert.equal(estimateScrollStart({ index: 100, rowHeight: 76, viewportHeight: 700 }), 100 * 76 - 700);
+  // Conversas da primeira tela: a uma tela acima seria negativo, então fica o topo
+  assert.equal(estimateScrollStart({ index: 0, rowHeight: 76, viewportHeight: 700 }), 0);
+  assert.equal(estimateScrollStart({ index: 9, rowHeight: 76, viewportHeight: 700 }), 0);
+  assert.equal(estimateScrollStart({ index: 10, rowHeight: 76, viewportHeight: 700 }), 60);
+  // Altura medida com fração de pixel: a posição é inteira e não passa da estimativa
+  assert.equal(estimateScrollStart({ index: 3, rowHeight: 72.5, viewportHeight: 100 }), 117);
+
+  for (const params of [
+    { index: -1, rowHeight: 76, viewportHeight: 700 },
+    { index: Number.NaN, rowHeight: 76, viewportHeight: 700 },
+    { index: 5, rowHeight: undefined, viewportHeight: 700 },
+    { index: 5, rowHeight: 76, viewportHeight: Number.POSITIVE_INFINITY }
+  ]) {
+    assert.throws(() => estimateScrollStart(params), /^Error: Valor inválido para estimar a posição da conversa na lista: /);
+  }
 });
 
 test('motivo ou tentativa desconhecidos lançam erro em vez de sair na mensagem', () => {

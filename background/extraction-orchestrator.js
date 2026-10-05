@@ -61,6 +61,15 @@ const DATE_RANGE_UNCONFIRMED_NOTE = " Aviso: não foi possível confirmar a opç
 
 const UNEXPECTED_FILE_SOURCE_LABELS = Object.freeze({ page: 'página', download: 'chrome.downloads' });
 
+// Por que a varredura da lista parou, pelos códigos que o content devolve nas estatísticas dela
+// (STOP_REASONS em content/dom/chat-list-scanner.js; content script clássico não é importável aqui)
+const SCAN_STOP_LABELS = Object.freeze({
+  'end-of-list': 'parou no fim da lista',
+  'scroll-stalled': 'parou porque a rolagem travou antes do fim da lista, que pode ter ficado incompleta',
+  'limit-reached': 'parou ao atingir o limite escolhido',
+  'time-limit': 'parou no tempo máximo da varredura, e a lista pode ter ficado incompleta'
+});
+
 class RunCancelledError extends Error {
   constructor() {
     super('Extração cancelada.');
@@ -115,11 +124,14 @@ export class ExtractionOrchestrator {
     this.statusMessage = null;
     this.currentIndex = 0;
     this.currentChatTitle = '';
+    /** Conversas encontradas até agora pela varredura em andamento, mostradas no popup */
+    this.scanFound = 0;
 
     /**
      * `retry` é a repescagem: null até a fila terminar; `indices` são as posições na fila que entraram
-     * nela, `cursor` a próxima a exportar e `startsAt` quando a rodada pode começar.
-     * @type {{ runId: string, tabId: number|null, options: Object, queue: Array, nextIndex: number, results: Array, unexpectedFiles: Array, retry: { indices: number[], cursor: number, startsAt: string }|null, startedAt: string }|null}
+     * nela, `cursor` a próxima a exportar e `startsAt` quando a rodada pode começar. `scan` são as
+     * estatísticas da varredura (null até ela terminar).
+     * @type {{ runId: string, tabId: number|null, options: Object, queue: Array, nextIndex: number, results: Array, unexpectedFiles: Array, retry: { indices: number[], cursor: number, startsAt: string }|null, scan: { found: number, steps: number, durationMs: number, stopReason: string, lastChatTimestamp: string|null }|null, startedAt: string }|null}
      */
     this.run = null;
 
@@ -202,6 +214,7 @@ export class ExtractionOrchestrator {
       total,
       percentage,
       retry,
+      scanFound: this.scanFound,
       currentChatTitle: this.currentChatTitle,
       errorMessage: this.errorMessage,
       statusMessage: this.statusMessage,
@@ -252,16 +265,23 @@ export class ExtractionOrchestrator {
   }
 
   /**
+   * Notifica o popup, sem persistir o estado
+   * @private
+   * @param {Object} [extra] Campos adicionais só para a notificação (ex: infoMessage, warningMessage)
+   */
+  _sendProgressToPopup(extra = {}) {
+    chrome.runtime.sendMessage({ action: ACTIONS.WORKFLOW_PROGRESS_UPDATE, ...this.getState(), ...extra }).catch(() => {
+      // Popup fechado
+    });
+  }
+
+  /**
    * Notifica o popup e persiste o estado da execução
    * @private
    * @param {Object} [extra] Campos adicionais só para a notificação (ex: infoMessage, warningMessage)
    */
   _notifyProgress(extra = {}) {
-    const payload = { ...this.getState(), ...extra };
-
-    chrome.runtime.sendMessage({ action: ACTIONS.WORKFLOW_PROGRESS_UPDATE, ...payload }).catch(() => {
-      // Popup fechado
-    });
+    this._sendProgressToPopup(extra);
 
     if (this.run) {
       StorageClient.set({
@@ -412,6 +432,26 @@ export class ExtractionOrchestrator {
   }
 
   /**
+   * Repassa ao popup quantas conversas a varredura já encontrou (SCAN_PROGRESS, que a aba manda no
+   * máximo a cada 500 ms). Não grava o storage: a retomada depois de um reinício não continua uma
+   * varredura interrompida, e o total parcial não serve a ela. Um aviso de outra aba ou atrasado, que
+   * chegue depois do fim da varredura, é ignorado.
+   * @param {{ found: number, tabId: number }} params
+   * @returns {{ success: boolean, recorded?: boolean, error?: string }}
+   */
+  recordScanProgress({ found, tabId }) {
+    if (!Number.isInteger(found) || found < 0) {
+      return { success: false, error: `Andamento da varredura inválido: ${String(found)}.` };
+    }
+    if (this._activeState !== WORKFLOW_STATES.SCANNING || this.run?.tabId !== tabId) {
+      return { success: true, recorded: false };
+    }
+    this.scanFound = found;
+    this._sendProgressToPopup();
+    return { success: true, recorded: true };
+  }
+
+  /**
    * Inicia o fluxo completo de extração em lote
    * @param {Object} options
    * @param {number|null} [options.maxChats=null] Limite máximo de chats (para testes)
@@ -435,6 +475,7 @@ export class ExtractionOrchestrator {
     this.statusMessage = null;
     this.currentIndex = 0;
     this.currentChatTitle = '';
+    this.scanFound = 0;
     this.run = {
       runId: Date.now().toString(36),
       tabId: null,
@@ -444,6 +485,7 @@ export class ExtractionOrchestrator {
       results: [],
       unexpectedFiles: [],
       retry: null,
+      scan: null,
       startedAt: new Date().toISOString()
     };
 
@@ -616,7 +658,16 @@ export class ExtractionOrchestrator {
 
     const chats = limit ? response.chats.slice(0, limit) : response.chats;
     this.run.queue = chats.map(({ id, title, duplicateTitle }) => ({ id, title, duplicateTitle: Boolean(duplicateTitle) }));
-    log.info(`Fila montada com ${this.run.queue.length} conversas para exportação.`);
+    this.scanFound = response.chats.length;
+    const { stats } = response;
+    this.run.scan = stats ? {
+      found: response.chats.length,
+      steps: stats.steps,
+      durationMs: stats.durationMs,
+      stopReason: stats.stopReason,
+      lastChatTimestamp: stats.lastChatTimestamp ?? null
+    } : null;
+    log.info(`Fila montada com ${this.run.queue.length} conversas para exportação (varredura: ${stats?.stopReason ?? 'sem estatísticas'}).`);
     this._notifyProgress();
   }
 
@@ -824,7 +875,8 @@ export class ExtractionOrchestrator {
     this._exportInProgress = { captureId, tabId, title: chat.title };
 
     try {
-      const trigger = await this._sendToTab(tabId, { action: ACTIONS.EXPORT_CHAT_REQUEST, chat, captureId }, signal);
+      // A posição na fila é a da conversa na lista durante a varredura: a rolagem da aba começa perto dela
+      const trigger = await this._sendToTab(tabId, { action: ACTIONS.EXPORT_CHAT_REQUEST, chat, captureId, queueIndex: index }, signal);
       if (!trigger?.success) {
         if (trigger?.cancelled && signal.aborted) throw new RunCancelledError();
         return failed(trigger?.error || 'erro desconhecido na página.', errorCodeOf(trigger));
@@ -946,7 +998,7 @@ export class ExtractionOrchestrator {
    * @returns {string}
    */
   _buildReport() {
-    const { queue, results, options, retry, startedAt } = this.run;
+    const { queue, results, options, retry, scan, startedAt } = this.run;
     const summary = this.getState().summary;
     const labels = {
       [RESULT_STATUS.SAVED]: 'OK',
@@ -968,12 +1020,16 @@ export class ExtractionOrchestrator {
       `Início: ${new Date(startedAt).toLocaleString('pt-BR')}`,
       `Geração do ZIP: ${new Date().toLocaleString('pt-BR')}`,
       // A varredura (chat-list-scanner.js) percorre só a lista principal e não abre "Arquivadas"
-      `Modo: ${options.downloadAll ? 'lista principal (arquivadas não incluídas)' : `limite de ${options.maxChats} conversa(s)`}`,
+      `Modo: ${options.downloadAll ? 'lista principal (arquivadas não incluídas)' : `limite de ${options.maxChats} conversa(s)`}`
+    ];
+    // Uma execução gravada por uma versão anterior da extensão não tem as estatísticas da varredura
+    if (scan) lines.push(this._describeScan(scan));
+    lines.push(
       'Conteúdo: somente texto; o WhatsApp Web exporta sem mídia, e os anexos aparecem como marcadores ' +
         `(${omittedMedia} anexo(s) omitido(s) nesta execução${partialNote}).`,
       `Conversas na fila: ${queue.length} | no ZIP: ${summary.saved} (vazias: ${summary.empty}) | ` +
         `na pasta Downloads: ${summary.savedToDisk} | não exportáveis: ${summary.notExportable} | falhas: ${summary.failed}`
-    ];
+    );
     if (unconfirmedRange) {
       lines.push(
         `Aviso: em ${unconfirmedRange} conversa(s) não foi possível confirmar a opção 'Todas as mensagens' no modal; ` +
@@ -1015,6 +1071,22 @@ export class ExtractionOrchestrator {
       }
     }
     return lines.join('\n') + '\n';
+  }
+
+  /**
+   * Linha da varredura no relatório: quantas conversas ela achou, por que parou e a data/hora exibida na
+   * última conversa da lista, que mostra se ela chegou mesmo ao fim
+   * @private
+   * @param {{ found: number, durationMs: number, stopReason: string, lastChatTimestamp: string|null }} scan
+   * @returns {string}
+   */
+  _describeScan({ found, durationMs, stopReason, lastChatTimestamp }) {
+    const duration = Number.isFinite(durationMs) ? ` em ${Math.round(durationMs / 1000)} s` : '';
+    const reason = SCAN_STOP_LABELS[stopReason] ?? `parou por um motivo desconhecido (${stopReason})`;
+    const lastChat = lastChatTimestamp
+      ? `data/hora exibida na última conversa: ${lastChatTimestamp}`
+      : 'a última conversa não tinha data/hora legível';
+    return `Varredura: ${found} conversa(s) encontrada(s)${duration}; ${reason}; ${lastChat}.`;
   }
 
   /**

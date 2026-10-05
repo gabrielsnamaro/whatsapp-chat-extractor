@@ -36,7 +36,9 @@ function urlPatternToRegExp(pattern) {
  * (deliverFile), ou falhar (resposta de falha ou exceção; um `code` em texto na exceção vai na
  * resposta, como no content real). `onFetchBlob` simula a leitura de um download interceptado pelo
  * chrome.downloads; sem ele, a leitura falha. `onResetSidebar` responde ao RESET_SIDEBAR (antes da
- * repescagem); sem ele, a lista volta ao normal com sucesso.
+ * repescagem); sem ele, a lista volta ao normal com sucesso. Na varredura, `onScan` roda antes da
+ * resposta (ex: para avisar o andamento, como o content real faz durante a rolagem), e `scanStats`, se
+ * definido, vai na resposta como as estatísticas da varredura; sem ele, a resposta não as traz.
  */
 function createFakeContent({ chats, ready }) {
   const content = {
@@ -48,6 +50,10 @@ function createFakeContent({ chats, ready }) {
     received: [],
     exportRequests: [],
     fetchRequests: [],
+    /** @type {null|{ steps: number, durationMs: number, stopReason: string, lastChatTimestamp: string|null }} */
+    scanStats: null,
+    /** @type {null|function(Object): (void|Promise<void>)} */
+    onScan: null,
     /** @type {null|function(Object): (Object|Promise<Object>)} */
     onExport: null,
     /** @type {null|function(Object): (Object|Promise<Object>)} */
@@ -62,8 +68,10 @@ function createFakeContent({ chats, ready }) {
           return { success: true, ready: content.ready, url: WHATSAPP_URL };
 
         case ACTIONS.SCAN_CHATS_REQUEST: {
+          if (content.onScan) await content.onScan(message);
           const found = structuredClone(content.chats);
-          return { success: true, chats: message.maxLimit ? found.slice(0, message.maxLimit) : found };
+          const chats = message.maxLimit ? found.slice(0, message.maxLimit) : found;
+          return content.scanStats ? { success: true, chats, stats: structuredClone(content.scanStats) } : { success: true, chats };
         }
 
         case ACTIONS.EXPORT_CHAT_REQUEST:

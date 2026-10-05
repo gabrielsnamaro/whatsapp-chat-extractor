@@ -62,6 +62,16 @@ test('durante a espera antes da repescagem, o detalhe mostra a mensagem de esper
   assert.equal(elements['progress-detail'].textContent, 'Aguardando 60 s antes da repescagem de 1 conversa(s).');
 });
 
+test('durante a varredura o rótulo mostra quantas conversas já foram encontradas', () => {
+  const { view, elements } = createView();
+  view.renderProgress({ state: WORKFLOW_STATES.SCANNING, current: 0, total: 0, percentage: 0, scanFound: 0 });
+  assert.equal(elements['progress-label'].textContent, 'Buscando lista de chats...');
+
+  view.renderProgress({ state: WORKFLOW_STATES.SCANNING, current: 0, total: 0, percentage: 0, scanFound: 137 });
+  assert.equal(elements['progress-label'].textContent, '137 conversa(s) encontrada(s)');
+  assert.equal(elements['progress-detail'].textContent, 'Descobrindo conversas...');
+});
+
 test('fora da repescagem o rótulo continua o da fila', () => {
   const { view, elements } = createView();
   view.renderProgress({ state: WORKFLOW_STATES.EXPORTING, current: 3, total: 5, percentage: 40, retry: null, currentChatTitle: 'Caio', summary: SUMMARY });
