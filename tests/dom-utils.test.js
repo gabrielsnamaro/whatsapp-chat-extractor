@@ -9,7 +9,7 @@ const context = vm.createContext({ window: {} });
 vm.runInContext(readFileSync(new URL('../content/dom/dom-utils.js', import.meta.url), 'utf8'), context);
 const {
   isTitleMatch, normalizeTitle, buildChatNotFoundMessage, estimateScrollStart, waitFor,
-  ERROR_CODES, LOCATE_FAILURES, DomAutomationError, OperationTimeoutError
+  ERROR_CODES, LOCATE_FAILURES, TIMEOUTS, DomAutomationError, OperationTimeoutError
 } = context.window.DomUtils;
 // Os erros são criados no contexto do vm, com o Error de lá
 const ContextError = vm.runInContext('Error', context);
@@ -71,6 +71,27 @@ test('mensagem "não encontrada" traz o motivo de cada tentativa, na ordem em qu
     `${base} (busca: sem resultado em 1.5 s; rolagem: lista lateral não encontrada).`
   );
   assert.equal(buildChatNotFoundMessage('Ana', []), `${base}.`);
+});
+
+test('mensagem "não encontrada" com a rolagem interrompida no teto de tempo ou no limite de passos', () => {
+  const base = 'Conversa "Ana" não foi encontrada na lista lateral (busca: sem resultado em 8 s; rolagem: ';
+  const searchFailure = { via: 'search', reason: LOCATE_FAILURES.SEARCH_NO_RESULT, timeoutMs: 8000 };
+  // No teto, os passos são os da rolagem inteira (as duas descidas somadas)
+  assert.equal(
+    buildChatNotFoundMessage('Ana', [
+      searchFailure,
+      { via: 'scroll', reason: LOCATE_FAILURES.SCROLL_TIME_LIMIT, timeoutMs: TIMEOUTS.OPEN_SCROLL_MS, steps: 95 }
+    ]),
+    `${base}interrompida no teto de 60 s, após 95 passo(s)).`
+  );
+  assert.equal(
+    buildChatNotFoundMessage('Ana', [searchFailure, { via: 'scroll', reason: LOCATE_FAILURES.SCROLL_STEP_LIMIT, steps: 236 }]),
+    `${base}interrompida no limite de 236 passo(s), proporcional ao tamanho da lista).`
+  );
+  // Os motivos vão no diagnóstico da abertura, e o background os traduz pelo texto no _execucao.log
+  assert.equal(LOCATE_FAILURES.SCROLL_TIME_LIMIT, 'scroll-time-limit');
+  assert.equal(LOCATE_FAILURES.SCROLL_STEP_LIMIT, 'scroll-step-limit');
+  assert.equal(TIMEOUTS.OPEN_SCROLL_MS, 60000);
 });
 
 test('rolagem de abertura começa uma tela acima da linha estimada, nunca antes do topo', () => {

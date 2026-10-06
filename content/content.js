@@ -172,8 +172,11 @@
             }
 
             const operation = beginOperation();
+            /** Diagnóstico da busca e da rolagem da abertura (ChatNavigator.openChat), quando elas rodaram */
+            let openDiagnostics = null;
             try {
-              const { via } = await chatNavigator.openChat(chat, { signal: operation.signal, queueIndex });
+              const opened = await chatNavigator.openChat(chat, { signal: operation.signal, queueIndex });
+              openDiagnostics = opened.diagnostics;
               await optionsMenu.triggerExportOption({ signal: operation.signal });
               // A captura só é armada imediatamente antes do clique em "Exportar" (o link de download só
               // existe depois dele): até lá, um arquivo atrasado da conversa anterior não é tomado como desta
@@ -182,9 +185,12 @@
                 onBeforeConfirm: () => armCaptureBeforeConfirm(captureId)
               });
               const warnings = allMessagesConfirmed ? [] : [DATE_RANGE_UNCONFIRMED_WARNING];
-              sendResponse({ success: true, triggered: true, via, warnings });
+              sendResponse({ success: true, triggered: true, via: opened.via, warnings, ...(openDiagnostics ? { openDiagnostics } : {}) });
             } catch (err) {
               if (armedCaptureId === captureId) armedCaptureId = null;
+              // Uma falha no menu ou no modal também leva à resposta o diagnóstico da abertura que a precedeu;
+              // uma falha na abertura já o traz (openChat)
+              if (openDiagnostics && !err.openDiagnostics) err.openDiagnostics = openDiagnostics;
               throw err;
             } finally {
               endOperation(operation);
@@ -235,7 +241,9 @@
         if (!cancelled) console.error('[WhatsApp Web Extractor] Erro no mediator do content script:', err);
         // DOMException traz um `code` numérico legado; só os códigos em texto são da extensão (DomUtils.ERROR_CODES)
         const code = typeof err.code === 'string' ? err.code : null;
-        sendResponse({ success: false, cancelled, error: err.message, code });
+        // Na exportação, o diagnóstico da abertura vai junto do erro, para o _execucao.log
+        const openDiagnostics = err.openDiagnostics ?? null;
+        sendResponse({ success: false, cancelled, error: err.message, code, ...(openDiagnostics ? { openDiagnostics } : {}) });
       }
     })();
 

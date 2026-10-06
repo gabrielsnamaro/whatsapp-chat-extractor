@@ -2495,6 +2495,95 @@ test('_execucao.log de execução gravada por uma versão anterior, sem históri
   ], executionLog);
 });
 
+/** Linha de uma tentativa no log sem o horário, e com a duração (o 3º campo) trocada por <duração> */
+function withoutClockAndDuration(line) {
+  return line.replace(new RegExp(`^${CLOCK} `), '').replace(new RegExp(` \\| ${DURATION} \\| `), ' | <duração> | ');
+}
+
+test('_execucao.log: diagnóstico da abertura pela busca e pela rolagem no fim da linha da tentativa, guardado no histórico só quando a aba o manda', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const { fake, archive } = setUp({ chats: sidebarChats(['Ana', 'Bia', 'Caio']) });
+  const orch = createOrchestrator();
+  const menuTimeout = 'Timeout de 15s aguardando o menu de opções da conversa.';
+  const deliver = deliveringExport(orch, { failures: { Caio: { error: menuTimeout, code: 'TIMEOUT' } } });
+  // Como o content real: Bia abre pela busca; Caio, pela rolagem depois de a busca não achar, e falha no
+  // menu, e a falha traz o diagnóstico da abertura que a precedeu. Um campo que o orquestrador não conhece não é guardado
+  const searchDiagnostics = { searchMs: 1234, searchCellsSeen: 3, searchExited: true };
+  const scrollDiagnostics = {
+    searchMs: 8000, searchCellsSeen: 0, searchExited: false, scrollSteps: 12, scrollMs: 4321, scrollHeightGrew: true, scrollStopReason: 'found'
+  };
+  fake.content.onExport = (message) => {
+    const response = deliver(message);
+    if (message.chat.title === 'Bia') return { ...response, via: 'search', openDiagnostics: { ...searchDiagnostics, campoDeUmaVersaoFutura: 1 } };
+    if (message.chat.title === 'Caio') return { ...response, openDiagnostics: scrollDiagnostics };
+    return response;
+  };
+
+  await orch.start({ safeDelayMs: 0, retryCooldownMs: 0 });
+
+  assert.equal(orch.getState().state, WORKFLOW_STATES.COMPLETED);
+  const { results } = orch.run;
+  // Só as tentativas cuja resposta trouxe o diagnóstico o guardam; Caio falha igual na repescagem
+  assert.deepEqual(results.map((r) => r.history.map((entry) => entry.openDiagnostics ?? null)), [
+    [null],
+    [searchDiagnostics],
+    [scrollDiagnostics, scrollDiagnostics]
+  ]);
+  assert.equal('openDiagnostics' in results[0].history[0], false);
+  assert.deepEqual(persistedRun(fake.snapshotStorage()).results.map((r) => r.history), results.map((r) => r.history));
+
+  // Os campos de antes ficam na mesma posição; o diagnóstico vem depois do motivo
+  const events = archive.calls[0].executionLog.split('\n').slice(5, -1);
+  const caioDiagnostics = 'busca: 8 s, 0 célula(s) de conversa no painel, saída não confirmada | ' +
+    'rolagem: 12 passo(s) em 4.3 s, lista cresceu: sim, parou: achou a conversa';
+  assert.deepEqual(events.map(withoutClockAndDuration), [
+    'nº 1 "Ana" | tentativa 1 | <duração> | abertura: lista visível | OK',
+    'nº 2 "Bia" | tentativa 1 | <duração> | abertura: busca | OK | busca: 1.2 s, 3 célula(s) de conversa no painel, saída confirmada',
+    `nº 3 "Caio" | tentativa 1 | <duração> | abertura: não informada | FALHA (TIMEOUT) | motivo: ${menuTimeout} | ${caioDiagnostics}`,
+    'Repescagem: rodada prevista para este horário (fim da espera; uma pausa a adia), com 1 conversa(s) que falharam na fila.',
+    `nº 3 "Caio" | tentativa 2 | <duração> | abertura: não informada | FALHA (TIMEOUT) | motivo: ${menuTimeout} | ${caioDiagnostics}`
+  ]);
+});
+
+test('rolagem de abertura interrompida no teto: a conversa falha com CHAT_NOT_FOUND, entra na repescagem e o log mostra o diagnóstico das duas tentativas', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const { fake, archive } = setUp({ chats: sidebarChats(['Ana', 'Bia', 'Caio']) });
+  const orch = createOrchestrator();
+  // Como o content real quando a rolagem estoura o teto de tempo: a mensagem diz o teto, e o diagnóstico vem com a falha
+  const cappedError = 'Conversa "Bia" não foi encontrada na lista lateral (busca: sem resultado em 8 s; ' +
+    'rolagem: interrompida no teto de 60 s, após 95 passo(s)).';
+  const capped = {
+    searchMs: 8000, searchCellsSeen: 0, searchExited: true, scrollSteps: 95, scrollMs: 60012, scrollHeightGrew: true, scrollStopReason: 'scroll-time-limit'
+  };
+  const recovered = { searchMs: 600, searchCellsSeen: 1, searchExited: true };
+  const deliver = deliveringExport(orch);
+  fake.content.onExport = (message) => {
+    if (message.chat.title !== 'Bia') return deliver(message);
+    if (!isRetryAttempt(message)) return { success: false, cancelled: false, error: cappedError, code: 'CHAT_NOT_FOUND', openDiagnostics: capped };
+    return { ...deliver(message), via: 'search', openDiagnostics: recovered };
+  };
+
+  await orch.start({ safeDelayMs: 0, retryCooldownMs: 0 });
+
+  const state = orch.getState();
+  assert.equal(state.state, WORKFLOW_STATES.COMPLETED);
+  assert.deepEqual(state.summary, { saved: 3, empty: 0, savedToDisk: 0, notExportable: 0, failed: 0 });
+  // CHAT_NOT_FOUND entra na repescagem, e lá a busca acha a conversa
+  assert.deepEqual(orch.run.retry.indices, [1]);
+  assert.deepEqual(fake.content.exportRequests.map((m) => m.chat.title), ['Ana', 'Bia', 'Caio', 'Bia']);
+  assert.deepEqual(withoutAttemptTimes(orch.run.results[1]).history, [
+    { ...attemptRecord({ attempt: 1, status: 'failed', code: 'CHAT_NOT_FOUND', reason: cappedError }), openDiagnostics: capped },
+    { ...attemptRecord({ attempt: 2, status: 'saved', via: 'search' }), openDiagnostics: recovered }
+  ]);
+
+  const { report, executionLog } = archive.calls[0];
+  assert.equal(report.split('\n')[6], retryHeader(1, 1));
+  const bia = executionLog.split('\n').filter((line) => line.includes(' nº 2 "Bia" ')).map(withoutClockAndDuration);
+  assert.deepEqual(bia, [
+    `nº 2 "Bia" | tentativa 1 | <duração> | abertura: não informada | FALHA (CHAT_NOT_FOUND) | motivo: ${cappedError} | ` +
+      'busca: 8 s, 0 célula(s) de conversa no painel, saída confirmada | rolagem: 95 passo(s) em 60 s, lista cresceu: sim, parou: teto de tempo',
+    'nº 2 "Bia" | tentativa 2 | <duração> | abertura: busca | OK | busca: 0.6 s, 1 célula(s) de conversa no painel, saída confirmada'
+  ]);
+});
+
 // Índice da execução (_indice.csv): as linhas que o orquestrador monta; o CSV é testado no packager
 
 test('linhas do _indice.csv: uma por conversa da fila, também as fora do ZIP, com a chave do staging só nas que têm arquivo nele', { timeout: TEST_TIMEOUT_MS }, async () => {

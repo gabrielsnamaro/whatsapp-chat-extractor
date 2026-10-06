@@ -19,6 +19,9 @@
     MAIN_CHAT: '#main',
 
     // Lista lateral de conversas (#pane-side)
+    // A grade da lista normal, nos snapshots da kb/ (com e sem conversa aberta, menu e modal). Os
+    // snapshots não têm a tela de resultados da busca; a saída da busca espera esta grade voltar
+    CHAT_LIST_GRID: '#pane-side [data-testid="chat-list"] [role="grid"][aria-label="Lista de conversas"]',
     CHAT_ROW: '[role="row"]',
     CHAT_CELL: '[role="row"] [data-testid="cell-frame-container"]',
     ARCHIVED_BUTTON: '[data-testid="chatlist-panel-archived-button"]',
@@ -65,6 +68,11 @@
     // O modal já abriu: o botão "Exportar" faz parte dele e só demora o tempo de renderizar
     MODAL_CONFIRM_BUTTON_MS: 3000,
     SEARCH_RESULTS_MS: 8000,
+    // Teto da rolagem de abertura inteira (as duas descidas somadas). Uma descida pela lista inteira de
+    // ~500 conversas leva ~40 s; sem teto, uma rolagem que não chegava ao fim levou 36 min em 06/10/2026
+    OPEN_SCROLL_MS: 60000,
+    // Curto: sair da busca só devolve a lista que já existe, e sem confirmação a abertura segue mesmo assim
+    SEARCH_EXIT_MS: 3000,
     MODAL_CLOSE_MS: 5000
   });
 
@@ -86,7 +94,9 @@
     SEARCH_NO_RESULT: 'search-no-result',
     LIST_MISSING: 'list-missing',
     END_OF_LIST: 'end-of-list',
-    SCROLL_STALLED: 'scroll-stalled'
+    SCROLL_STALLED: 'scroll-stalled',
+    SCROLL_TIME_LIMIT: 'scroll-time-limit',
+    SCROLL_STEP_LIMIT: 'scroll-step-limit'
   });
 
   const LOCATE_VIA_LABELS = Object.freeze({ search: 'busca', scroll: 'rolagem' });
@@ -123,7 +133,9 @@
   }
 
   /**
-   * @param {{ via: string, reason: string, timeoutMs?: number, steps?: number }} attempt
+   * @param {{ via: string, reason: string, timeoutMs?: number, steps?: number }} attempt `timeoutMs` é o prazo
+   *   da busca ou o teto da rolagem; `steps`, os passos da descida a partir do topo ou, nos tetos, os da
+   *   rolagem inteira
    * @returns {string}
    */
   function describeFailedAttempt({ via, reason, timeoutMs, steps }) {
@@ -141,6 +153,10 @@
         return `${label}: ${steps} passo(s) até o fim da lista`;
       case LOCATE_FAILURES.SCROLL_STALLED:
         return `${label}: parou após ${steps} passo(s), antes do fim da lista`;
+      case LOCATE_FAILURES.SCROLL_TIME_LIMIT:
+        return `${label}: interrompida no teto de ${formatSeconds(timeoutMs)}, após ${steps} passo(s)`;
+      case LOCATE_FAILURES.SCROLL_STEP_LIMIT:
+        return `${label}: interrompida no limite de ${steps} passo(s), proporcional ao tamanho da lista`;
       default:
         throw new Error(`Motivo de tentativa desconhecido: ${reason}`);
     }
@@ -264,9 +280,11 @@
     element.click();
   }
 
-  function pressEscape() {
+  /**
+   * @param {Element} [target] Quem recebe a tecla; sem ele, o elemento com o foco
+   */
+  function pressEscape(target = document.activeElement || document.body) {
     const init = { key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true };
-    const target = document.activeElement || document.body;
     target.dispatchEvent(new KeyboardEvent('keydown', init));
     target.dispatchEvent(new KeyboardEvent('keyup', init));
   }

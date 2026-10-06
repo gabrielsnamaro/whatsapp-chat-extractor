@@ -58,6 +58,23 @@ const VIA_LABELS = Object.freeze({
   scroll: 'rolagem da lista'
 });
 
+// Campos do diagnóstico da abertura que o content devolve quando a busca ou a rolagem rodaram
+// (OpenDiagnostics em content/dom/chat-navigator.js); só eles vão para o histórico da tentativa
+const OPEN_DIAGNOSTIC_KEYS = Object.freeze([
+  'searchMs', 'searchCellsSeen', 'searchExited', 'scrollSteps', 'scrollMs', 'scrollHeightGrew', 'scrollStopReason'
+]);
+
+// Por que a rolagem de abertura parou, pelo `scrollStopReason` do diagnóstico ('found' e os LOCATE_FAILURES
+// da rolagem em content/dom/dom-utils.js; content script clássico não é importável aqui)
+const OPEN_SCROLL_STOP_LABELS = Object.freeze({
+  found: 'achou a conversa',
+  'end-of-list': 'fim da lista',
+  'scroll-stalled': 'rolagem travada antes do fim da lista',
+  'scroll-time-limit': 'teto de tempo',
+  'scroll-step-limit': 'limite de passos',
+  'list-missing': 'lista lateral não encontrada'
+});
+
 // Horário no log de uma tentativa registrada por uma versão anterior da extensão, que não o guardava
 const UNTIMED_CLOCK = '--:--:--';
 
@@ -167,6 +184,43 @@ function describeCheckDivergence({ missingKeys, unreadable, unexpected, crcMisma
 }
 
 /**
+ * Diagnóstico da abertura que a aba devolveu, só com os campos conhecidos que vieram preenchidos: é
+ * persistido com o histórico de cada tentativa, e só as aberturas pela busca ou pela rolagem o têm
+ * @param {unknown} raw `openDiagnostics` da resposta ao EXPORT_CHAT_REQUEST
+ * @returns {Object|null} null quando a aba não mandou nenhum campo conhecido
+ */
+function compactOpenDiagnostics(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const entries = OPEN_DIAGNOSTIC_KEYS.filter((key) => raw[key] != null).map((key) => [key, raw[key]]);
+  return entries.length ? Object.fromEntries(entries) : null;
+}
+
+/**
+ * Trechos da linha de uma tentativa no log da execução com o diagnóstico da abertura: a busca (células
+ * na lista quando ela achou a conversa ou esgotou o prazo, tempo e se a saída dela foi confirmada) e a
+ * rolagem (passos, tempo, se a lista cresceu e por que parou)
+ * @param {Object} diagnostics Diagnóstico compacto (compactOpenDiagnostics)
+ * @returns {string[]}
+ */
+function describeOpenDiagnostics(diagnostics) {
+  const { searchMs, searchCellsSeen, searchExited, scrollSteps, scrollMs, scrollHeightGrew, scrollStopReason } = diagnostics;
+  const parts = [];
+  if (searchMs != null) {
+    const exit = searchExited == null ? '' : `, saída ${searchExited ? 'confirmada' : 'não confirmada'}`;
+    // Conta as células de conversa no painel lateral ao fim da busca: sem um snapshot da tela de busca, não dá
+    // para separar resultado da busca de linha da lista normal que tenha ficado na tela
+    parts.push(`busca: ${formatSeconds(searchMs)}, ${searchCellsSeen} célula(s) de conversa no painel${exit}`);
+  }
+  if (scrollSteps != null) {
+    const stop = OPEN_SCROLL_STOP_LABELS[scrollStopReason] ?? `motivo desconhecido (${scrollStopReason})`;
+    parts.push(
+      `rolagem: ${scrollSteps} passo(s) em ${formatSeconds(scrollMs)}, lista cresceu: ${scrollHeightGrew ? 'sim' : 'não'}, parou: ${stop}`
+    );
+  }
+  return parts;
+}
+
+/**
  * Código de erro de uma resposta da aba ou de uma exceção. DOMException (ex: do IndexedDB) traz um
  * `code` numérico legado, que não é um código desta extensão.
  * @param {{ code?: unknown }|null|undefined} source
@@ -187,6 +241,8 @@ function errorCodeOf(source) {
  * @property {string|null} reason Texto do erro, sem o título da conversa; null quando a tentativa recebeu o arquivo
  * @property {boolean} quarantined O prazo de espera do arquivo esgotou e a tentativa passou pela quarentena
  * @property {boolean} late O arquivo chegou na quarentena
+ * @property {Object} [openDiagnostics] Diagnóstico da busca e da rolagem da abertura (compactOpenDiagnostics),
+ *   só quando a aba o mandou: ausente nas aberturas pela lista visível e nas tentativas de uma versão anterior
  */
 
 /**
@@ -1076,8 +1132,9 @@ export class ExtractionOrchestrator {
    * a exportação); `staged` diz se o arquivo foi
    * gravado no staging; `late` diz se ele só chegou na quarentena. Uma conversa salva traz também o
    * resultado da inspeção do texto (`empty`, contagens e datas, null se o conteúdo não foi inspecionado,
-   * com o motivo em `inspectionError`). `history` traz só esta tentativa, com o início, a duração e se ela
-   * passou pela quarentena; a repescagem a junta à da fila.
+   * com o motivo em `inspectionError`). `history` traz só esta tentativa, com o início, a duração, se ela
+   * passou pela quarentena e, quando a aba o mandou, o diagnóstico da busca e da rolagem da abertura; a
+   * repescagem a junta à da fila.
    * @private
    * @param {{ title: string, duplicateTitle: boolean }} chat
    * @param {number} index Posição na fila
@@ -1095,6 +1152,7 @@ export class ExtractionOrchestrator {
     let warnings = [];
     let late = false;
     let quarantined = false;
+    let openDiagnostics = null;
     const withHistory = (result, reason = null) => ({
       ...result,
       history: [{
@@ -1106,7 +1164,8 @@ export class ExtractionOrchestrator {
         via: result.via,
         reason,
         quarantined,
-        late: result.late
+        late: result.late,
+        ...(openDiagnostics ? { openDiagnostics } : {})
       }]
     });
     const failed = (message, code) => withHistory({
@@ -1127,6 +1186,8 @@ export class ExtractionOrchestrator {
     try {
       // A posição na fila é a da conversa na lista durante a varredura: a rolagem da aba começa perto dela
       const trigger = await this._sendToTab(tabId, { action: ACTIONS.EXPORT_CHAT_REQUEST, chat, captureId, queueIndex: index }, signal);
+      // Vem também na falha: uma conversa não encontrada diz no log como foram a busca e a rolagem
+      openDiagnostics = compactOpenDiagnostics(trigger?.openDiagnostics);
       if (!trigger?.success) {
         if (trigger?.cancelled && signal.aborted) throw new RunCancelledError();
         return failed(trigger?.error || 'erro desconhecido na página.', errorCodeOf(trigger));
@@ -1451,6 +1512,8 @@ export class ExtractionOrchestrator {
       parts.push(`quarentena: ${entry.late ? 'o arquivo chegou nela, atrasado' : 'o arquivo não foi recebido nela'}`);
     }
     if (entry.reason) parts.push(`motivo: ${entry.reason}`);
+    // No fim da linha, para os campos de antes ficarem na mesma posição em todas as tentativas
+    if (entry.openDiagnostics) parts.push(...describeOpenDiagnostics(entry.openDiagnostics));
     return parts.join(' | ');
   }
 
