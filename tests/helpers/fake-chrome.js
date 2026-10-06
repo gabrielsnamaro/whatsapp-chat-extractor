@@ -117,7 +117,8 @@ function createFakeContent({ chats, ready }) {
 /**
  * API chrome falsa. Os métodos assíncronos no Chrome devolvem Promise, porque o background encadeia
  * .then/.catch em chamadas "dispara e esquece"; getManifest, getURL e add/removeListener são síncronos, como no Chrome. O storage clona no set e no get: o orquestrador grava
- * `...this.run` vivo, e guardar a referência faria o snapshot mudar junto com a execução.
+ * objetos vivos da execução (a fila, os resultados), e guardar a referência faria o snapshot mudar junto com ela.
+ * Cada `set` e `remove` fica registrado em `storageOps`, na ordem, para os testes contarem as gravações.
  * @param {Object} [options]
  * @param {Array<{ id: string, title: string, duplicateTitle?: boolean }>} [options.chats]
  * @param {boolean} [options.ready=true] Resposta do CHECK_PAGE_READY
@@ -130,6 +131,8 @@ export function createFakeChrome({ chats = [], ready = true, storage = {} } = {}
   const runtimeMessages = [];
   const injections = [];
   const downloadCalls = [];
+  /** @type {Array<{ method: 'set', items: Object }|{ method: 'remove', keys: string[] }>} */
+  const storageOps = [];
 
   const keysOf = (keys) => {
     if (keys == null) return [...store.keys()];
@@ -166,9 +169,11 @@ export function createFakeChrome({ chats = [], ready = true, storage = {} } = {}
           return result;
         },
         set: async (items) => {
+          storageOps.push({ method: 'set', items: structuredClone(items) });
           for (const [key, value] of Object.entries(items)) store.set(key, structuredClone(value));
         },
         remove: async (keys) => {
+          storageOps.push({ method: 'remove', keys: [...keysOf(keys)] });
           for (const key of keysOf(keys)) store.delete(key);
         },
         clear: async () => { store.clear(); }
@@ -223,6 +228,10 @@ export function createFakeChrome({ chats = [], ready = true, storage = {} } = {}
     snapshotStorage: () => structuredClone(Object.fromEntries(store)),
     /** Valor gravado numa chave, clonado */
     readStorage: (key) => structuredClone(store.get(key)),
+    /** Chaves do chrome.storage.local agora, em ordem alfabética */
+    storageKeys: () => [...store.keys()].sort(),
+    /** Chamadas a set e remove do chrome.storage.local, na ordem (com cópia do que cada set gravou) */
+    storageOps,
     /** Mensagens WORKFLOW_PROGRESS_UPDATE enviadas ao popup */
     progressUpdates: () => runtimeMessages.filter((m) => m.action === ACTIONS.WORKFLOW_PROGRESS_UPDATE),
     /** Ações recebidas pela aba, na ordem */

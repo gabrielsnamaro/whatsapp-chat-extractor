@@ -13,6 +13,10 @@ import { ArchiveDownloader } from './archive-downloader.js';
 const log = new Logger('ExtractionOrchestrator');
 
 const RUN_STORAGE_KEY = 'extractionRun';
+// A fila e o resultado de cada conversa ficam em chaves próprias, fora do estado: o estado é gravado a cada
+// conversa, e com eles dentro cada gravação regravaria a execução inteira (centenas de KB numa fila de 500)
+const RUN_QUEUE_STORAGE_KEY = `${RUN_STORAGE_KEY}:queue`;
+const RUN_RESULT_STORAGE_KEY_PREFIX = `${RUN_STORAGE_KEY}:result:`;
 // Conversas grandes com mídia levam minutos para o WhatsApp gerar o arquivo
 const CAPTURE_TIMEOUT_MS = 10 * 60 * 1000;
 // Espera extra depois do prazo esgotado, com as duas fontes ainda armadas. O prazo já conta da última
@@ -139,6 +143,15 @@ function stagingKeyOf(index) {
 }
 
 /**
+ * Chave do resultado de uma conversa no chrome.storage.local, com a chave dela no staging
+ * @param {number} index Posição na fila
+ * @returns {string}
+ */
+function resultStorageKeyOf(index) {
+  return `${RUN_RESULT_STORAGE_KEY_PREFIX}${stagingKeyOf(index)}`;
+}
+
+/**
  * Aviso para o popup quando o ZIP montado não confere com as conversas esperadas nele
  * @param {import('../shared/archive/archive-packager.js').ArchiveCheck} check
  * @returns {string|null} null quando confere
@@ -224,6 +237,9 @@ function historyOf(result) {
  *
  * O estado da execução é persistido a cada conversa: o Chrome pode encerrar o service
  * worker no meio de execuções longas, e a execução volta como pausada para ser retomada.
+ * No chrome.storage.local, o estado fica em `extractionRun`, sem a fila e os resultados; a fila, em
+ * `extractionRun:queue`, gravada uma vez depois da varredura; e o resultado de cada conversa, em
+ * `extractionRun:result:<chave do staging>` (_persistRun).
  */
 export class ExtractionOrchestrator {
   /**
@@ -250,6 +266,10 @@ export class ExtractionOrchestrator {
      * @type {{ runId: string, tabId: number|null, options: Object, queue: Array, nextIndex: number, results: Array, unexpectedFiles: Array, retry: { indices: number[], cursor: number, startsAt: string }|null, scan: { found: number, steps: number, durationMs: number, stopReason: string, lastChatTimestamp: string|null }|null, startedAt: string }|null}
      */
     this.run = null;
+    /** A fila ainda não foi para o storage; vai na próxima gravação do estado (_persistRun) */
+    this._queueUnsaved = false;
+    /** @type {Set<number>} Posições na fila cujo resultado ainda não foi para o storage; vão na próxima gravação do estado */
+    this._unsavedResults = new Set();
 
     this.captures = new ExportCaptureRegistry();
     this.interceptor = new DownloadInterceptor({
@@ -278,10 +298,22 @@ export class ExtractionOrchestrator {
    * Reidrata a execução persistida após o service worker ser reiniciado
    */
   async restore() {
-    const saved = await StorageClient.get(RUN_STORAGE_KEY, null);
+    const stored = await StorageClient.get([RUN_STORAGE_KEY, RUN_QUEUE_STORAGE_KEY], {});
+    const saved = stored[RUN_STORAGE_KEY];
     if (!saved) return;
 
     const { state, errorMessage, statusMessage, currentIndex, currentChatTitle, ...run } = saved;
+    if (Array.isArray(run.queue)) {
+      // Gravada por uma versão anterior da extensão, com a fila e os resultados dentro do estado: a próxima
+      // gravação os passa para as chaves próprias, no mesmo `set` do estado
+      this._queueUnsaved = true;
+      run.results.forEach((result, index) => {
+        if (result) this._unsavedResults.add(index);
+      });
+    } else {
+      run.queue = run.queueRunId === run.runId ? (stored[RUN_QUEUE_STORAGE_KEY] ?? []) : [];
+      run.results = await this._readResults(run.nextIndex);
+    }
     this.run = run;
     this.currentIndex = currentIndex || 0;
     this.currentChatTitle = currentChatTitle || '';
@@ -310,6 +342,24 @@ export class ExtractionOrchestrator {
       ? (statusMessage || 'Extração pausada.')
       : 'A extração foi interrompida pelo navegador. Clique em "Retomar" para continuar de onde parou.';
     log.info(`Execução ${run.runId} restaurada como pausada (${run.nextIndex}/${run.queue.length}).`);
+  }
+
+  /**
+   * Resultados gravados nas chaves próprias, só das conversas já processadas: uma chave que tenha sobrado
+   * de outra execução (numa remoção que falhou ao iniciar esta) numa posição ainda não alcançada não entra
+   * @private
+   * @param {number} processed Conversas já processadas (`nextIndex`)
+   * @returns {Promise<Array<Object>>} Como o da execução em memória: sem a posição de uma chave ausente
+   */
+  async _readResults(processed) {
+    const keys = Array.from({ length: processed }, (_, index) => resultStorageKeyOf(index));
+    if (!keys.length) return [];
+    const stored = await StorageClient.get(keys, {});
+    const results = [];
+    keys.forEach((key, index) => {
+      if (stored[key] !== undefined) results[index] = stored[key];
+    });
+    return results;
   }
 
   /**
@@ -398,19 +448,74 @@ export class ExtractionOrchestrator {
    */
   _notifyProgress(extra = {}) {
     this._sendProgressToPopup(extra);
+    if (this.run) this._persistRun();
+  }
 
-    if (this.run) {
-      StorageClient.set({
-        [RUN_STORAGE_KEY]: {
-          ...this.run,
-          state: this.state,
-          errorMessage: this.errorMessage,
-          statusMessage: this.statusMessage,
-          currentIndex: this.currentIndex,
-          currentChatTitle: this.currentChatTitle
-        }
-      });
-    }
+  /**
+   * Grava o estado da execução, sem a fila e os resultados, e no mesmo `set` o que deles ainda não foi para
+   * o storage: a fila, depois da varredura, e o resultado de cada conversa, junto do estado com o novo
+   * `nextIndex` (ou `retry.cursor`, na repescagem). Um `set` só porque um reinício entre duas gravações
+   * deixaria o estado apontando para depois de uma conversa sem o resultado dela.
+   * @private
+   */
+  _persistRun() {
+    const { run } = this;
+    // Marca no estado de qual execução é a fila gravada: se a limpeza da anterior falhar, a fila velha
+    // continua no storage, e um reinício durante a varredura nova não pode retomá-la
+    if (this._queueUnsaved) run.queueRunId = run.runId;
+    const { queue, results, ...rest } = run;
+    const items = {
+      [RUN_STORAGE_KEY]: {
+        ...rest,
+        state: this.state,
+        errorMessage: this.errorMessage,
+        statusMessage: this.statusMessage,
+        currentIndex: this.currentIndex,
+        currentChatTitle: this.currentChatTitle
+      }
+    };
+    const queueIncluded = this._queueUnsaved;
+    const resultsIncluded = [...this._unsavedResults];
+    if (queueIncluded) items[RUN_QUEUE_STORAGE_KEY] = queue;
+    for (const index of resultsIncluded) items[resultStorageKeyOf(index)] = results[index];
+    this._queueUnsaved = false;
+    this._unsavedResults.clear();
+
+    StorageClient.set(items).then((saved) => {
+      // A falha já foi registrada pelo StorageClient. As gravações seguintes só levam o estado, e sem isto a
+      // fila ou o resultado ficariam fora do storage de vez
+      if (saved || this.run !== run) return;
+      if (queueIncluded) this._queueUnsaved = true;
+      resultsIncluded.forEach((index) => this._unsavedResults.add(index));
+    });
+  }
+
+  /**
+   * Guarda o resultado de uma conversa. Ele vai para o storage na próxima gravação do estado, que é a do
+   * aviso do resultado (_notifyResult), depois de avançar `nextIndex` ou `retry.cursor`.
+   * @private
+   * @param {number} index Posição na fila
+   * @param {Object} result
+   */
+  _setResult(index, result) {
+    this.run.results[index] = result;
+    this._unsavedResults.add(index);
+  }
+
+  /**
+   * Apaga do storage a execução anterior inteira (estado, fila e resultados) antes da primeira gravação da
+   * nova. A nova só regrava as chaves de resultado das posições que alcança: sem isto, uma fila menor
+   * deixaria para trás os resultados das últimas posições da anterior. As chaves dos resultados saem do
+   * tamanho da fila anterior.
+   * @private
+   */
+  async _removePreviousRun() {
+    const stored = await StorageClient.get([RUN_STORAGE_KEY, RUN_QUEUE_STORAGE_KEY], {});
+    const previous = stored[RUN_STORAGE_KEY];
+    // Uma execução gravada por uma versão anterior da extensão tem a fila dentro do estado
+    const previousQueue = Array.isArray(previous?.queue) ? previous.queue : stored[RUN_QUEUE_STORAGE_KEY];
+    const resultKeys = Array.from({ length: previousQueue?.length ?? 0 }, (_, index) => resultStorageKeyOf(index));
+    await StorageClient.remove([RUN_STORAGE_KEY, RUN_QUEUE_STORAGE_KEY, ...resultKeys]);
   }
 
   /**
@@ -604,8 +709,11 @@ export class ExtractionOrchestrator {
       scan: null,
       startedAt: new Date().toISOString()
     };
+    this._queueUnsaved = false;
+    this._unsavedResults = new Set();
 
     return this._execute(async (signal) => {
+      await this._removePreviousRun();
       await StagingRepository.clear();
       const tab = await this._prepareTab();
       this.run.tabId = tab.id;
@@ -774,6 +882,7 @@ export class ExtractionOrchestrator {
 
     const chats = limit ? response.chats.slice(0, limit) : response.chats;
     this.run.queue = chats.map(({ id, title, duplicateTitle }) => ({ id, title, duplicateTitle: Boolean(duplicateTitle) }));
+    this._queueUnsaved = true;
     this.scanFound = response.chats.length;
     const { stats } = response;
     this.run.scan = stats ? {
@@ -816,7 +925,7 @@ export class ExtractionOrchestrator {
       log.info(`[${index + 1}/${queue.length}] Exportando conversa "${chat.title}"...`);
 
       const result = await this._exportChat(chat, index, signal);
-      this.run.results[index] = { ...result, attempts: 1 };
+      this._setResult(index, { ...result, attempts: 1 });
       this.run.nextIndex = index + 1;
       this._notifyResult(`[${index + 1}/${queue.length}]`, this.run.results[index]);
 
@@ -892,12 +1001,12 @@ export class ExtractionOrchestrator {
       // Fica o resultado da repescagem, sucesso ou falha: a 1ª tentativa falhou sem deixar arquivo no
       // staging. O código dela fica para o relatório reconstituir a ordem real das tentativas, e o
       // histórico guarda as duas para o log da execução
-      this.run.results[index] = {
+      this._setResult(index, {
         ...result,
         attempts: 2,
         firstAttemptCode,
         history: [...(previous ? historyOf(previous) : []), ...result.history]
-      };
+      });
       retry.cursor++;
       this._notifyResult(`[Repescagem ${position}]`, this.run.results[index]);
 
@@ -926,7 +1035,8 @@ export class ExtractionOrchestrator {
 
     const reason = response?.error || 'a aba não respondeu.';
     log.warn(`Lista lateral não devolvida ao normal antes da repescagem: ${reason}`);
-    this._notifyProgress({
+    // Só o popup: o aviso não muda o estado da execução
+    this._sendProgressToPopup({
       warningMessage: `⚠️ Repescagem: a lista lateral não voltou ao normal, e as conversas são tentadas mesmo assim. Motivo: ${reason}`
     });
   }
@@ -1025,7 +1135,9 @@ export class ExtractionOrchestrator {
       warnings = Array.isArray(trigger.warnings) ? trigger.warnings : [];
 
       this._setPhase(WORKFLOW_STATES.WAITING_DOWNLOAD);
-      this._notifyProgress();
+      // Só o popup: o estado vai para o storage com o resultado da conversa, e a retomada depois de um
+      // reinício exporta a conversa de novo, esteja ela esperando o arquivo ou não
+      this._sendProgressToPopup();
       let captured;
       try {
         captured = await this.captures.waitFor(captureId, { timeoutMs: this.timings.captureTimeoutMs, signal });
