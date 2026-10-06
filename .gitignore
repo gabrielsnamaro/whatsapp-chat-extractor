@@ -21,3 +21,5 @@ build/
 
 kb
 kb/
+# Planos de implementação (PLANO_*.md) ficam fora do git
+PLANO*.md
