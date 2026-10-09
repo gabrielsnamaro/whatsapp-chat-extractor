@@ -1,9 +1,13 @@
 import { WORKFLOW_STATES } from '../../shared/constants/workflow-states.js';
 import { StorageClient } from '../../shared/clients/storage-client.js';
+import { phoneFromTitle } from '../../shared/utils/phone.js';
 
 const DEFAULT_SAFE_DELAY_SECONDS = 2;
 // Abaixo disso o ritmo fica com cara de automação, e o WhatsApp pode restringir a conta
 const MIN_SAFE_DELAY_SECONDS = 1;
+
+const LINE_PHONE_REQUIRED_MESSAGE = 'Informe o número da linha (a conta logada no WhatsApp Web) com o DDI, ' +
+  'de 10 a 15 dígitos (ex.: 5511999999999), para iniciar.';
 
 /**
  * Intervalo entre conversas digitado no popup, em segundos. Vazio volta ao padrão; inválido ou abaixo
@@ -33,6 +37,10 @@ export class ExtractionControls {
     this.radioLimit = document.getElementById('mode-limit');
     this.inputMaxChats = document.getElementById('max-chats-input');
     this.inputSafeDelay = document.getElementById('safe-delay-input');
+    this.linePhoneRow = document.getElementById('line-phone-row');
+    this.inputLinePhone = document.getElementById('line-phone-input');
+    /** O campo "Número da linha" está à mostra: a linha da conta não foi detectada na aba */
+    this._linePhoneVisible = false;
 
     this.btnStart = document.getElementById('btn-start-batch');
     this.btnPause = document.getElementById('btn-pause-batch');
@@ -69,6 +77,13 @@ export class ExtractionControls {
       this.inputSafeDelay.addEventListener('change', () => {
         this.inputSafeDelay.value = String(this._readSafeDelaySeconds());
         this.savePreferences();
+      });
+    }
+    // Também só no change. O número não vai para o extractionConfig: vale só para a execução que vai iniciar
+    if (this.inputLinePhone) {
+      this.inputLinePhone.addEventListener('change', () => {
+        const linePhone = this._readLinePhone();
+        if (linePhone) this.inputLinePhone.value = linePhone;
       });
     }
   }
@@ -137,6 +152,36 @@ export class ExtractionControls {
   }
 
   /**
+   * Mostra o campo "Número da linha" quando a linha da conta não é detectada na aba, e o esconde quando é
+   * @param {boolean} visible
+   */
+  setLinePhoneVisible(visible) {
+    this._linePhoneVisible = Boolean(visible);
+    this.linePhoneRow?.classList.toggle('hidden', !this._linePhoneVisible);
+  }
+
+  /**
+   * @private
+   * @returns {string|null} Os dígitos do número digitado no campo da linha, de 10 a 15; null vazio ou inválido
+   */
+  _readLinePhone() {
+    // A regra do título que é um telefone: "+", espaços, hífens e parênteses saem, e uma letra invalida o número
+    // em vez de sumir dele (um "O" digitado no lugar de um zero não vira outro número)
+    return phoneFromTitle(this.inputLinePhone?.value ?? '');
+  }
+
+  /**
+   * Parâmetros do início da extração: os de getOptions e o número da linha, só com o campo dele à mostra. O
+   * número vale só para esta execução e fica fora do extractionConfig (savePreferences grava getOptions), para
+   * não sobrar a linha de uma conta quando outra logar.
+   * @returns {{ downloadAll: boolean, maxChats: number|null, safeDelayMs: number, linePhone: string|null }}
+   *   `linePhone`: os dígitos; null com o campo escondido ou com um número inválido
+   */
+  getStartOptions() {
+    return { ...this.getOptions(), linePhone: this._linePhoneVisible ? this._readLinePhone() : null };
+  }
+
+  /**
    * Atualiza a visibilidade e disponibilidade dos controles conforme o estado da máquina
    * @param {string} state Estado atual de WORKFLOW_STATES
    */
@@ -155,6 +200,7 @@ export class ExtractionControls {
     if (this.radioLimit) this.radioLimit.disabled = isRunning || isPaused;
     if (this.inputMaxChats) this.inputMaxChats.disabled = (isRunning || isPaused) || this.radioAll?.checked;
     if (this.inputSafeDelay) this.inputSafeDelay.disabled = isRunning || isPaused;
+    if (this.inputLinePhone) this.inputLinePhone.disabled = isRunning || isPaused;
 
     // Controle de exibição dos botões de ação
     if (this.btnStart) {
@@ -179,11 +225,21 @@ export class ExtractionControls {
   }
 
   /**
-   * Registra callbacks para cada ação do usuário
+   * Registra callbacks para cada ação do usuário. Com o campo "Número da linha" à mostra, o início só é pedido
+   * com um número de 10 a 15 dígitos; senão, `onInvalidLinePhone` recebe o aviso para o log do popup
+   * @param {function(Object): void} callback Recebe getStartOptions
+   * @param {function(string): void} [onInvalidLinePhone]
    */
-  onStart(callback) {
+  onStart(callback, onInvalidLinePhone = () => {}) {
     if (this.btnStart) {
-      this.btnStart.addEventListener('click', () => callback(this.getOptions()));
+      this.btnStart.addEventListener('click', () => {
+        const options = this.getStartOptions();
+        if (this._linePhoneVisible && !options.linePhone) {
+          onInvalidLinePhone(LINE_PHONE_REQUIRED_MESSAGE);
+          return;
+        }
+        callback(options);
+      });
     }
   }
 

@@ -70,10 +70,11 @@ async function handleMessage(message, sender) {
       if (orchestrator.isBusy()) {
         return { success: false, error: 'Já existe uma extração em andamento.' };
       }
-      const { maxChats, downloadAll, safeDelayMs } = message;
+      // `linePhone` só vem quando o popup não detectou a linha na aba
+      const { maxChats, downloadAll, safeDelayMs, linePhone } = message;
       log.info(`Iniciando extração em lote (maxChats: ${maxChats}, downloadAll: ${downloadAll})...`);
       // Responde de imediato ao popup; falhas chegam pelas notificações de progresso
-      orchestrator.start({ maxChats, downloadAll, safeDelayMs }).catch((err) => {
+      orchestrator.start({ maxChats, downloadAll, safeDelayMs, linePhone }).catch((err) => {
         log.error('Erro na execução da extração em lote:', err);
       });
       return { success: true, message: 'Extração iniciada com sucesso.' };

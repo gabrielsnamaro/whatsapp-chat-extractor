@@ -9,9 +9,23 @@ import { ProgressView } from './ui/progress-view.js';
 import { ExtractionControls } from './ui/extraction-controls.js';
 import { findWhatsAppTab, countWhatsAppTabs } from '../shared/utils/whatsapp-tab.js';
 
+// Código com que o orquestrador (background/extraction-orchestrator.js) falha quando a aba não detecta a linha e
+// nenhum número foi informado. O popup não importa o módulo do background, que traria a extração inteira junto
+const LINE_NOT_DETECTED_CODE = 'LINE_NOT_DETECTED';
+
+/**
+ * A execução falhou porque a linha da conta não foi detectada na aba
+ * @param {{ state?: string, errorCode?: string|null }|null} data Estado do orquestrador
+ * @returns {boolean}
+ */
+function failedWithoutLine(data) {
+  return data?.state === WORKFLOW_STATES.FAILED && data.errorCode === LINE_NOT_DETECTED_CODE;
+}
+
 document.addEventListener('DOMContentLoaded', async () => {
   const statusBadge = document.getElementById('status-badge');
   const statusDetail = document.getElementById('status-detail');
+  const statusLine = document.getElementById('status-line');
   const btnOpenWa = document.getElementById('btn-open-wa');
   const btnCheckReady = document.getElementById('btn-check-ready');
   const logArea = document.getElementById('log-area');
@@ -32,6 +46,46 @@ document.addEventListener('DOMContentLoaded', async () => {
     logArea.scrollTop = logArea.scrollHeight;
   }
 
+  /** Sem aba do WhatsApp Web, não há linha para mostrar nem para informar */
+  function hideLine() {
+    statusLine?.classList.add('hidden');
+    controls.setLinePhoneVisible(false);
+  }
+
+  /**
+   * Mostra a linha (a conta logada no WhatsApp Web) abaixo do status e, quando ela não é detectada com a aba
+   * pronta, o campo "Número da linha". Sem resposta da aba (content script ausente depois de recarregar a
+   * extensão), a linha é detectada ao iniciar, que reinjeta o content script
+   * @param {{ ready?: boolean, line?: { phone: string }|null }|null} pageStatus Resposta ao CHECK_PAGE_READY; null sem resposta
+   * @param {Object} [options]
+   * @param {boolean} [options.lineNotDetected=false] A execução falhou sem a linha (LINE_NOT_DETECTED)
+   */
+  function renderLine(pageStatus, { lineNotDetected = false } = {}) {
+    const phone = pageStatus?.line?.phone;
+    const missing = !phone && (Boolean(pageStatus?.ready) || lineNotDetected);
+    if (statusLine) {
+      statusLine.textContent = phone
+        ? `Linha: +${phone}`
+        : (missing ? 'Linha: não detectada na aba. Informe o número da conta logada abaixo.' : 'Linha: detectada ao iniciar');
+      statusLine.classList.toggle('missing', missing);
+      statusLine.classList.remove('hidden');
+    }
+    controls.setLinePhoneVisible(missing);
+  }
+
+  /**
+   * Pergunta à aba se o WhatsApp Web está pronto e qual é a linha da conta logada
+   * @param {chrome.tabs.Tab} tab
+   * @returns {Promise<Object|null>} null quando a aba não respondeu
+   */
+  async function checkPage(tab) {
+    try {
+      return (await chrome.tabs.sendMessage(tab.id, { action: ACTIONS.CHECK_PAGE_READY })) ?? null;
+    } catch (_) {
+      return null;
+    }
+  }
+
   async function updateTabStatus() {
     try {
       const tab = await findWhatsAppTab();
@@ -40,6 +94,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         statusBadge.className = 'badge disconnected';
         statusDetail.textContent = 'Nenhuma aba do WhatsApp Web aberta.';
         if (btnCheckReady) btnCheckReady.disabled = true;
+        hideLine();
         return null;
       }
 
@@ -55,6 +110,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       statusBadge.textContent = 'Erro';
       statusBadge.className = 'badge disconnected';
       statusDetail.textContent = err.message;
+      hideLine();
       return null;
     }
   }
@@ -110,6 +166,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (message.state === WORKFLOW_STATES.CANCELLED) log('Extração cancelada.', 'warning');
       lastLoggedFinalState = message.state;
     }
+    if (failedWithoutLine(message)) renderLine(null, { lineNotDetected: true });
   });
 
   // Ação: Iniciar extração em lote
@@ -121,7 +178,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     const modeText = options.downloadAll ? 'Todos os chats' : `Limite de ${options.maxChats} chats`;
-    log(`Iniciando lote: ${modeText}...`);
+    const lineText = options.linePhone ? ` (linha informada: +${options.linePhone})` : '';
+    log(`Iniciando lote: ${modeText}${lineText}...`);
 
     controls.updateUiState(WORKFLOW_STATES.SCANNING);
     progressView.renderProgress({
@@ -136,7 +194,9 @@ document.addEventListener('DOMContentLoaded', async () => {
         action: ACTIONS.START_BATCH_EXTRACTION,
         maxChats: options.maxChats,
         downloadAll: options.downloadAll,
-        safeDelayMs: options.safeDelayMs
+        safeDelayMs: options.safeDelayMs,
+        // Só com o campo à mostra (a linha não foi detectada na aba); vale só para esta execução
+        linePhone: options.linePhone
       });
 
       if (!res || !res.success) {
@@ -147,7 +207,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       log(`Erro de comunicação com o Service Worker: ${err.message}`, 'error');
       controls.updateUiState(WORKFLOW_STATES.FAILED);
     }
-  });
+  }, (message) => log(`⚠️ ${message}`, 'warning'));
 
   // Ação: Pausar
   controls.onPause(async () => {
@@ -186,19 +246,20 @@ document.addEventListener('DOMContentLoaded', async () => {
       }
 
       log('Consultando status do WhatsApp Web...');
-      try {
-        const response = await chrome.tabs.sendMessage(tab.id, { action: ACTIONS.CHECK_PAGE_READY });
-        if (response && response.ready) {
-          log('✅ WhatsApp Web carregado e pronto para extração!');
-        } else {
-          log('⏳ WhatsApp Web ainda carregando ou no QR Code.');
-        }
-      } catch (err) {
+      const response = await checkPage(tab);
+      renderLine(response);
+      if (!response) {
         log('⚠️ Falha ao comunicar com a página. Recarregue a aba do WhatsApp Web ou inicie a extração (o script é reinjetado).', 'warning');
+      } else if (response.ready) {
+        log('✅ WhatsApp Web carregado e pronto para extração!');
+      } else {
+        log('⏳ WhatsApp Web ainda carregando ou no QR Code.');
       }
     });
   }
 
-  // Checagem inicial da aba
-  await updateTabStatus();
+  // Checagem inicial da aba e da linha. Depois de uma falha por falta da linha, o campo do número continua à mostra
+  // até a aba detectá-la
+  const initialTab = await updateTabStatus();
+  if (initialTab) renderLine(await checkPage(initialTab), { lineNotDetected: failedWithoutLine(initialState) });
 });

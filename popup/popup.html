@@ -21,6 +21,13 @@
       <div class="card status-card">
         <p class="card-title">Status da Conexão</p>
         <p class="status-detail" id="status-detail">Consultando abas abertas...</p>
+        <p class="status-line hidden" id="status-line"></p>
+
+        <!-- Só aparece quando a linha (a conta logada) não é detectada na aba -->
+        <div class="limit-input-row hidden" id="line-phone-row">
+          <label for="line-phone-input" class="input-label">Número da linha (com DDI):</label>
+          <input type="text" id="line-phone-input" class="number-input line-phone-input" inputmode="tel" autocomplete="off" spellcheck="false" placeholder="5511999999999">
+        </div>
       </div>
 
       <!-- Configuração de Modo e Limite de Extração -->

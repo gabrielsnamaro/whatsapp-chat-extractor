@@ -6,6 +6,8 @@ import { ACTIONS } from '../shared/constants/actions.js';
 import { WORKFLOW_STATES } from '../shared/constants/workflow-states.js';
 import {
   WHATSAPP_TAB_ID,
+  FAKE_LINE_PHONE,
+  accountLine,
   createFakeChrome,
   installFakeChrome,
   uninstallFakeChrome,
@@ -450,12 +452,13 @@ test('relatório: cabeçalho, datas e uma linha por conversa', { timeout: TEST_T
   const { report } = archive.calls[0];
   assert.ok(report.endsWith('\n'));
   const lines = report.split('\n');
-  assert.equal(lines.length, 13);
+  assert.equal(lines.length, 14);
   assert.equal(lines[0], 'Relatório de extração - WhatsApp Web Extractor');
   // As datas dependem do fuso de quem roda o teste
   assert.match(lines[1], new RegExp(`^Início: ${DATE_PT_BR}$`));
   assert.match(lines[2], new RegExp(`^Geração do ZIP: ${DATE_PT_BR}$`));
   assert.deepEqual(lines.slice(3), [
+    `Linha: ${FAKE_LINE_PHONE} (detectada na aba)`,
     'Modo: limite de 3 conversa(s)',
     'Varredura: 3 conversa(s) encontrada(s) em 1 s; parou ao atingir o limite escolhido; data/hora exibida na última conversa: Ontem.',
     `${CONTENT_LINE_PREFIX} (0 anexo(s) omitido(s) nesta execução).`,
@@ -496,8 +499,8 @@ test('conversa sem "Exportar conversa" no menu é não exportável, contada à p
   });
 
   const lines = archive.calls[0].report.split('\n');
-  assert.equal(lines[5], 'Conversas na fila: 3 | no ZIP: 2 (vazias: 0) | na pasta Downloads: 0 | não exportáveis: 1 | falhas: 0');
-  assert.deepEqual(lines.slice(7, 10), [
+  assert.equal(lines[6], 'Conversas na fila: 3 | no ZIP: 2 (vazias: 0) | na pasta Downloads: 0 | não exportáveis: 1 | falhas: 0');
+  assert.deepEqual(lines.slice(8, 11), [
     '[OK] 1. "Ana" salvo (1.5 KB).',
     `[NÃO EXPORTÁVEL] 2. "Bia": ${EXPORT_UNAVAILABLE_MESSAGE}`,
     '[OK] 3. "Caio" salvo (1.5 KB).'
@@ -573,7 +576,7 @@ test('arquivo não entregue no prazo nem na quarentena: falha FILE_NOT_DELIVERED
 
   // Um arquivo atrasado de Bia que chegasse depois do clique em "Exportar" de Caio seria tomado como de
   // Caio: o relatório marca só a conversa seguinte a um FILE_NOT_DELIVERED e diz qual tentativa foi
-  assert.deepEqual(archive.calls[0].report.split('\n').slice(8, 12), [
+  assert.deepEqual(archive.calls[0].report.split('\n').slice(9, 13), [
     '[OK] 1. "Ana" salvo (1.5 KB).',
     `[FALHA] 2. "Bia": ${notDelivered} Tentativas: 2.`,
     `[OK] 3. "Caio" salvo (1.5 KB).${notDeliveredCheckNote(2, 'Bia', 1)}`,
@@ -658,7 +661,7 @@ test('arquivo atrasado chega na quarentena, pela página ou pelo chrome.download
   assert.equal(orch.run.results[1].messageCount, 1);
 
   // Chegou na quarentena: a conversa seguinte não é marcada para conferir
-  assert.deepEqual(archive.calls[0].report.split('\n').slice(7, 11), [
+  assert.deepEqual(archive.calls[0].report.split('\n').slice(8, 12), [
     '[OK] 1. "Ana" salvo (1.5 KB).',
     `[OK] 2. "Bia" salvo (2.0 KB).${LATE_NOTE}`,
     `[OK] 3. "Caio" salvo (3.0 KB).${LATE_NOTE}`,
@@ -744,7 +747,7 @@ test('outra falha na quarentena prevalece sobre o prazo esgotado: leitura falha 
   assert.deepEqual(staging.saves.map((s) => s.chatTitle), ['Ana', 'Davi']);
 
   // Sem FILE_NOT_DELIVERED no resultado, a conversa seguinte não é marcada para conferir
-  assert.deepEqual(archive.calls[0].report.split('\n').slice(8, 12), [
+  assert.deepEqual(archive.calls[0].report.split('\n').slice(9, 13), [
     '[OK] 1. "Ana" salvo (1.5 KB).',
     '[FALHA] 2. "Bia": HTTP 404 ao ler o arquivo exportado. Tentativas: 2.',
     '[FALHA] 3. "Caio": Arquivo recebido com 5 bytes; esperados 10. Tentativas: 2.',
@@ -796,12 +799,12 @@ test('"conferir" só marca a conversa seguinte que recebeu arquivo, não uma fal
   assert.deepEqual(orch.run.retry.indices, [0, 1, 2, 4, 6, 8]);
   const notDeliveredMessage = 'O WhatsApp Web não entregou o arquivo exportado em 0.02 s.';
   const lines = archive.calls[0].report.split('\n');
-  assert.equal(lines[5], 'Conversas na fila: 10 | no ZIP: 2 (vazias: 1) | na pasta Downloads: 1 | não exportáveis: 1 | falhas: 6');
-  assert.equal(lines[6], retryHeader(6, 0));
+  assert.equal(lines[6], 'Conversas na fila: 10 | no ZIP: 2 (vazias: 1) | na pasta Downloads: 1 | não exportáveis: 1 | falhas: 6');
+  assert.equal(lines[7], retryHeader(6, 0));
   // Cada conversa par vem depois de um FILE_NOT_DELIVERED: Bia (falha) e Juca (não exportável) não
   // receberam arquivo nenhum e não são marcadas; na pasta Downloads, vazia e atrasada, sim. Na
   // repescagem todas falham, então nenhuma tentativa dela recebe a marcação
-  assert.deepEqual(lines.slice(8, 18), [
+  assert.deepEqual(lines.slice(9, 19), [
     `[FALHA] 1. "Ana": ${notDeliveredMessage} Tentativas: 2.`,
     '[FALHA] 2. "Bia": Conversa não encontrada na lista. Tentativas: 2.',
     `[FALHA] 3. "Caio": ${notDeliveredMessage} Tentativas: 2.`,
@@ -938,8 +941,8 @@ test('exportação vazia: [OK – VAZIA] no relatório, contada no ZIP e gravada
   assert.deepEqual(archive.calls[0].stagedKeys, ['000000', '000001', '000002']);
 
   const lines = archive.calls[0].report.split('\n');
-  assert.equal(lines[5], 'Conversas na fila: 3 | no ZIP: 3 (vazias: 1) | na pasta Downloads: 0 | não exportáveis: 0 | falhas: 0');
-  assert.deepEqual(lines.slice(7, 10), [
+  assert.equal(lines[6], 'Conversas na fila: 3 | no ZIP: 3 (vazias: 1) | na pasta Downloads: 0 | não exportáveis: 0 | falhas: 0');
+  assert.deepEqual(lines.slice(8, 11), [
     '[OK] 1. "Ana" salvo (1.5 KB).',
     `[OK – VAZIA] 2. "Bia" salvo (${sizeLabel(emptyZip)}).`,
     '[OK] 3. "Caio" salvo (1.5 KB).'
@@ -1003,7 +1006,7 @@ test('conteúdo não inspecionado: a conversa é salva mesmo assim, e o relatór
   // O arquivo vai para o staging como chegou
   assert.deepEqual(new Uint8Array(await staging.saves[1].blob.arrayBuffer()), truncatedZip);
   assert.deepEqual(archive.calls[0].stagedKeys, ['000000', '000001', '000002']);
-  assert.equal(archive.calls[0].report.split('\n')[8], `[OK] 2. ${result.message}`);
+  assert.equal(archive.calls[0].report.split('\n')[9], `[OK] 2. ${result.message}`);
   assert.equal(persistedRun(fake.snapshotStorage()).results[1].inspectionError, result.inspectionError);
 
   // A falha da inspeção vai para o log do background, com o erro original
@@ -1034,8 +1037,8 @@ test('anexos omitidos: contagem na linha da conversa e total da execução no ca
   assert.deepEqual(state.summary, { saved: 3, empty: 0, savedToDisk: 0, notExportable: 0, failed: 0 });
 
   const lines = archive.calls[0].report.split('\n');
-  assert.equal(lines[4], `${CONTENT_LINE_PREFIX} (4 anexo(s) omitido(s) nesta execução).`);
-  assert.deepEqual(lines.slice(7, 10), [
+  assert.equal(lines[5], `${CONTENT_LINE_PREFIX} (4 anexo(s) omitido(s) nesta execução).`);
+  assert.deepEqual(lines.slice(8, 11), [
     `[OK] 1. "Ana" salvo (${sizeLabel(anaZip)}, 3 anexo(s) omitido(s)).`,
     `[OK] 2. "Bia" salvo (${sizeLabel(biaZip)}).`,
     `[OK] 3. "Caio" salvo (${sizeLabel(caioZip)}, 1 anexo(s) omitido(s)).`
@@ -1077,11 +1080,11 @@ test('formato do texto não reconhecido e conteúdo não inspecionado: a linha a
 
   const lines = archive.calls[0].report.split('\n');
   assert.equal(
-    lines[4],
+    lines[5],
     `${CONTENT_LINE_PREFIX} (1 anexo(s) omitido(s) nesta execução; total parcial: 2 conversa(s) sem contagem).`
   );
-  assert.equal(lines[8], `[OK] 2. "Bia" salvo (${sizeLabel(biaZip)}). Formato do texto não reconhecido: mensagens e anexos não contados.`);
-  assert.match(lines[9], /^\[OK\] 3\. "Caio" salvo \([^)]*\)\. Conteúdo não inspecionado: /);
+  assert.equal(lines[9], `[OK] 2. "Bia" salvo (${sizeLabel(biaZip)}). Formato do texto não reconhecido: mensagens e anexos não contados.`);
+  assert.match(lines[10], /^\[OK\] 3\. "Caio" salvo \([^)]*\)\. Conteúdo não inspecionado: /);
 });
 
 test('retomada no meio da fila: nova instância exporta só as conversas restantes', { timeout: TEST_TIMEOUT_MS }, async () => {
@@ -1260,8 +1263,8 @@ test('interceptor só é armado depois do EXPORT_CAPTURE_ARMED: um download ante
     duringChat: 'Ana'
   });
   const lines = archive.calls[0].report.split('\n');
-  assert.deepEqual(lines.slice(9, 11), ['', unexpectedFilesHeader(1)]);
-  assert.match(lines[11], unexpectedFileLine('chrome.downloads, "Conversa do WhatsApp com Fulano.zip", durante "Ana"'));
+  assert.deepEqual(lines.slice(10, 12), ['', unexpectedFilesHeader(1)]);
+  assert.match(lines[12], unexpectedFileLine('chrome.downloads, "Conversa do WhatsApp com Fulano.zip", durante "Ana"'));
 });
 
 test('aviso de captura armada recusado: outra captura, outra aba ou conversa já encerrada; a conversa falha com CAPTURE_NOT_ARMED', { timeout: TEST_TIMEOUT_MS }, async () => {
@@ -1359,16 +1362,16 @@ test('arquivos recebidos fora de hora, da página e do chrome.downloads, vão pa
   assert.deepEqual(fake.readStorage('extractionRun').unexpectedFiles, orch.run.unexpectedFiles);
 
   const lines = archive.calls[0].report.split('\n');
-  assert.deepEqual(lines.slice(7, 12), [
+  assert.deepEqual(lines.slice(8, 13), [
     '[OK] 1. "Ana" salvo (1.5 KB).',
     '[OK] 2. "Bia" salvo (1.5 KB).',
     '[OK] 3. "Caio" salvo (1.5 KB).',
     '',
     unexpectedFilesHeader(2)
   ]);
-  assert.match(lines[12], unexpectedFileLine('chrome.downloads, nome ainda não definido pelo Chrome, entre conversas'));
-  assert.match(lines[13], unexpectedFileLine('página, "Conversa do WhatsApp com Ana.zip", durante "Bia"'));
-  assert.deepEqual(lines.slice(14), ['']);
+  assert.match(lines[13], unexpectedFileLine('chrome.downloads, nome ainda não definido pelo Chrome, entre conversas'));
+  assert.match(lines[14], unexpectedFileLine('página, "Conversa do WhatsApp com Ana.zip", durante "Bia"'));
+  assert.deepEqual(lines.slice(15), ['']);
 
   // Popup: um aviso por arquivo
   const warnings = fake.progressUpdates().map((m) => m.warningMessage).filter(Boolean);
@@ -1391,7 +1394,7 @@ test('relatório sem arquivos fora de hora não tem a seção', { timeout: TEST_
 
   assert.deepEqual(orch.run.unexpectedFiles, []);
   assert.equal(archive.calls[0].report.includes('fora de hora'), false);
-  assert.deepEqual(archive.calls[0].report.split('\n').slice(7), ['[OK] 1. "Ana" salvo (1.5 KB).', '']);
+  assert.deepEqual(archive.calls[0].report.split('\n').slice(8), ['[OK] 1. "Ana" salvo (1.5 KB).', '']);
 });
 
 /**
@@ -1454,7 +1457,7 @@ test('execução gravada pela versão anterior, sem a lista de arquivos fora de 
   assert.deepEqual(fakeB.readStorage('extractionRun').unexpectedFiles, orchB.run.unexpectedFiles);
 
   const lines = archive.calls[0].report.split('\n');
-  assert.deepEqual(lines.slice(7, 13), [
+  assert.deepEqual(lines.slice(8, 14), [
     '[OK] 1. "Ana" salvo (1.5 KB).',
     '[OK] 2. "Bia" salvo (1.5 KB).',
     '[OK] 3. "Caio" salvo (1.5 KB).',
@@ -1462,7 +1465,7 @@ test('execução gravada pela versão anterior, sem a lista de arquivos fora de 
     '',
     unexpectedFilesHeader(1)
   ]);
-  assert.match(lines[13], unexpectedFileLine('chrome.downloads, "Conversa do WhatsApp com Fulano.zip", durante "Davi"'));
+  assert.match(lines[14], unexpectedFileLine('chrome.downloads, "Conversa do WhatsApp com Fulano.zip", durante "Davi"'));
 });
 
 test('execução gravada pela versão anterior, sem a lista e sem arquivo fora de hora: o relatório sai sem a seção', { timeout: TEST_TIMEOUT_MS }, async () => {
@@ -1481,7 +1484,7 @@ test('execução gravada pela versão anterior, sem a lista e sem arquivo fora d
 
   assert.equal(orchB.getState().state, WORKFLOW_STATES.COMPLETED);
   assert.equal(orchB.run.unexpectedFiles, undefined);
-  assert.deepEqual(archive.calls[0].report.split('\n').slice(7), [
+  assert.deepEqual(archive.calls[0].report.split('\n').slice(8), [
     '[OK] 1. "Ana" salvo (1.5 KB).',
     '[OK] 2. "Bia" salvo (1.5 KB).',
     '[OK] 3. "Caio" salvo (1.5 KB).',
@@ -1566,9 +1569,9 @@ test('repescagem recupera falhas passageiras: lista lateral devolvida ao normal 
   assert.deepEqual(archive.calls[0].stagedKeys, ['000000', '000001', '000002', '000003', '000004']);
 
   const lines = archive.calls[0].report.split('\n');
-  assert.equal(lines[5], 'Conversas na fila: 5 | no ZIP: 5 (vazias: 0) | na pasta Downloads: 0 | não exportáveis: 0 | falhas: 0');
-  assert.equal(lines[6], retryHeader(2, 2));
-  assert.deepEqual(lines.slice(7), [
+  assert.equal(lines[6], 'Conversas na fila: 5 | no ZIP: 5 (vazias: 0) | na pasta Downloads: 0 | não exportáveis: 0 | falhas: 0');
+  assert.equal(lines[7], retryHeader(2, 2));
+  assert.deepEqual(lines.slice(8), [
     '',
     '[OK] 1. "Ana" salvo (1.5 KB).',
     '[OK] 2. "Bia" salvo (1.5 KB). Tentativas: 2.',
@@ -1644,8 +1647,8 @@ test('falha que persiste: uma única repescagem, sem segunda rodada, e fica a fa
   assert.deepEqual(staging.saves.map((s) => s.chatTitle), ['Ana', 'Caio']);
 
   const lines = archive.calls[0].report.split('\n');
-  assert.equal(lines[6], retryHeader(1, 0));
-  assert.equal(lines[9], `[FALHA] 2. "Bia": ${timeouts[2]} Tentativas: 2.`);
+  assert.equal(lines[7], retryHeader(1, 0));
+  assert.equal(lines[10], `[FALHA] 2. "Bia": ${timeouts[2]} Tentativas: 2.`);
   assert.deepEqual(
     fake.progressUpdates().map((m) => m.warningMessage).filter(Boolean),
     [`[2/3] ⚠️ "Bia": ${timeouts[1]}`, `[Repescagem 1/1] ⚠️ "Bia": ${timeouts[2]}`]
@@ -1683,7 +1686,7 @@ test('fora da repescagem: exportação vazia, não exportável, homônimo e moda
 
   // O cabeçalho só fala da repescagem quando houve uma, e nenhum aviso do popup a anuncia
   const lines = archive.calls[0].report.split('\n');
-  assert.equal(lines[6], '');
+  assert.equal(lines[7], '');
   assert.equal(archive.calls[0].report.includes('Repescagem'), false);
   assert.equal(archive.calls[0].report.includes('Tentativas'), false);
   const updates = fake.progressUpdates();
@@ -1727,7 +1730,7 @@ test('modal sem "Todas as mensagens": aviso na linha e total no cabeçalho; com 
 
   const rangeNote = " Aviso: não foi possível confirmar a opção 'Todas as mensagens' no modal.";
   const lines = archive.calls[0].report.split('\n');
-  assert.deepEqual(lines.slice(5, 12), [
+  assert.deepEqual(lines.slice(6, 13), [
     'Conversas na fila: 4 | no ZIP: 3 (vazias: 0) | na pasta Downloads: 0 | não exportáveis: 0 | falhas: 1',
     "Aviso: em 2 conversa(s) não foi possível confirmar a opção 'Todas as mensagens' no modal; confira se o histórico delas veio completo.",
     '',
@@ -1937,7 +1940,7 @@ test('lista lateral não volta ao normal: aviso no popup, e a repescagem segue m
     '⚠️ Repescagem: a lista lateral não voltou ao normal, e as conversas são tentadas mesmo assim. ' +
     'Motivo: Lista lateral (#pane-side) não encontrada para voltar ao topo.'));
   assert.ok(warned.some((line) => line.includes('Lista lateral não devolvida ao normal antes da repescagem')));
-  assert.equal(archive.calls[0].report.split('\n')[6], retryHeader(1, 1));
+  assert.equal(archive.calls[0].report.split('\n')[7], retryHeader(1, 1));
 });
 
 test('"conferir" na ordem real das exportações: a 1ª da repescagem vem depois da última da fila, e a nota diz qual tentativa não entregou', { timeout: TEST_TIMEOUT_MS }, async () => {
@@ -1959,11 +1962,11 @@ test('"conferir" na ordem real das exportações: a 1ª da repescagem vem depois
   assert.deepEqual(fake.content.exportRequests.map((m) => m.chat.title), ['Ana', 'Bia', 'Caio', 'Davi', 'Eva', 'Bia', 'Davi', 'Eva']);
   const notDeliveredMessage = 'O WhatsApp Web não entregou o arquivo exportado em 0.02 s.';
   const lines = archive.calls[0].report.split('\n');
-  assert.equal(lines[6], retryHeader(3, 2));
+  assert.equal(lines[7], retryHeader(3, 2));
   // Caio vem depois da 1ª tentativa de Bia, que foi recuperada depois: a linha de cima já mostra [OK], e a
   // nota diz qual tentativa não entregou. A repescada Bia vem depois da 1ª de Eva, a última da fila;
   // a repescada Eva, depois da 2ª de Davi
-  assert.deepEqual(lines.slice(8, 13), [
+  assert.deepEqual(lines.slice(9, 14), [
     '[OK] 1. "Ana" salvo (1.5 KB).',
     `[OK] 2. "Bia" salvo (1.5 KB). Tentativas: 2.${notDeliveredCheckNote(5, 'Eva', 1)}`,
     `[OK] 3. "Caio" salvo (1.5 KB).${notDeliveredCheckNote(2, 'Bia', 1)}`,
@@ -2058,8 +2061,8 @@ for (const { stallAt, remaining } of [
     assert.deepEqual(archive.calls[0].stagedKeys, ['000000', '000001', '000002', '000003']);
     assert.equal(staging.saves.length, 4);
     const lines = archive.calls[0].report.split('\n');
-    assert.equal(lines[6], retryHeader(2, 2));
-    assert.deepEqual(lines.slice(8, 12), [
+    assert.equal(lines[7], retryHeader(2, 2));
+    assert.deepEqual(lines.slice(9, 13), [
       '[OK] 1. "Ana" salvo (1.5 KB).',
       '[OK] 2. "Bia" salvo (1.5 KB). Tentativas: 2.',
       '[OK] 3. "Caio" salvo (1.5 KB).',
@@ -2095,7 +2098,7 @@ test('download do ZIP não concluído: "Retomar" gera o ZIP de novo sem repetir 
   assert.equal(orch.getState().state, WORKFLOW_STATES.COMPLETED);
   assert.equal(fake.receivedActions().length, actionsBeforeResume);
   assert.equal(archive.calls.length, 1);
-  assert.equal(archive.calls[0].report.split('\n')[6], retryHeader(1, 1));
+  assert.equal(archive.calls[0].report.split('\n')[7], retryHeader(1, 1));
 
   // Depois de reinício, com o storage do momento da pausa: a fase restaurada é a de empacotamento, e a
   // aba não é usada. O staging já foi limpo pelo download da instância anterior, mas o substituto do
@@ -2156,11 +2159,11 @@ for (const { stopReason, durationMs, lastChatTimestamp, summary } of [
     assert.deepEqual(orch.run.scan, { found: 2, steps: 7, durationMs, stopReason, lastChatTimestamp });
     assert.deepEqual(fake.readStorage('extractionRun').scan, orch.run.scan);
     const lines = archive.calls[0].report.split('\n');
-    assert.deepEqual(lines.slice(3, 5), [
+    assert.deepEqual(lines.slice(4, 6), [
       'Modo: lista principal (arquivadas não incluídas)',
       `Varredura: 2 conversa(s) encontrada(s) ${summary}.`
     ]);
-    assert.ok(lines[5].startsWith(CONTENT_LINE_PREFIX));
+    assert.ok(lines[6].startsWith(CONTENT_LINE_PREFIX));
   });
 }
 
@@ -2204,7 +2207,7 @@ test('estatísticas da varredura sobrevivem a um reinício; execução gravada a
 
   const resumed = await resumeFrom(snapshot);
   assert.equal(
-    resumed[4],
+    resumed[5],
     'Varredura: 3 conversa(s) encontrada(s) em 4 s; parou no fim da lista; data/hora exibida na última conversa: 05/01/2024.'
   );
 
@@ -2212,7 +2215,7 @@ test('estatísticas da varredura sobrevivem a um reinício; execução gravada a
   delete previousVersion.extractionRun.scan;
   const withoutStats = await resumeFrom(previousVersion);
   assert.equal(withoutStats.some((line) => line.startsWith('Varredura:')), false);
-  assert.ok(withoutStats[4].startsWith(CONTENT_LINE_PREFIX));
+  assert.ok(withoutStats[5].startsWith(CONTENT_LINE_PREFIX));
 });
 
 test('andamento da varredura: o popup recebe o total encontrado a cada aviso da aba, sem gravar o storage', { timeout: TEST_TIMEOUT_MS }, async () => {
@@ -2426,7 +2429,8 @@ test('_execucao.log: uma linha por tentativa, em ordem cronológica, com horári
     lines[1],
     new RegExp(`^Execução: ${literal(runId)} \\| início: ${DATE_PT_BR} \\| versão da extensão: ${literal(fake.api.runtime.getManifest().version)}$`)
   );
-  assert.deepEqual(lines.slice(2, 5), [
+  assert.deepEqual(lines.slice(2, 6), [
+    `Linha: ${FAKE_LINE_PHONE} (detectada na aba)`,
     'Modo: lista principal (arquivadas não incluídas) | intervalo entre conversas: 0 s, com variação de até +50%',
     'Varredura: 3 conversa(s) encontrada(s) em 3 s; parou no fim da lista; data/hora exibida na última conversa: 12/03/2021.',
     ''
@@ -2434,7 +2438,7 @@ test('_execucao.log: uma linha por tentativa, em ordem cronológica, com horári
 
   // Na ordem real: as três tentativas da fila (o arquivo fora de hora chegou durante Caio), o início da
   // repescagem e a 2ª tentativa de Bia. Sem `via`, a aba não chegou a confirmar a exportação
-  const events = lines.slice(5, -1);
+  const events = lines.slice(6, -1);
   assertTimedEvents(events, [
     `nº 1 "Ana" \\| tentativa 1 \\| ${DURATION} \\| abertura: lista visível \\| OK`,
     `nº 2 "Bia" \\| tentativa 1 \\| ${DURATION} \\| abertura: não informada \\| FALHA \\(CHAT_NOT_FOUND\\) \\| motivo: ${literal(notFound('Bia').error)}`,
@@ -2479,7 +2483,7 @@ test('_execucao.log de execução gravada por uma versão anterior, sem históri
   const { executionLog } = archive.calls[0];
   const lines = executionLog.split('\n');
   // O content simulado não manda as estatísticas da varredura
-  assert.deepEqual(lines.slice(3, 10), [
+  assert.deepEqual(lines.slice(4, 11), [
     'Varredura: sem estatísticas registradas nesta execução.',
     'As linhas com --:--:-- foram registradas por uma versão anterior da extensão, sem horário nem duração, e vêm antes das demais.',
     '',
@@ -2488,7 +2492,7 @@ test('_execucao.log de execução gravada por uma versão anterior, sem históri
     '--:--:-- nº 3 "Caio" | tentativa 1 | duração não registrada | abertura: lista visível | OK',
     '--:--:-- nº 4 "Davi" | tentativa 1 | duração não registrada | abertura: não informada | FALHA (TIMEOUT) | motivo: Timeout de 30s aguardando o menu.'
   ]);
-  assertTimedEvents(lines.slice(10, -1), [
+  assertTimedEvents(lines.slice(11, -1), [
     literal('Repescagem: rodada prevista para este horário (fim da espera; uma pausa a adia), com 2 conversa(s) que falharam na fila.'),
     `nº 2 "Bia" \\| tentativa 2 \\| ${DURATION} \\| abertura: lista visível \\| OK`,
     `nº 4 "Davi" \\| tentativa 2 \\| ${DURATION} \\| abertura: lista visível \\| OK`
@@ -2532,7 +2536,7 @@ test('_execucao.log: diagnóstico da abertura pela busca e pela rolagem no fim d
   assert.deepEqual(persistedRun(fake.snapshotStorage()).results.map((r) => r.history), results.map((r) => r.history));
 
   // Os campos de antes ficam na mesma posição; o diagnóstico vem depois do motivo
-  const events = archive.calls[0].executionLog.split('\n').slice(5, -1);
+  const events = archive.calls[0].executionLog.split('\n').slice(6, -1);
   const caioDiagnostics = 'busca: 8 s, 0 célula(s) de conversa no painel, saída não confirmada | ' +
     'rolagem: 12 passo(s) em 4.3 s, lista cresceu: sim, parou: achou a conversa';
   assert.deepEqual(events.map(withoutClockAndDuration), [
@@ -2575,7 +2579,7 @@ test('rolagem de abertura interrompida no teto: a conversa falha com CHAT_NOT_FO
   ]);
 
   const { report, executionLog } = archive.calls[0];
-  assert.equal(report.split('\n')[6], retryHeader(1, 1));
+  assert.equal(report.split('\n')[7], retryHeader(1, 1));
   const bia = executionLog.split('\n').filter((line) => line.includes(' nº 2 "Bia" ')).map(withoutClockAndDuration);
   assert.deepEqual(bia, [
     `nº 2 "Bia" | tentativa 1 | <duração> | abertura: não informada | FALHA (CHAT_NOT_FOUND) | motivo: ${cappedError} | ` +
@@ -2938,4 +2942,355 @@ test('fila de outra execução que sobrou no storage não é retomada: reinício
   assert.equal(orch.getState().state, WORKFLOW_STATES.FAILED);
   assert.deepEqual(orch.run.queue, []);
   assert.match(orch.getState().errorMessage, /durante a descoberta de conversas/);
+});
+
+// Linha da conta (o número da conta logada no WhatsApp Web): a detectada na aba ou, sem ela, a informada no
+// popup; gravada no início da execução e conferida a cada retomada
+
+const OTHER_LINE_PHONE = '5511911111111';
+const LINE_NOT_DETECTED_MESSAGE =
+  'Não foi possível detectar o número da linha (a conta logada no WhatsApp Web). Informe o número no popup para iniciar.';
+
+/** Mensagem da retomada recusada com a aba logada em outra conta */
+function otherAccountMessage(tabPhone, runPhone) {
+  return `A aba do WhatsApp Web está logada em outra conta (linha +${tabPhone}). ` +
+    `Esta extração é da linha +${runPhone}: entre na conta da linha +${runPhone} e clique em "Retomar".`;
+}
+
+/** Aviso da retomada com a aba sem a linha detectada */
+function lineNotCheckedWarning(runPhone) {
+  return '⚠️ A linha da aba do WhatsApp Web não foi detectada, e a conta dela não pôde ser conferida. ' +
+    `Esta extração é da linha +${runPhone}: confira se a aba está logada nessa conta.`;
+}
+
+/**
+ * Storage de uma execução interrompida no meio da fila: a instância A exporta as conversas antes de `stallAt` e
+ * fica presa nela, como se o Chrome encerrasse o service worker ali
+ */
+async function snapshotStalledAt(fakeA, stallAt) {
+  const orchA = createOrchestrator();
+  const deliverA = deliveringExport(orchA);
+  const stalled = createDeferred();
+  let snapshot = null;
+  fakeA.content.onExport = (message) => {
+    if (message.chat.title !== stallAt) return deliverA(message);
+    snapshot = fakeA.snapshotStorage();
+    stalled.resolve();
+    return { success: true, triggered: true };
+  };
+
+  const loopA = orchA.start({ safeDelayMs: 0 });
+  await stalled.promise;
+  await orchA.cancel();
+  await loopA;
+  return snapshot;
+}
+
+/** Service worker novo, restaurado do storage dado, com a aba logada na linha `line` (null: aba sem a linha) */
+async function restartWith(storage, { chats, line }) {
+  const fake = createFakeChrome({ chats, storage, line });
+  installFakeChrome(fake);
+  const orch = createOrchestrator();
+  fake.content.onExport = deliveringExport(orch);
+  await orch.restore();
+  return { fake, orch };
+}
+
+test('linha detectada na aba: gravada em run.line antes da varredura, persistida e no cabeçalho do relatório e do log', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const { fake, archive } = setUp({ chats: sidebarChats(['Ana', 'Bia']) });
+  const orch = createOrchestrator();
+  let lineAtScan = null;
+  fake.content.onScan = () => { lineAtScan = structuredClone(orch.run.line); };
+  fake.content.onExport = deliveringExport(orch);
+
+  await orch.start({ safeDelayMs: 0 });
+
+  assert.equal(orch.getState().state, WORKFLOW_STATES.COMPLETED);
+  const line = { phone: FAKE_LINE_PHONE, source: 'auto' };
+  assert.deepEqual(lineAtScan, line);
+  assert.deepEqual(orch.run.line, line);
+  // A linha sai da mesma resposta que confere a aba, e já vai na 1ª gravação do estado
+  assert.equal(fake.content.readyChecks, 1);
+  assert.deepEqual(storageWrites(fake)[0].extractionRun.line, line);
+  assert.deepEqual(fake.readStorage('extractionRun').line, line);
+
+  const { report, executionLog } = archive.calls[0];
+  assert.equal(report.split('\n')[3], `Linha: ${FAKE_LINE_PHONE} (detectada na aba)`);
+  assert.equal(executionLog.split('\n')[2], `Linha: ${FAKE_LINE_PHONE} (detectada na aba)`);
+});
+
+test('sem a linha na aba e sem número informado, a extração falha antes da varredura com LINE_NOT_DETECTED, e o código é limpo ao iniciar outra', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const chats = sidebarChats(['Ana']);
+  const { fake, archive } = setUp({ chats });
+  fake.content.line = null;
+  const orch = createOrchestrator();
+  fake.content.onExport = deliveringExport(orch);
+
+  const silencedError = console.error;
+  console.error = () => {};
+  try {
+    await orch.start({ safeDelayMs: 0 });
+  } finally {
+    console.error = silencedError;
+  }
+
+  const failed = orch.getState();
+  assert.deepEqual(
+    [failed.state, failed.errorMessage, failed.errorCode],
+    [WORKFLOW_STATES.FAILED, LINE_NOT_DETECTED_MESSAGE, 'LINE_NOT_DETECTED']
+  );
+  // A aba foi conferida, e nada além disso: nem varredura, nem exportação, nem ZIP
+  assert.deepEqual(fake.receivedActions(), [ACTIONS.CHECK_PAGE_READY]);
+  assert.equal(archive.calls.length, 0);
+  assert.equal(orch.run.line, null);
+  // O popup recebe a falha com o código, que fica no storage e volta depois de um reinício
+  const notified = fake.progressUpdates().at(-1);
+  assert.deepEqual(
+    [notified.state, notified.errorCode, notified.errorMessage],
+    [WORKFLOW_STATES.FAILED, 'LINE_NOT_DETECTED', LINE_NOT_DETECTED_MESSAGE]
+  );
+  const { orch: restored } = await restartWith(fake.snapshotStorage(), { chats, line: null });
+  assert.deepEqual([restored.getState().state, restored.getState().errorCode], [WORKFLOW_STATES.FAILED, 'LINE_NOT_DETECTED']);
+
+  // Com a linha detectada, a execução seguinte começa sem o código da anterior
+  installFakeChrome(fake);
+  fake.content.line = accountLine(FAKE_LINE_PHONE);
+  let errorCodeAtScan;
+  fake.content.onScan = () => { errorCodeAtScan = orch.getState().errorCode; };
+  await orch.start({ safeDelayMs: 0 });
+  assert.equal(errorCodeAtScan, null);
+  assert.deepEqual([orch.getState().state, orch.getState().errorCode], [WORKFLOW_STATES.COMPLETED, null]);
+});
+
+test('sem a linha na aba, vale o número informado no popup, só com os dígitos e com origem "manual", de 10 a 15 dígitos', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const { fake, archive } = setUp({ chats: sidebarChats(['Ana']) });
+  fake.content.line = null;
+  const orch = createOrchestrator();
+  fake.content.onExport = deliveringExport(orch);
+
+  for (const [linePhone, phone] of [
+    ['+55 (11) 92222-2222', '5511922222222'],
+    ['1192222222', '1192222222'],
+    ['999999999999999', '999999999999999']
+  ]) {
+    await orch.start({ safeDelayMs: 0, linePhone });
+
+    assert.equal(orch.getState().state, WORKFLOW_STATES.COMPLETED, linePhone);
+    assert.deepEqual(orch.run.line, { phone, source: 'manual' });
+    assert.deepEqual(fake.readStorage('extractionRun').line, { phone, source: 'manual' });
+    const { report, executionLog } = archive.calls.at(-1);
+    assert.equal(report.split('\n')[3], `Linha: ${phone} (informada no popup)`);
+    assert.equal(executionLog.split('\n')[2], `Linha: ${phone} (informada no popup)`);
+  }
+});
+
+test('com a linha detectada na aba, o número informado no popup não é usado', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const { fake, archive } = setUp({ chats: sidebarChats(['Ana']) });
+  const orch = createOrchestrator();
+  fake.content.onExport = deliveringExport(orch);
+
+  await orch.start({ safeDelayMs: 0, linePhone: '5511922222222' });
+
+  assert.equal(orch.getState().state, WORKFLOW_STATES.COMPLETED);
+  assert.deepEqual(orch.run.line, { phone: FAKE_LINE_PHONE, source: 'auto' });
+  assert.equal(archive.calls[0].report.split('\n')[3], `Linha: ${FAKE_LINE_PHONE} (detectada na aba)`);
+});
+
+test('número da linha inválido: start() lança o erro sem começar a execução, mesmo com a linha detectada na aba', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const { fake, archive } = setUp({ chats: sidebarChats(['Ana']) });
+  const orch = createOrchestrator();
+  fake.content.onExport = deliveringExport(orch);
+
+  for (const [linePhone, digits] of [['99999-9999', 9], ['+999 9999 99999-9999', 16], ['sem número', 0]]) {
+    await assert.rejects(
+      orch.start({ safeDelayMs: 0, linePhone }),
+      { message: `Número da linha inválido (${digits} dígito(s)): informe de 10 a 15 dígitos, com o DDI (ex.: 5511999999999).` },
+      linePhone
+    );
+    assert.equal(orch.isBusy(), false);
+    assert.equal(orch.getState().state, WORKFLOW_STATES.IDLE);
+    assert.equal(orch.run, null);
+  }
+  assert.equal(fake.content.readyChecks, 0);
+  assert.equal(archive.calls.length, 0);
+
+  // Campo em branco é o mesmo que não informar o número
+  await orch.start({ safeDelayMs: 0, linePhone: '  ' });
+  assert.equal(orch.getState().state, WORKFLOW_STATES.COMPLETED);
+  assert.deepEqual(orch.run.line, { phone: FAKE_LINE_PHONE, source: 'auto' });
+});
+
+test('retomada depois de reinício com a aba em outra conta: a execução continua pausada, sem exportar nada, até a aba voltar à linha dela', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const chats = sidebarChats(['Ana', 'Bia', 'Caio', 'Davi']);
+  const { fake: fakeA, archive } = setUp({ chats });
+  const snapshot = await snapshotStalledAt(fakeA, 'Caio');
+  assert.deepEqual(snapshot.extractionRun.line, { phone: FAKE_LINE_PHONE, source: 'auto' });
+
+  const { fake: fakeB, orch: orchB } = await restartWith(snapshot, { chats, line: accountLine(OTHER_LINE_PHONE) });
+  assert.equal(orchB.resume(), true);
+  await orchB._loopPromise;
+
+  const message = otherAccountMessage(OTHER_LINE_PHONE, FAKE_LINE_PHONE);
+  const refused = orchB.getState();
+  assert.deepEqual([refused.state, refused.statusMessage, refused.errorMessage], [WORKFLOW_STATES.PAUSED, message, null]);
+  assert.equal(orchB.isBusy(), false);
+  // A aba só foi conferida: nada exportado nem empacotado
+  assert.deepEqual(fakeB.receivedActions(), [ACTIONS.CHECK_PAGE_READY]);
+  assert.equal(archive.calls.length, 0);
+  // O popup recebe o aviso, e a pausa com a mensagem fica no storage
+  assert.equal(fakeB.progressUpdates().at(-1).warningMessage, message);
+  assert.deepEqual(
+    [fakeB.readStorage('extractionRun').state, fakeB.readStorage('extractionRun').statusMessage],
+    [WORKFLOW_STATES.PAUSED, message]
+  );
+
+  // A aba volta à conta da execução: "Retomar" continua de Caio
+  fakeB.content.line = accountLine(FAKE_LINE_PHONE);
+  assert.equal(orchB.resume(), true);
+  await orchB._loopPromise;
+
+  assert.equal(orchB.getState().state, WORKFLOW_STATES.COMPLETED);
+  assert.deepEqual(fakeB.content.exportRequests.map((m) => m.chat.title), ['Caio', 'Davi']);
+  assert.equal(archive.calls.length, 1);
+  assert.deepEqual(archive.calls[0].stagedKeys, ['000000', '000001', '000002', '000003']);
+  assert.equal(archive.calls[0].report.split('\n')[3], `Linha: ${FAKE_LINE_PHONE} (detectada na aba)`);
+});
+
+test('cancelamento enquanto a retomada depois de reinício confere a aba: a execução fica cancelada, e não pausada pela outra conta', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const chats = sidebarChats(['Ana', 'Bia', 'Caio']);
+  const { fake: fakeA, archive } = setUp({ chats });
+  const snapshot = await snapshotStalledAt(fakeA, 'Caio');
+
+  const { fake: fakeB, orch: orchB } = await restartWith(snapshot, { chats, line: accountLine(OTHER_LINE_PHONE) });
+  // A aba demora a responder o CHECK_PAGE_READY, e o usuário cancela nesse meio-tempo
+  const answer = createDeferred();
+  let checkPending = false;
+  const realSendMessage = fakeB.api.tabs.sendMessage;
+  fakeB.api.tabs.sendMessage = async (tabId, message) => {
+    if (message.action === ACTIONS.CHECK_PAGE_READY) {
+      checkPending = true;
+      await answer.promise;
+    }
+    return realSendMessage(tabId, message);
+  };
+
+  assert.equal(orchB.resume(), true);
+  const loop = orchB._loopPromise;
+  await waitUntil(() => checkPending, { description: 'CHECK_PAGE_READY da retomada enviado' });
+  await orchB.cancel();
+  answer.resolve();
+  await loop;
+
+  assert.deepEqual([orchB.getState().state, orchB.getState().statusMessage], [WORKFLOW_STATES.CANCELLED, 'Extração cancelada.']);
+  assert.equal(orchB.isPaused, false);
+  assert.deepEqual(fakeB.content.exportRequests, []);
+  assert.equal(archive.calls.length, 0);
+  assert.equal(fakeB.readStorage('extractionRun').state, WORKFLOW_STATES.CANCELLED);
+});
+
+test('retomada depois de reinício com a aba sem a linha detectada: a execução segue, com um aviso no popup', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const chats = sidebarChats(['Ana', 'Bia', 'Caio']);
+  const { fake: fakeA, archive } = setUp({ chats });
+  const snapshot = await snapshotStalledAt(fakeA, 'Caio');
+
+  const { fake: fakeB, orch: orchB } = await restartWith(snapshot, { chats, line: null });
+  assert.equal(orchB.resume(), true);
+  await orchB._loopPromise;
+
+  assert.equal(orchB.getState().state, WORKFLOW_STATES.COMPLETED);
+  assert.deepEqual(fakeB.content.exportRequests.map((m) => m.chat.title), ['Caio']);
+  assert.deepEqual(fakeB.progressUpdates().map((m) => m.warningMessage).filter(Boolean), [lineNotCheckedWarning(FAKE_LINE_PHONE)]);
+  // A linha da execução continua a do início
+  assert.deepEqual(orchB.run.line, { phone: FAKE_LINE_PHONE, source: 'auto' });
+  assert.equal(archive.calls[0].report.split('\n')[3], `Linha: ${FAKE_LINE_PHONE} (detectada na aba)`);
+});
+
+test('pausa no meio da fila e troca de conta na aba: "Retomar" pergunta a linha à aba e volta a pausar, até a aba voltar à conta da execução', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const { fake, archive } = setUp({ chats: sidebarChats(['Ana', 'Bia', 'Caio']) });
+  const orch = createOrchestrator();
+  const deliver = deliveringExport(orch);
+  fake.content.onExport = (message) => {
+    if (message.chat.title === 'Bia') orch.pause();
+    return deliver(message);
+  };
+
+  const loop = orch.start({ safeDelayMs: 0 });
+  await waitUntil(() => orch.run?.nextIndex === 2, { description: 'fim da exportação de "Bia"' });
+  // Folga para o laço chegar à espera da retomada
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(orch.getState().state, WORKFLOW_STATES.PAUSED);
+
+  // Durante a pausa, a aba entra em outra conta
+  fake.content.line = accountLine(OTHER_LINE_PHONE);
+  assert.equal(orch.resume(), true);
+  const message = otherAccountMessage(OTHER_LINE_PHONE, FAKE_LINE_PHONE);
+  await waitUntil(() => orch.getState().statusMessage === message, { description: 'volta à pausa com a aba em outra conta' });
+
+  assert.equal(orch.getState().state, WORKFLOW_STATES.PAUSED);
+  assert.equal(orch.isBusy(), true);
+  assert.deepEqual(fake.content.exportRequests.map((m) => m.chat.title), ['Ana', 'Bia']);
+  assert.equal(fake.progressUpdates().at(-1).warningMessage, message);
+  assert.equal(fake.readStorage('extractionRun').statusMessage, message);
+  assert.equal(countAction(fake, ACTIONS.CHECK_PAGE_READY), 2);
+
+  // De volta à conta da execução, a retomada segue de Caio
+  fake.content.line = accountLine(FAKE_LINE_PHONE);
+  assert.equal(orch.resume(), true);
+  await loop;
+
+  assert.equal(orch.getState().state, WORKFLOW_STATES.COMPLETED);
+  assert.deepEqual(fake.content.exportRequests.map((m) => m.chat.title), ['Ana', 'Bia', 'Caio']);
+  // A linha é perguntada à aba na retomada, antes de exportar a conversa seguinte
+  const actions = fake.receivedActions();
+  assert.equal(countAction(fake, ACTIONS.CHECK_PAGE_READY), 3);
+  const lastCheck = actions.lastIndexOf(ACTIONS.CHECK_PAGE_READY);
+  assert.deepEqual(actions.slice(lastCheck, lastCheck + 2), [ACTIONS.CHECK_PAGE_READY, ACTIONS.EXPORT_CHAT_REQUEST]);
+  assert.equal(archive.calls.length, 1);
+});
+
+test('reinício na repescagem com a aba em outra conta: a rodada só continua quando a aba volta à linha da execução', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const chats = sidebarChats(['Ana', 'Bia', 'Caio', 'Davi']);
+  const { fake: fakeA, archive } = setUp({ chats });
+  const snapshot = await snapshotDuringRetry(fakeA, { stallAt: 1 });
+
+  const { fake: fakeB, orch: orchB } = await restartWith(snapshot, { chats, line: accountLine(OTHER_LINE_PHONE) });
+  assert.equal(orchB.resume(), true);
+  await orchB._loopPromise;
+
+  const refused = orchB.getState();
+  assert.deepEqual([refused.state, refused.statusMessage], [WORKFLOW_STATES.PAUSED, otherAccountMessage(OTHER_LINE_PHONE, FAKE_LINE_PHONE)]);
+  // Nem a lista lateral nem as conversas da rodada foram pedidas à aba
+  assert.deepEqual(fakeB.receivedActions(), [ACTIONS.CHECK_PAGE_READY]);
+  assert.equal(orchB.run.retry.cursor, 0);
+
+  fakeB.content.line = accountLine(FAKE_LINE_PHONE);
+  assert.equal(orchB.resume(), true);
+  await orchB._loopPromise;
+
+  assert.equal(orchB.getState().state, WORKFLOW_STATES.COMPLETED);
+  assert.deepEqual(fakeB.content.exportRequests.map((m) => m.chat.title), ['Bia', 'Davi']);
+  assert.deepEqual(orchB.run.results.map((r) => r.attempts), [1, 2, 1, 2]);
+  assert.equal(archive.calls.length, 1);
+});
+
+test('execução gravada por uma versão anterior, sem a linha: a retomada segue sem conferir a conta, e o relatório e o log dizem que a linha não foi registrada', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const chats = sidebarChats(['Ana', 'Bia', 'Caio']);
+  const { fake: fakeA, archive } = setUp({ chats });
+  const snapshot = await snapshotWithoutUnexpectedFiles(fakeA);
+  delete snapshot.extractionRun.line;
+
+  // A aba está em outra conta, mas sem a linha da execução não há com o que comparar
+  const { fake: fakeB, orch: orchB } = await restartWith(snapshot, { chats, line: accountLine(OTHER_LINE_PHONE) });
+  assert.equal(orchB.run.line, undefined);
+  assert.equal(orchB.resume(), true);
+  await orchB._loopPromise;
+
+  assert.equal(orchB.getState().state, WORKFLOW_STATES.COMPLETED);
+  assert.deepEqual(fakeB.content.exportRequests.map((m) => m.chat.title), ['Caio']);
+  assert.equal(fakeB.content.readyChecks, 1);
+  assert.deepEqual(fakeB.progressUpdates().map((m) => m.warningMessage).filter(Boolean), []);
+  const notRecorded = 'Linha: não registrada (execução iniciada por uma versão anterior da extensão)';
+  const { report, executionLog } = archive.calls[0];
+  assert.equal(report.split('\n')[3], notRecorded);
+  assert.equal(executionLog.split('\n')[2], notRecorded);
 });

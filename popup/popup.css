@@ -111,6 +111,16 @@ body {
   color: var(--text-main);
 }
 
+.status-line {
+  font-size: 12px;
+  color: var(--text-main);
+  margin-top: 4px;
+}
+
+.status-line.missing {
+  color: var(--status-warn);
+}
+
 /* Opções de extração */
 .radio-group {
   display: flex;
@@ -166,6 +176,12 @@ body {
 .number-input:disabled {
   opacity: 0.4;
   cursor: not-allowed;
+}
+
+/* Cabe um número com DDI e formatação colada (ex: +55 11 99999-9999) */
+.line-phone-input {
+  width: 130px;
+  text-align: left;
 }
 
 /* Barra de Progresso */

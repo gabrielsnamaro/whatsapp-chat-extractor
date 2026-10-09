@@ -5,6 +5,7 @@ import { StorageClient } from '../shared/clients/storage-client.js';
 import { inspectChatExport } from '../shared/archive/chat-export-inspector.js';
 import { REPORT_FILENAME } from '../shared/archive/archive-packager.js';
 import { findWhatsAppTab } from '../shared/utils/whatsapp-tab.js';
+import { normalizePhoneDigits } from '../shared/utils/phone.js';
 import { Logger } from '../shared/utils/logger.js';
 import { DownloadInterceptor } from './download-interceptor.js';
 import { ExportCaptureRegistry, CAPTURE_ERROR_CODES } from './export-capture-registry.js';
@@ -112,6 +113,24 @@ const SCAN_STOP_LABELS = Object.freeze({
   'scroll-stalled': 'parou porque a rolagem travou antes do fim da lista, que pode ter ficado incompleta',
   'limit-reached': 'parou ao atingir o limite escolhido',
   'time-limit': 'parou no tempo máximo da varredura, e a lista pode ter ficado incompleta'
+});
+
+// Toda conversa exportada é de uma linha só: sem a linha da conta (a detectada na aba ou a informada no popup), a
+// extração não começa. O popup reconhece esta falha pelo código (popup/popup.js) e mostra o campo do número
+const LINE_NOT_DETECTED_CODE = 'LINE_NOT_DETECTED';
+const LINE_NOT_DETECTED_MESSAGE =
+  'Não foi possível detectar o número da linha (a conta logada no WhatsApp Web). Informe o número no popup para iniciar.';
+
+// Os mesmos limites de phoneFromTitle (shared/utils/phone.js): menos de 10 dígitos não chega a ser DDD + número,
+// e mais de 15 passa do máximo do E.164
+const LINE_PHONE_MIN_DIGITS = 10;
+const LINE_PHONE_MAX_DIGITS = 15;
+
+// De onde veio a linha da execução: da aba (o content a lê do localStorage da página) ou do popup
+const LINE_SOURCES = Object.freeze({ AUTO: 'auto', MANUAL: 'manual' });
+const LINE_SOURCE_LABELS = Object.freeze({
+  [LINE_SOURCES.AUTO]: 'detectada na aba',
+  [LINE_SOURCES.MANUAL]: 'informada no popup'
 });
 
 class RunCancelledError extends Error {
@@ -231,6 +250,65 @@ function errorCodeOf(source) {
 }
 
 /**
+ * Número da linha informado no popup, que só o manda quando não detectou a linha na aba
+ * @param {unknown} value
+ * @returns {string|null} Os dígitos; null quando nenhum número foi informado
+ * @throws {Error} Número com menos de 10 ou mais de 15 dígitos
+ */
+function typedLinePhoneOf(value) {
+  if (value == null || String(value).trim() === '') return null;
+  const digits = normalizePhoneDigits(value) ?? '';
+  if (digits.length < LINE_PHONE_MIN_DIGITS || digits.length > LINE_PHONE_MAX_DIGITS) {
+    throw new Error(
+      `Número da linha inválido (${digits.length} dígito(s)): informe de ${LINE_PHONE_MIN_DIGITS} a ` +
+        `${LINE_PHONE_MAX_DIGITS} dígitos, com o DDI (ex.: 5511999999999).`
+    );
+  }
+  return digits;
+}
+
+/**
+ * Linha da conta logada na aba, pela resposta ao CHECK_PAGE_READY (`line`, que o content lê do localStorage da página)
+ * @param {Object|null} status
+ * @returns {string|null} Os dígitos; null quando a aba não detectou a linha ou não respondeu
+ */
+function tabLinePhoneOf(status) {
+  const phone = status?.line?.phone;
+  return typeof phone === 'string' && /^\d+$/.test(phone) ? phone : null;
+}
+
+/**
+ * Linha da execução: a detectada na aba e, sem ela, a informada no popup
+ * @param {string|null} tabLinePhone
+ * @param {string|null} typedLinePhone
+ * @returns {{ phone: string, source: string }}
+ * @throws {Error} Com o código LINE_NOT_DETECTED, sem nenhuma das duas
+ */
+function resolveRunLine(tabLinePhone, typedLinePhone) {
+  if (tabLinePhone) {
+    if (typedLinePhone && typedLinePhone !== tabLinePhone) {
+      log.info('O número informado no popup não é o da linha detectada na aba; vale a detectada.');
+    }
+    return { phone: tabLinePhone, source: LINE_SOURCES.AUTO };
+  }
+  if (typedLinePhone) return { phone: typedLinePhone, source: LINE_SOURCES.MANUAL };
+  const error = new Error(LINE_NOT_DETECTED_MESSAGE);
+  error.code = LINE_NOT_DETECTED_CODE;
+  throw error;
+}
+
+/**
+ * Linha da execução no cabeçalho do relatório e do log
+ * @param {{ phone: string, source: string }|null|undefined} line
+ * @returns {string}
+ */
+function describeLine(line) {
+  // Uma execução iniciada por uma versão anterior da extensão não tem a linha
+  if (!line) return 'Linha: não registrada (execução iniciada por uma versão anterior da extensão)';
+  return `Linha: ${line.phone} (${LINE_SOURCE_LABELS[line.source] ?? line.source})`;
+}
+
+/**
  * @typedef {Object} AttemptRecord Uma tentativa de exportar a conversa, no histórico do resultado dela
  * @property {number} attempt 1 na fila, 2 na repescagem
  * @property {string|null} startedAt Início, em ISO; null numa tentativa registrada por uma versão anterior da extensão
@@ -309,6 +387,8 @@ export class ExtractionOrchestrator {
     this.state = WORKFLOW_STATES.IDLE;
     this.isPaused = false;
     this.errorMessage = null;
+    /** Código da falha da execução (ex: LINE_NOT_DETECTED, que o popup reconhece); null sem código */
+    this.errorCode = null;
     this.statusMessage = null;
     this.currentIndex = 0;
     this.currentChatTitle = '';
@@ -316,10 +396,12 @@ export class ExtractionOrchestrator {
     this.scanFound = 0;
 
     /**
-     * `retry` é a repescagem: null até a fila terminar; `indices` são as posições na fila que entraram
-     * nela, `cursor` a próxima a exportar e `startsAt` quando a rodada pode começar. `scan` são as
-     * estatísticas da varredura (null até ela terminar).
-     * @type {{ runId: string, tabId: number|null, options: Object, queue: Array, nextIndex: number, results: Array, unexpectedFiles: Array, retry: { indices: number[], cursor: number, startsAt: string }|null, scan: { found: number, steps: number, durationMs: number, stopReason: string, lastChatTimestamp: string|null }|null, startedAt: string }|null}
+     * `line` é a linha da conta (o número da conta logada no WhatsApp Web), a detectada na aba (`auto`) ou a
+     * informada no popup (`manual`): null até a aba ser conferida no início, e ausente numa execução iniciada
+     * por uma versão anterior da extensão. `retry` é a repescagem: null até a fila terminar; `indices` são as
+     * posições na fila que entraram nela, `cursor` a próxima a exportar e `startsAt` quando a rodada pode
+     * começar. `scan` são as estatísticas da varredura (null até ela terminar).
+     * @type {{ runId: string, tabId: number|null, line: { phone: string, source: 'auto'|'manual' }|null, options: Object, queue: Array, nextIndex: number, results: Array, unexpectedFiles: Array, retry: { indices: number[], cursor: number, startsAt: string }|null, scan: { found: number, steps: number, durationMs: number, stopReason: string, lastChatTimestamp: string|null }|null, startedAt: string }|null}
      */
     this.run = null;
     /** A fila ainda não foi para o storage; vai na próxima gravação do estado (_persistRun) */
@@ -358,7 +440,7 @@ export class ExtractionOrchestrator {
     const saved = stored[RUN_STORAGE_KEY];
     if (!saved) return;
 
-    const { state, errorMessage, statusMessage, currentIndex, currentChatTitle, ...run } = saved;
+    const { state, errorMessage, errorCode, statusMessage, currentIndex, currentChatTitle, ...run } = saved;
     if (Array.isArray(run.queue)) {
       // Gravada por uma versão anterior da extensão, com a fila e os resultados dentro do estado: a próxima
       // gravação os passa para as chaves próprias, no mesmo `set` do estado
@@ -378,6 +460,7 @@ export class ExtractionOrchestrator {
     if (!wasRunning) {
       this.state = state;
       this.errorMessage = errorMessage || null;
+      this.errorCode = errorCode || null;
       this.statusMessage = statusMessage || null;
       return;
     }
@@ -439,6 +522,7 @@ export class ExtractionOrchestrator {
       scanFound: this.scanFound,
       currentChatTitle: this.currentChatTitle,
       errorMessage: this.errorMessage,
+      errorCode: this.errorCode,
       statusMessage: this.statusMessage,
       summary: {
         saved: results.filter((r) => r.status === RESULT_STATUS.SAVED).length,
@@ -525,6 +609,7 @@ export class ExtractionOrchestrator {
         ...rest,
         state: this.state,
         errorMessage: this.errorMessage,
+        errorCode: this.errorCode,
         statusMessage: this.statusMessage,
         currentIndex: this.currentIndex,
         currentChatTitle: this.currentChatTitle
@@ -600,7 +685,8 @@ export class ExtractionOrchestrator {
   }
 
   /**
-   * Retoma o fluxo pausado, inclusive uma execução restaurada após reinício do service worker
+   * Retoma o fluxo pausado, inclusive uma execução restaurada após reinício do service worker. Antes de voltar
+   * a exportar, a linha da aba é conferida (_confirmTabLine): com a aba em outra conta, a execução continua pausada.
    * @returns {boolean}
    */
   resume() {
@@ -617,8 +703,11 @@ export class ExtractionOrchestrator {
     } else if (!this.isBusy() && this.run) {
       this._execute(async (signal) => {
         if (this.run.nextIndex < this.run.queue.length || this._hasPendingRetry()) {
-          const tab = await this._prepareTab(this.run.tabId);
+          const { tab, linePhone } = await this._prepareTab(this.run.tabId);
+          // Cancelada enquanto a aba era preparada: a pausa da conferência não pode sobrescrever o cancelamento
+          if (signal.aborted) throw new RunCancelledError();
           this.run.tabId = tab.id;
+          if (!this._confirmTabLine(linePhone)) return;
         }
         await this._processQueue(signal);
       });
@@ -626,6 +715,38 @@ export class ExtractionOrchestrator {
 
     this._notifyProgress();
     return true;
+  }
+
+  /**
+   * Confere a linha da aba quando a execução volta a usá-la, depois de uma pausa ou de um reinício do service
+   * worker: a aba pode ter entrado em outra conta nesse meio-tempo, e uma execução não mistura linhas. Com a aba
+   * em outra conta, a execução volta para a pausa; sem a linha detectada na aba, segue com um aviso. Uma execução
+   * iniciada por uma versão anterior da extensão não tem a linha, e segue sem conferir.
+   * @private
+   * @param {string|null} tabLinePhone Linha detectada na aba agora
+   * @returns {boolean} false quando a execução voltou para a pausa
+   */
+  _confirmTabLine(tabLinePhone) {
+    const expected = this.run.line?.phone;
+    if (!expected || tabLinePhone === expected) return true;
+
+    if (!tabLinePhone) {
+      log.warn('Linha da aba não detectada na retomada; a extração segue sem conferir a conta.');
+      // Só o popup: o aviso não muda o estado da execução
+      this._sendProgressToPopup({
+        warningMessage: '⚠️ A linha da aba do WhatsApp Web não foi detectada, e a conta dela não pôde ser conferida. ' +
+          `Esta extração é da linha +${expected}: confira se a aba está logada nessa conta.`
+      });
+      return true;
+    }
+
+    this.isPaused = true;
+    this.state = WORKFLOW_STATES.PAUSED;
+    this.statusMessage = `A aba do WhatsApp Web está logada em outra conta (linha +${tabLinePhone}). ` +
+      `Esta extração é da linha +${expected}: entre na conta da linha +${expected} e clique em "Retomar".`;
+    log.warn('Retomada recusada: a aba está logada em outra conta.');
+    this._notifyProgress({ warningMessage: this.statusMessage });
+    return false;
   }
 
   /**
@@ -736,19 +857,23 @@ export class ExtractionOrchestrator {
    * @param {number} [options.safeDelayMs=2000] Intervalo base entre conversas, em ms (recebe variação aleatória de
    *   até +50%). Aceita qualquer número finito ≥ 0: o mínimo de 1 s para o usuário é aplicado no popup, e os testes usam 0
    * @param {number} [options.retryCooldownMs=60000] Espera entre o fim da fila e a repescagem
+   * @param {string|null} [options.linePhone=null] Número da linha informado no popup, que só o manda quando não
+   *   detectou a linha na aba. Aceita o número formatado; vale só se a aba também não detectar a linha no início
    * @returns {Promise<void>}
    */
-  async start({ maxChats = null, downloadAll = true, safeDelayMs = 2000, retryCooldownMs = RETRY_COOLDOWN_MS } = {}) {
+  async start({ maxChats = null, downloadAll = true, safeDelayMs = 2000, retryCooldownMs = RETRY_COOLDOWN_MS, linePhone = null } = {}) {
     if (this.isBusy()) {
       throw new Error('Já existe uma extração em andamento.');
     }
     if (typeof safeDelayMs !== 'number' || !Number.isFinite(safeDelayMs) || safeDelayMs < 0) {
       throw new Error(`Intervalo entre conversas inválido: ${String(safeDelayMs)} (esperado um número de milissegundos ≥ 0).`);
     }
+    const typedLinePhone = typedLinePhoneOf(linePhone);
 
     // Uma execução pausada ou interrompida anterior é descartada ao iniciar outra
     this.isPaused = false;
     this.errorMessage = null;
+    this.errorCode = null;
     this.statusMessage = null;
     this.currentIndex = 0;
     this.currentChatTitle = '';
@@ -756,6 +881,7 @@ export class ExtractionOrchestrator {
     this.run = {
       runId: Date.now().toString(36),
       tabId: null,
+      line: null,
       options: { maxChats, downloadAll, safeDelayMs, retryCooldownMs },
       queue: [],
       nextIndex: 0,
@@ -771,8 +897,10 @@ export class ExtractionOrchestrator {
     return this._execute(async (signal) => {
       await this._removePreviousRun();
       await StagingRepository.clear();
-      const tab = await this._prepareTab();
+      const { tab, linePhone: tabLinePhone } = await this._prepareTab();
       this.run.tabId = tab.id;
+      this.run.line = resolveRunLine(tabLinePhone, typedLinePhone);
+      log.info(`Linha da execução: ${this.run.line.phone} (${LINE_SOURCE_LABELS[this.run.line.source]}).`);
       await this._scan(signal);
       await this._processQueue(signal);
     });
@@ -800,6 +928,7 @@ export class ExtractionOrchestrator {
           log.error('Erro crítico no fluxo do orquestrador:', err);
           this.state = WORKFLOW_STATES.FAILED;
           this.errorMessage = err.message;
+          this.errorCode = errorCodeOf(err);
         }
         this._activeState = this.state;
         this.isPaused = false;
@@ -838,8 +967,24 @@ export class ExtractionOrchestrator {
       await new Promise((resolve) => {
         this._resumeResolver = resolve;
       });
+      if (!this.isPaused && !signal.aborted) await this._checkTabLineOnResume(signal);
     }
     if (signal.aborted) throw new RunCancelledError();
+  }
+
+  /**
+   * Na retomada de uma pausa do laço, pergunta a linha à aba (CHECK_PAGE_READY) e a confere (_confirmTabLine):
+   * com a aba em outra conta, a execução volta para a pausa
+   * @private
+   * @param {AbortSignal} signal
+   */
+  async _checkTabLineOnResume(signal) {
+    // Sem a linha na execução não há com o que comparar, e a aba nem é consultada
+    if (!this.run.line) return;
+    const status = await this._pingTab(this.run.tabId);
+    // Cancelada durante a consulta: a pausa da conferência não pode sobrescrever o cancelamento
+    if (signal.aborted) return;
+    this._confirmTabLine(tabLinePhoneOf(status));
   }
 
   /**
@@ -893,7 +1038,8 @@ export class ExtractionOrchestrator {
    * a extensão, a aba já aberta fica sem content script até ser recarregada, então ele é reinjetado.
    * @private
    * @param {number|null} [preferredTabId=null]
-   * @returns {Promise<chrome.tabs.Tab>}
+   * @returns {Promise<{ tab: chrome.tabs.Tab, linePhone: string|null }>} A aba e a linha da conta logada nela, na
+   *   mesma resposta que confere a aba; null quando a aba não detecta a linha
    */
   async _prepareTab(preferredTabId = null) {
     const tab = await findWhatsAppTab({ preferredTabId });
@@ -915,7 +1061,7 @@ export class ExtractionOrchestrator {
     if (!status.ready) {
       throw new Error('O WhatsApp Web ainda não está pronto (carregando ou aguardando a leitura do QR Code).');
     }
-    return tab;
+    return { tab, linePhone: tabLinePhoneOf(status) };
   }
 
   /**
@@ -1312,7 +1458,7 @@ export class ExtractionOrchestrator {
    * @returns {string}
    */
   _buildReport() {
-    const { queue, results, options, retry, scan, startedAt } = this.run;
+    const { queue, results, options, retry, scan, startedAt, line } = this.run;
     const summary = this.getState().summary;
     const omittedMedia = results.reduce((total, result) => total + (result?.omittedMediaCount ?? 0), 0);
     // Conversa salva sem contagem (não inspecionada ou formato não reconhecido) deixa o total abaixo do real
@@ -1327,6 +1473,7 @@ export class ExtractionOrchestrator {
       'Relatório de extração - WhatsApp Web Extractor',
       `Início: ${new Date(startedAt).toLocaleString('pt-BR')}`,
       `Geração do ZIP: ${new Date().toLocaleString('pt-BR')}`,
+      describeLine(line),
       `Modo: ${describeMode(options)}`
     ];
     // Uma execução gravada por uma versão anterior da extensão não tem as estatísticas da varredura
@@ -1442,7 +1589,7 @@ export class ExtractionOrchestrator {
    * @returns {string}
    */
   _buildExecutionLog() {
-    const { runId, queue, results, options, retry, scan, startedAt } = this.run;
+    const { runId, queue, results, options, retry, scan, startedAt, line } = this.run;
 
     const attemptEvents = (belongs) => queue.flatMap((chat, index) => {
       const result = results[index];
@@ -1474,6 +1621,7 @@ export class ExtractionOrchestrator {
     const lines = [
       'Log da execução - WhatsApp Web Extractor',
       `Execução: ${runId} | início: ${new Date(startedAt).toLocaleString('pt-BR')} | versão da extensão: ${chrome.runtime.getManifest().version}`,
+      describeLine(line),
       `Modo: ${describeMode(options)} | intervalo entre conversas: ${formatSeconds(options.safeDelayMs)}, com variação de até +50%`,
       scan ? this._describeScan(scan) : 'Varredura: sem estatísticas registradas nesta execução.'
     ];

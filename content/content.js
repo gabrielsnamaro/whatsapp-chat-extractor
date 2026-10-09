@@ -31,6 +31,11 @@
   // sem outro intervalo marcado). O background marca a conversa no relatório por este código
   const DATE_RANGE_UNCONFIRMED_WARNING = 'DATE_RANGE_UNCONFIRMED';
 
+  // Conta logada (a linha): o WhatsApp Web grava o id dela em `last-wid-md`, como texto JSON
+  // ("<dígitos>:<dispositivo>@c.us"). A chave `WALid` traz o LID da conta, que não é o telefone
+  const ACCOUNT_LINE_STORAGE_KEY = 'last-wid-md';
+  const ACCOUNT_WID_PATTERN = /^(\d{8,15})(?::\d+)?@c\.us$/;
+
   /** @type {AbortController|null} Operação DOM em andamento (scan ou exportação) */
   let currentOperation = null;
   /** @type {string|null} Captura aguardando o arquivo gerado pela exportação atual */
@@ -51,6 +56,32 @@
   /** Sessão logada: o painel lateral só existe depois da leitura do QR Code */
   function isSessionReady() {
     return Boolean(document.querySelector(SELECTORS.SIDE_PANEL) && document.querySelector(SELECTORS.PANE_SIDE));
+  }
+
+  /**
+   * Linha da conta logada, lida do localStorage da página (o content script é da mesma origem)
+   * @returns {{ phone: string, source: string }|null} Os dígitos do número, sem o "+"; null quando a chave falta,
+   *   não tem o formato esperado ou o localStorage não pode ser lido
+   */
+  function readAccountLine() {
+    let raw;
+    try {
+      raw = window.localStorage.getItem(ACCOUNT_LINE_STORAGE_KEY);
+    } catch (err) {
+      console.warn('[WhatsApp Web Extractor] Falha ao ler a linha da conta no localStorage da página:', err);
+      return null;
+    }
+    if (typeof raw !== 'string') return null;
+
+    let wid = raw.trim();
+    try {
+      const parsed = JSON.parse(wid);
+      if (typeof parsed === 'string') wid = parsed;
+    } catch (_) {
+      // Gravado sem as aspas: vale o texto como está
+    }
+    const match = ACCOUNT_WID_PATTERN.exec(wid);
+    return match ? { phone: match[1], source: ACCOUNT_LINE_STORAGE_KEY } : null;
   }
 
   async function sendToBackground(message) {
@@ -137,7 +168,7 @@
       try {
         switch (message.action) {
           case 'CHECK_PAGE_READY': {
-            sendResponse({ success: true, ready: isSessionReady(), url: window.location.href });
+            sendResponse({ success: true, ready: isSessionReady(), url: window.location.href, line: readAccountLine() });
             return;
           }
 

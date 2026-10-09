@@ -13,6 +13,18 @@ export const WHATSAPP_TAB_ID = 7;
 const WHATSAPP_URL = 'https://web.whatsapp.com/';
 const NO_RECEIVER_ERROR = 'Could not establish connection. Receiving end does not exist.';
 
+/** Linha (número fictício) da conta logada na aba simulada, por padrão */
+export const FAKE_LINE_PHONE = '5511900000000';
+
+/**
+ * Linha como o content real a devolve no CHECK_PAGE_READY, lida da chave `last-wid-md` do localStorage
+ * @param {string} phone
+ * @returns {{ phone: string, source: string }}
+ */
+export function accountLine(phone) {
+  return { phone, source: 'last-wid-md' };
+}
+
 function createEvent() {
   const listeners = new Set();
   return {
@@ -38,13 +50,17 @@ function urlPatternToRegExp(pattern) {
  * chrome.downloads; sem ele, a leitura falha. `onResetSidebar` responde ao RESET_SIDEBAR (antes da
  * repescagem); sem ele, a lista volta ao normal com sucesso. Na varredura, `onScan` roda antes da
  * resposta (ex: para avisar o andamento, como o content real faz durante a rolagem), e `scanStats`, se
- * definido, vai na resposta como as estatísticas da varredura; sem ele, a resposta não as traz.
+ * definido, vai na resposta como as estatísticas da varredura; sem ele, a resposta não as traz. `line` é a
+ * linha da conta logada que o CHECK_PAGE_READY devolve (accountLine); null simula a aba que não a detecta, e
+ * trocá-la no meio do teste simula a aba entrando em outra conta.
  */
-function createFakeContent({ chats, ready }) {
+function createFakeContent({ chats, ready, line }) {
   const content = {
     present: true,
     injected: false,
     ready,
+    /** @type {{ phone: string, source: string }|null} */
+    line,
     chats,
     readyChecks: 0,
     received: [],
@@ -65,7 +81,7 @@ function createFakeContent({ chats, ready }) {
       switch (message.action) {
         case ACTIONS.CHECK_PAGE_READY:
           content.readyChecks++;
-          return { success: true, ready: content.ready, url: WHATSAPP_URL };
+          return { success: true, ready: content.ready, url: WHATSAPP_URL, line: content.line ? structuredClone(content.line) : null };
 
         case ACTIONS.SCAN_CHATS_REQUEST: {
           if (content.onScan) await content.onScan(message);
@@ -122,12 +138,14 @@ function createFakeContent({ chats, ready }) {
  * @param {Object} [options]
  * @param {Array<{ id: string, title: string, duplicateTitle?: boolean }>} [options.chats]
  * @param {boolean} [options.ready=true] Resposta do CHECK_PAGE_READY
+ * @param {{ phone: string, source: string }|null} [options.line] Linha da conta no CHECK_PAGE_READY (padrão: a de
+ *   FAKE_LINE_PHONE); null simula a aba que não a detecta
  * @param {Object} [options.storage] Conteúdo inicial do chrome.storage.local (clonado)
  */
-export function createFakeChrome({ chats = [], ready = true, storage = {} } = {}) {
+export function createFakeChrome({ chats = [], ready = true, line = accountLine(FAKE_LINE_PHONE), storage = {} } = {}) {
   const store = new Map(Object.entries(structuredClone(storage)));
   const tabs = [{ id: WHATSAPP_TAB_ID, url: WHATSAPP_URL, active: true, lastAccessed: 1 }];
-  const content = createFakeContent({ chats, ready });
+  const content = createFakeContent({ chats, ready, line });
   const runtimeMessages = [];
   const injections = [];
   const downloadCalls = [];

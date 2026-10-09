@@ -33,10 +33,19 @@ test('phoneFromTitle: aceita parênteses, pontos, espaços nas pontas e marcas i
 test('phoneFromTitle: nome, mesmo com dígitos ou com um telefone dentro, não é telefone', () => {
   assert.equal(phoneFromTitle('Maria'), null);
   assert.equal(phoneFromTitle('Oficina 1500 Norte'), null);
+  // Forma de nome com dígitos vista nos títulos reais: nome, número e sigla
+  assert.equal(phoneFromTitle('Fulano 1234 AB'), null);
   assert.equal(phoneFromTitle('Ana +55 11 99999-9999'), null);
   assert.equal(phoneFromTitle('+55 11 99999-9999 (casa)'), null);
   // O "+" só vale no começo
   assert.equal(phoneFromTitle('55+11 99999-9999'), null);
+});
+
+test('phoneFromTitle: número da linha digitado no popup, só com os dígitos ou colado com a formatação; uma letra no lugar de um dígito invalida', () => {
+  assert.equal(phoneFromTitle('5511999999999'), '5511999999999');
+  assert.equal(phoneFromTitle('+55 (11) 99999-9999'), '5511999999999');
+  assert.equal(phoneFromTitle('55 11 99999 9999'), '5511999999999');
+  assert.equal(phoneFromTitle('551199999999O'), null);
 });
 
 test('phoneFromTitle: só de 10 a 15 dígitos', () => {
