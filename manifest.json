@@ -29,6 +29,7 @@
         "content/dom/chat-navigator.js",
         "content/dom/chat-options-menu.js",
         "content/dom/export-modal-handler.js",
+        "content/dom/contact-info-reader.js",
         "content/content.js"
       ],
       "run_at": "document_idle"

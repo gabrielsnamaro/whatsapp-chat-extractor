@@ -5,7 +5,7 @@ import { StorageClient } from '../shared/clients/storage-client.js';
 import { inspectChatExport } from '../shared/archive/chat-export-inspector.js';
 import { REPORT_FILENAME } from '../shared/archive/archive-packager.js';
 import { findWhatsAppTab } from '../shared/utils/whatsapp-tab.js';
-import { normalizePhoneDigits } from '../shared/utils/phone.js';
+import { normalizePhoneDigits, phoneFromTitle } from '../shared/utils/phone.js';
 import { Logger } from '../shared/utils/logger.js';
 import { DownloadInterceptor } from './download-interceptor.js';
 import { ExportCaptureRegistry, CAPTURE_ERROR_CODES } from './export-capture-registry.js';
@@ -121,10 +121,10 @@ const LINE_NOT_DETECTED_CODE = 'LINE_NOT_DETECTED';
 const LINE_NOT_DETECTED_MESSAGE =
   'Não foi possível detectar o número da linha (a conta logada no WhatsApp Web). Informe o número no popup para iniciar.';
 
-// Os mesmos limites de phoneFromTitle (shared/utils/phone.js): menos de 10 dígitos não chega a ser DDD + número,
-// e mais de 15 passa do máximo do E.164
-const LINE_PHONE_MIN_DIGITS = 10;
-const LINE_PHONE_MAX_DIGITS = 15;
+// Limites do número da linha e do telefone do contato lido no painel, os mesmos de phoneFromTitle
+// (shared/utils/phone.js): menos de 10 dígitos não chega a ser DDD + número, e mais de 15 passa do máximo do E.164
+const PHONE_MIN_DIGITS = 10;
+const PHONE_MAX_DIGITS = 15;
 
 // De onde veio a linha da execução: da aba (o content a lê do localStorage da página) ou do popup
 const LINE_SOURCES = Object.freeze({ AUTO: 'auto', MANUAL: 'manual' });
@@ -132,6 +132,19 @@ const LINE_SOURCE_LABELS = Object.freeze({
   [LINE_SOURCES.AUTO]: 'detectada na aba',
   [LINE_SOURCES.MANUAL]: 'informada no popup'
 });
+
+// Número brasileiro com o 9 depois do DDD: 55, o DDD, o 9 e mais 8 dígitos
+const BRAZILIAN_NINTH_DIGIT_PATTERN = /^55(\d{2})9(\d{8})$/;
+
+// Tipo da conversa, como a aba o devolve: o `chatKind` do menu de opções e o `kind` do painel "Dados do contato"
+// (DomUtils.CHAT_KINDS em content/dom/dom-utils.js; content script clássico não é importável aqui)
+const CHAT_KINDS = Object.freeze({ CHAT: 'chat', GROUP: 'group' });
+
+// De onde veio o telefone do contato: do título da conversa (contato não salvo) ou do painel "Dados do contato"
+const CONTACT_PHONE_SOURCES = Object.freeze({ TITLE: 'title', CONTACT_INFO: 'contact_info' });
+
+// Motivo do aviso quando o painel de uma conversa individual foi lido e não mostrou o número
+const CONTACT_PHONE_NOT_FOUND = 'número não encontrado no painel';
 
 class RunCancelledError extends Error {
   constructor() {
@@ -258,10 +271,10 @@ function errorCodeOf(source) {
 function typedLinePhoneOf(value) {
   if (value == null || String(value).trim() === '') return null;
   const digits = normalizePhoneDigits(value) ?? '';
-  if (digits.length < LINE_PHONE_MIN_DIGITS || digits.length > LINE_PHONE_MAX_DIGITS) {
+  if (digits.length < PHONE_MIN_DIGITS || digits.length > PHONE_MAX_DIGITS) {
     throw new Error(
-      `Número da linha inválido (${digits.length} dígito(s)): informe de ${LINE_PHONE_MIN_DIGITS} a ` +
-        `${LINE_PHONE_MAX_DIGITS} dígitos, com o DDI (ex.: 5511999999999).`
+      `Número da linha inválido (${digits.length} dígito(s)): informe de ${PHONE_MIN_DIGITS} a ` +
+        `${PHONE_MAX_DIGITS} dígitos, com o DDI (ex.: 5511999999999).`
     );
   }
   return digits;
@@ -309,6 +322,202 @@ function describeLine(line) {
 }
 
 /**
+ * A mesma linha com e sem o 9 depois do DDD de um número brasileiro. Só a conferência da retomada usa, e só com a linha
+ * digitada no popup: quem digita costuma pôr o 9, e o número da conta, como o WhatsApp o grava, pode vir sem ele
+ * @param {string} a
+ * @param {string} b
+ * @returns {boolean}
+ */
+function isSameLineIgnoringNinthDigit(a, b) {
+  const withoutNinthDigit = (phone) => phone.replace(BRAZILIAN_NINTH_DIGIT_PATTERN, '55$1$2');
+  return withoutNinthDigit(a) === withoutNinthDigit(b);
+}
+
+/**
+ * @param {unknown} value
+ * @returns {'chat'|'group'|null} null para qualquer valor que não seja um dos dois tipos
+ */
+function chatKindOf(value) {
+  return value === CHAT_KINDS.CHAT || value === CHAT_KINDS.GROUP ? value : null;
+}
+
+/**
+ * @param {unknown} value
+ * @returns {string|null} O texto aparado; null quando não é texto ou está em branco
+ */
+function textOf(value) {
+  return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+
+/**
+ * @param {unknown} value
+ * @returns {number|null} Milissegundos inteiros; null quando não é um número finito ≥ 0
+ */
+function durationOf(value) {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? Math.round(value) : null;
+}
+
+/**
+ * Telefone do contato lido no painel: só os dígitos, aceito com 10 a 15, como o da linha
+ * @param {unknown} value
+ * @returns {string|null}
+ */
+function contactPhoneOf(value) {
+  if (typeof value !== 'string' && typeof value !== 'number') return null;
+  const digits = normalizePhoneDigits(value);
+  return digits && digits.length >= PHONE_MIN_DIGITS && digits.length <= PHONE_MAX_DIGITS ? digits : null;
+}
+
+/**
+ * @typedef {Object} ContactInfoRead Leitura do painel "Dados do contato" numa tentativa, como a aba a devolveu
+ * @property {'chat'|'group'|null} kind Pelo título do painel
+ * @property {string|null} phone Só os dígitos
+ * @property {number|null} ms Tempo da leitura, com a abertura e o fechamento do painel
+ * @property {string|null} error Por que a leitura falhou (ex: o painel não abriu); null quando o painel foi lido
+ * @property {string|null} reason Por que o painel lido não deu o número, quando a aba sabe (ex: título não reconhecido)
+ * @property {string|null} warning Aviso que não impediu a leitura (ex: o painel não fechou)
+ */
+
+/**
+ * Leitura do painel "Dados do contato" que veio na resposta da aba, só com os campos conhecidos
+ * @param {Object|null|undefined} response Resposta ao EXPORT_CHAT_REQUEST, de sucesso ou de falha
+ * @returns {ContactInfoRead|null} null quando a aba não leu o painel
+ */
+function contactInfoReadOf(response) {
+  const info = response?.contactInfo;
+  if (info && typeof info === 'object') {
+    return {
+      kind: chatKindOf(info.kind),
+      phone: contactPhoneOf(info.phone),
+      ms: durationOf(info.ms),
+      error: null,
+      reason: textOf(info.reason),
+      warning: textOf(info.warning)
+    };
+  }
+  const failure = response?.contactInfoError;
+  if (failure && typeof failure === 'object') {
+    return {
+      kind: null,
+      phone: null,
+      ms: durationOf(failure.ms),
+      error: textOf(failure.message) ?? 'falha sem mensagem na aba',
+      reason: null,
+      warning: null
+    };
+  }
+  return null;
+}
+
+/**
+ * @typedef {Object} ContactRecord Tipo da conversa e telefone do contato, no resultado dela
+ * @property {'chat'|'group'|null} kind Pelo menu de opções ou, sem ele, pelo painel "Dados do contato"
+ * @property {string|null} phone Só os dígitos; null num grupo
+ * @property {'title'|'contact_info'|null} phoneSource Do título da conversa ou do painel
+ * @property {number|null} infoMs Tempo da leitura do painel; null sem leitura
+ * @property {string|null} infoError Por que o telefone de uma conversa individual não saiu do painel; null num grupo,
+ *   com o telefone e sem leitura do painel
+ */
+
+/**
+ * Tipo da conversa e telefone do contato numa tentativa
+ * @param {Object} params
+ * @param {string|null} params.titlePhone Telefone do título da conversa (phoneFromTitle)
+ * @param {unknown} params.chatKind `chatKind` da resposta da aba
+ * @param {ContactInfoRead|null} params.infoRead
+ * @returns {ContactRecord|null} null quando não se sabe nada: nem o tipo, nem o telefone, nem a leitura do painel
+ */
+function buildContact({ titlePhone, chatKind, infoRead }) {
+  const kind = chatKindOf(chatKind) ?? infoRead?.kind ?? null;
+  if (!kind && !titlePhone && !infoRead) return null;
+  // Num grupo não há telefone de contato: o título não é o número de ninguém, e o painel lista os participantes
+  const isGroup = kind === CHAT_KINDS.GROUP;
+  let phone = null;
+  let phoneSource = null;
+  if (!isGroup && titlePhone) {
+    phone = titlePhone;
+    phoneSource = CONTACT_PHONE_SOURCES.TITLE;
+  } else if (!isGroup && infoRead?.phone) {
+    phone = infoRead.phone;
+    phoneSource = CONTACT_PHONE_SOURCES.CONTACT_INFO;
+  }
+  return {
+    kind,
+    phone,
+    phoneSource,
+    infoMs: infoRead?.ms ?? null,
+    infoError: isGroup || phone || !infoRead ? null : (infoRead.error ?? infoRead.reason ?? CONTACT_PHONE_NOT_FOUND)
+  };
+}
+
+/**
+ * Leitura do painel no histórico da tentativa, para o log da execução
+ * @param {ContactInfoRead} infoRead
+ * @param {ContactRecord} contact O da mesma tentativa
+ * @returns {{ ms: number|null, error: string|null, warning?: string }}
+ */
+function contactInfoAttemptOf(infoRead, contact) {
+  return {
+    ms: infoRead.ms,
+    // Num grupo, a falha da leitura fica no log, mas não vira aviso de telefone no relatório
+    error: infoRead.error ?? contact.infoError,
+    ...(infoRead.warning ? { warning: infoRead.warning } : {})
+  };
+}
+
+/**
+ * Contato da conversa repescada: o da 2ª tentativa, sem perder o tipo e o telefone que só a 1ª leu (ex: a 2ª falhou
+ * antes do painel e do menu)
+ * @param {ContactRecord|undefined} first Da 1ª tentativa; ausente quando ela não soube nada ou numa execução gravada
+ *   por uma versão anterior da extensão
+ * @param {ContactRecord|undefined} second
+ * @returns {ContactRecord|null}
+ */
+function mergeRetriedContact(first, second) {
+  if (!first || !second) return second ?? first ?? null;
+  const kind = second.kind ?? first.kind;
+  if (kind === CHAT_KINDS.GROUP) {
+    return { kind, phone: null, phoneSource: null, infoMs: second.infoMs ?? first.infoMs, infoError: null };
+  }
+  // O telefone vem com o tempo da leitura que o deu; sem telefone em nenhuma das duas, fica o motivo mais recente
+  const withPhone = [second, first].find((contact) => contact.phone);
+  if (withPhone) {
+    return { kind, phone: withPhone.phone, phoneSource: withPhone.phoneSource, infoMs: withPhone.infoMs, infoError: null };
+  }
+  return {
+    kind,
+    phone: null,
+    phoneSource: null,
+    infoMs: second.infoMs ?? first.infoMs,
+    infoError: second.infoError ?? first.infoError
+  };
+}
+
+/**
+ * Por que o telefone de uma conversa individual não foi lido no painel "Dados do contato", para a nota do relatório
+ * @param {Object|undefined} result
+ * @returns {string|null} null num grupo, com o telefone, sem leitura do painel e numa execução gravada por uma versão
+ *   anterior da extensão (sem `contact`)
+ */
+function missingContactPhoneReason(result) {
+  const contact = result?.contact;
+  if (!contact || contact.kind === CHAT_KINDS.GROUP || contact.phone) return null;
+  return contact.infoError ?? null;
+}
+
+/**
+ * Trecho da linha de uma tentativa no log da execução com a leitura do painel "Dados do contato": o tempo ou, na
+ * falha, o tempo e o motivo; e o aviso, quando houve
+ * @param {{ ms: number|null, error: string|null, warning?: string }} contactInfo Do histórico da tentativa
+ * @returns {string}
+ */
+function describeContactInfoAttempt({ ms, error, warning }) {
+  const duration = ms == null ? null : formatSeconds(ms);
+  const outcome = error ? `${duration ? `falhou em ${duration}` : 'falhou'} (${error})` : (duration ?? 'lido');
+  return `dados do contato: ${outcome}${warning ? ` (aviso: ${warning})` : ''}`;
+}
+
+/**
  * @typedef {Object} AttemptRecord Uma tentativa de exportar a conversa, no histórico do resultado dela
  * @property {number} attempt 1 na fila, 2 na repescagem
  * @property {string|null} startedAt Início, em ISO; null numa tentativa registrada por uma versão anterior da extensão
@@ -321,6 +530,8 @@ function describeLine(line) {
  * @property {boolean} late O arquivo chegou na quarentena
  * @property {Object} [openDiagnostics] Diagnóstico da busca e da rolagem da abertura (compactOpenDiagnostics),
  *   só quando a aba o mandou: ausente nas aberturas pela lista visível e nas tentativas de uma versão anterior
+ * @property {{ ms: number|null, error: string|null, warning?: string }} [contactInfo] Leitura do painel "Dados do
+ *   contato" (contactInfoAttemptOf), só quando a aba o leu nesta tentativa
  */
 
 /**
@@ -721,7 +932,9 @@ export class ExtractionOrchestrator {
    * Confere a linha da aba quando a execução volta a usá-la, depois de uma pausa ou de um reinício do service
    * worker: a aba pode ter entrado em outra conta nesse meio-tempo, e uma execução não mistura linhas. Com a aba
    * em outra conta, a execução volta para a pausa; sem a linha detectada na aba, segue com um aviso. Uma execução
-   * iniciada por uma versão anterior da extensão não tem a linha, e segue sem conferir.
+   * iniciada por uma versão anterior da extensão não tem a linha, e segue sem conferir. A linha detectada no início
+   * é comparada exatamente; a digitada no popup aceita a da aba que difere dela só pelo 9 depois do DDD, e continua
+   * sendo a linha da execução.
    * @private
    * @param {string|null} tabLinePhone Linha detectada na aba agora
    * @returns {boolean} false quando a execução voltou para a pausa
@@ -729,6 +942,11 @@ export class ExtractionOrchestrator {
   _confirmTabLine(tabLinePhone) {
     const expected = this.run.line?.phone;
     if (!expected || tabLinePhone === expected) return true;
+
+    if (tabLinePhone && this.run.line.source === LINE_SOURCES.MANUAL && isSameLineIgnoringNinthDigit(tabLinePhone, expected)) {
+      log.info('A linha da aba difere da digitada no popup só pelo 9 depois do DDD; a extração segue com a linha digitada.');
+      return true;
+    }
 
     if (!tabLinePhone) {
       log.warn('Linha da aba não detectada na retomada; a extração segue sem conferir a conta.');
@@ -1200,6 +1418,7 @@ export class ExtractionOrchestrator {
       const previous = this.run.results[index];
       const firstAttemptCode = previous?.code ?? null;
       const result = await this._exportChat(chat, index, signal, { attempt: 2 });
+      const contact = mergeRetriedContact(previous?.contact, result.contact);
       // Fica o resultado da repescagem, sucesso ou falha: a 1ª tentativa falhou sem deixar arquivo no
       // staging. O código dela fica para o relatório reconstituir a ordem real das tentativas, e o
       // histórico guarda as duas para o log da execução
@@ -1207,7 +1426,8 @@ export class ExtractionOrchestrator {
         ...result,
         attempts: 2,
         firstAttemptCode,
-        history: [...(previous ? historyOf(previous) : []), ...result.history]
+        history: [...(previous ? historyOf(previous) : []), ...result.history],
+        ...(contact ? { contact } : {})
       });
       retry.cursor++;
       this._notifyResult(`[Repescagem ${position}]`, this.run.results[index]);
@@ -1278,29 +1498,35 @@ export class ExtractionOrchestrator {
    * a exportação); `staged` diz se o arquivo foi
    * gravado no staging; `late` diz se ele só chegou na quarentena. Uma conversa salva traz também o
    * resultado da inspeção do texto (`empty`, contagens e datas, null se o conteúdo não foi inspecionado,
-   * com o motivo em `inspectionError`). `history` traz só esta tentativa, com o início, a duração, se ela
-   * passou pela quarentena e, quando a aba o mandou, o diagnóstico da busca e da rolagem da abertura; a
-   * repescagem a junta à da fila.
+   * com o motivo em `inspectionError`). `contact` traz o tipo da conversa e o telefone do contato, em qualquer
+   * status, quando se sabe algum deles (pelo título, pelo menu ou pelo painel "Dados do contato"). `history` traz
+   * só esta tentativa, com o início, a duração, se ela passou pela quarentena e, quando a aba os mandou, o
+   * diagnóstico da busca e da rolagem da abertura e a leitura do painel; a repescagem a junta à da fila.
    * @private
    * @param {{ title: string, duplicateTitle: boolean }} chat
    * @param {number} index Posição na fila
    * @param {AbortSignal} signal
    * @param {Object} [options]
    * @param {number} [options.attempt=1] 1 na fila, 2 na repescagem
-   * @returns {Promise<{ title: string, status: string, code: string|null, via: string|null, warnings: string[], staged: boolean, late: boolean, message: string, size?: number, history: AttemptRecord[] }>}
+   * @returns {Promise<{ title: string, status: string, code: string|null, via: string|null, warnings: string[], staged: boolean, late: boolean, message: string, size?: number, contact?: ContactRecord, history: AttemptRecord[] }>}
    */
   async _exportChat(chat, index, signal, { attempt = 1 } = {}) {
     const { runId, tabId } = this.run;
     // Uma captura por tentativa: um bloco atrasado da transferência da 1ª é recusado na repescagem
     const captureId = attempt === 1 ? `${runId}-${index}` : `${runId}-${index}-r${attempt - 1}`;
     const startedAt = new Date();
+    // O título de um contato não salvo é o próprio telefone: só sem ele a aba abre o painel "Dados do contato"
+    const titlePhone = phoneFromTitle(chat.title);
     let via = null;
     let warnings = [];
     let late = false;
     let quarantined = false;
     let openDiagnostics = null;
+    let contact = buildContact({ titlePhone, chatKind: null, infoRead: null });
+    let contactInfoAttempt = null;
     const withHistory = (result, reason = null) => ({
       ...result,
+      ...(contact ? { contact } : {}),
       history: [{
         attempt,
         startedAt: startedAt.toISOString(),
@@ -1311,7 +1537,8 @@ export class ExtractionOrchestrator {
         reason,
         quarantined,
         late: result.late,
-        ...(openDiagnostics ? { openDiagnostics } : {})
+        ...(openDiagnostics ? { openDiagnostics } : {}),
+        ...(contactInfoAttempt ? { contactInfo: contactInfoAttempt } : {})
       }]
     });
     const failed = (message, code) => withHistory({
@@ -1331,9 +1558,19 @@ export class ExtractionOrchestrator {
 
     try {
       // A posição na fila é a da conversa na lista durante a varredura: a rolagem da aba começa perto dela
-      const trigger = await this._sendToTab(tabId, { action: ACTIONS.EXPORT_CHAT_REQUEST, chat, captureId, queueIndex: index }, signal);
+      const trigger = await this._sendToTab(tabId, {
+        action: ACTIONS.EXPORT_CHAT_REQUEST,
+        chat,
+        captureId,
+        queueIndex: index,
+        readContactInfo: !titlePhone
+      }, signal);
       // Vem também na falha: uma conversa não encontrada diz no log como foram a busca e a rolagem
       openDiagnostics = compactOpenDiagnostics(trigger?.openDiagnostics);
+      // Também na falha: a conversa não exportável traz o tipo, e o painel é lido antes do menu de opções
+      const infoRead = contactInfoReadOf(trigger);
+      contact = buildContact({ titlePhone, chatKind: trigger?.chatKind, infoRead });
+      contactInfoAttempt = infoRead ? contactInfoAttemptOf(infoRead, contact) : null;
       if (!trigger?.success) {
         if (trigger?.cancelled && signal.aborted) throw new RunCancelledError();
         return failed(trigger?.error || 'erro desconhecido na página.', errorCodeOf(trigger));
@@ -1468,6 +1705,7 @@ export class ExtractionOrchestrator {
     // uma versão anterior da extensão não tem `warnings` nos resultados
     const hasUnconfirmedRange = (result) => gotFile(result) && Boolean(result.warnings?.includes(DATE_RANGE_UNCONFIRMED_WARNING));
     const unconfirmedRange = results.filter(hasUnconfirmedRange).length;
+    const missingContactPhones = results.filter(missingContactPhoneReason).length;
 
     const lines = [
       'Relatório de extração - WhatsApp Web Extractor',
@@ -1490,6 +1728,12 @@ export class ExtractionOrchestrator {
           'confira se o histórico delas veio completo.'
       );
     }
+    if (missingContactPhones) {
+      lines.push(
+        `Aviso: em ${missingContactPhones} conversa(s) o telefone do contato não foi lido no painel 'Dados do contato'; ` +
+          'o motivo está na linha de cada uma.'
+      );
+    }
     if (retry?.indices.length) {
       const recovered = retry.indices.filter((index) => gotFile(results[index])).length;
       lines.push(
@@ -1508,8 +1752,10 @@ export class ExtractionOrchestrator {
       }
       const attemptsNote = result.attempts > 1 ? ` Tentativas: ${result.attempts}.` : '';
       const rangeNote = hasUnconfirmedRange(result) ? DATE_RANGE_UNCONFIRMED_NOTE : '';
+      const contactReason = missingContactPhoneReason(result);
+      const contactNote = contactReason ? ` Aviso: telefone do contato não lido no painel (${contactReason}).` : '';
       lines.push(
-        `[${result.empty ? EMPTY_EXPORT_LABEL : RESULT_LABELS[result.status]}] ${i + 1}. ${result.message}${rangeNote}${attemptsNote}${checkNotes.get(i) ?? ''}`
+        `[${result.empty ? EMPTY_EXPORT_LABEL : RESULT_LABELS[result.status]}] ${i + 1}. ${result.message}${rangeNote}${contactNote}${attemptsNote}${checkNotes.get(i) ?? ''}`
       );
     });
 
@@ -1662,6 +1908,7 @@ export class ExtractionOrchestrator {
     if (entry.reason) parts.push(`motivo: ${entry.reason}`);
     // No fim da linha, para os campos de antes ficarem na mesma posição em todas as tentativas
     if (entry.openDiagnostics) parts.push(...describeOpenDiagnostics(entry.openDiagnostics));
+    if (entry.contactInfo) parts.push(describeContactInfoAttempt(entry.contactInfo));
     return parts.join(' | ');
   }
 

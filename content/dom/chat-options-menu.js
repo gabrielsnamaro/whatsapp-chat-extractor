@@ -5,7 +5,8 @@
  */
 (function registerChatOptionsMenu() {
   const {
-    SELECTORS, TIMEOUTS, ERROR_CODES, DomAutomationError, OperationTimeoutError, waitFor, isVisible, simulateClick, pressEscape
+    SELECTORS, TIMEOUTS, ERROR_CODES, CHAT_KINDS, DomAutomationError, OperationTimeoutError, waitFor, isVisible, simulateClick,
+    pressEscape
   } = window.DomUtils;
 
   class ChatOptionsMenu {
@@ -60,6 +61,17 @@
     }
 
     /**
+     * Tipo da conversa pelos itens do menu: "Dados do grupo" num grupo, "Dados do contato" numa individual
+     * @param {HTMLElement} menu
+     * @returns {'chat'|'group'|null} null quando o menu não tem nenhum dos dois
+     */
+    readChatKind(menu) {
+      if (menu.querySelector(SELECTORS.MENU_ITEM_GROUP_INFO)) return CHAT_KINDS.GROUP;
+      if (menu.querySelector(SELECTORS.MENU_ITEM_CONTACT_INFO)) return CHAT_KINDS.CHAT;
+      return null;
+    }
+
+    /**
      * Fecha o menu suspenso caso ele esteja aberto
      */
     closeMenu() {
@@ -69,10 +81,11 @@
     }
 
     /**
-     * Clica no botão de opções e seleciona "Exportar conversa"
+     * Clica no botão de opções e seleciona "Exportar conversa". O tipo da conversa sai do mesmo menu; na conversa
+     * não exportável, ele vai no erro (`chatKind`)
      * @param {Object} [params]
      * @param {AbortSignal} [params.signal]
-     * @returns {Promise<{ success: boolean }>}
+     * @returns {Promise<{ success: boolean, chatKind: 'chat'|'group'|null }>}
      */
     async triggerExportOption({ signal } = {}) {
       const btn = await waitFor(() => this._findMoreOptionsButton(), {
@@ -107,15 +120,20 @@
       } catch (err) {
         if (!(err instanceof OperationTimeoutError)) throw err;
         // O menu abriu e não trouxe o item: é uma conversa não exportável, não uma lentidão a repescar
+        const chatKind = this.readChatKind(menu);
         this.closeMenu();
-        throw new DomAutomationError(
+        const unavailable = new DomAutomationError(
           ERROR_CODES.EXPORT_OPTION_UNAVAILABLE,
           'Opção "Exportar conversa" não disponível para esta conversa (ex: chat de avisos ou restrito).'
         );
+        unavailable.chatKind = chatKind;
+        throw unavailable;
       }
 
+      // Com o item "Exportar conversa" encontrado, o menu já renderizou os outros itens
+      const chatKind = this.readChatKind(menu);
       simulateClick(exportItem);
-      return { success: true };
+      return { success: true, chatKind };
     }
   }
 

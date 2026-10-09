@@ -46,7 +46,10 @@ function urlPatternToRegExp(pattern) {
  * EXPORT_CHAT_REQUEST sem armar a captura nem entregar arquivo nenhum (como se o WhatsApp não gerasse
  * o download); cada cenário define `onExport` para armar a captura (armCapture) e entregar o arquivo
  * (deliverFile), ou falhar (resposta de falha ou exceção; um `code` em texto na exceção vai na
- * resposta, como no content real). `onFetchBlob` simula a leitura de um download interceptado pelo
+ * resposta, como no content real). O pedido traz `readContactInfo` (o background quer o telefone do painel
+ * "Dados do contato"), e a resposta do `onExport` leva, quando o cenário pede, o `chatKind` e o `contactInfo` ou
+ * o `contactInfoError`, como a do content real; sem eles, é a de uma aba que não leu o tipo nem o painel.
+ * `onFetchBlob` simula a leitura de um download interceptado pelo
  * chrome.downloads; sem ele, a leitura falha. `onResetSidebar` responde ao RESET_SIDEBAR (antes da
  * repescagem); sem ele, a lista volta ao normal com sucesso. Na varredura, `onScan` roda antes da
  * resposta (ex: para avisar o andamento, como o content real faz durante a rolagem), e `scanStats`, se

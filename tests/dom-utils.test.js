@@ -2,13 +2,14 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
+import { phoneFromTitle } from '../shared/utils/phone.js';
 
 // dom-utils.js é um content script clássico que se registra em window; as funções
 // testadas aqui não tocam no DOM, então um window vazio basta
 const context = vm.createContext({ window: {} });
 vm.runInContext(readFileSync(new URL('../content/dom/dom-utils.js', import.meta.url), 'utf8'), context);
 const {
-  isTitleMatch, normalizeTitle, buildChatNotFoundMessage, estimateScrollStart, waitFor,
+  isTitleMatch, normalizeTitle, buildChatNotFoundMessage, estimateScrollStart, waitFor, extractPhoneDigits,
   ERROR_CODES, LOCATE_FAILURES, TIMEOUTS, DomAutomationError, OperationTimeoutError
 } = context.window.DomUtils;
 // Os erros são criados no contexto do vm, com o Error de lá
@@ -148,4 +149,46 @@ test('DomAutomationError leva código e mensagem; o timeout das esperas tem cód
     assert.equal(thrown.message, 'Timeout de 0s aguardando o botão.');
     return true;
   });
+});
+
+// Textos fictícios nas formas do painel "Dados do contato" e dos títulos de conversa
+const PHONE_TEXTS = [
+  // Contato não salvo (13 dígitos) e conta comercial (12), como no painel
+  ['+55 11 90000-0001', '5511900000001'],
+  ['+55 11 3000-0002', '551130000002'],
+  // Marcas invisíveis de direção em volta do número, espaço não separável, parênteses, pontos e hífens
+  ['\u202A+55 11 90000-0001\u202C', '5511900000001'],
+  ['\u200E+55 (11) 90000.0001\u200F', '5511900000001'],
+  ['\u2066+55\u00A011\u00A090000-0001\u2069', '5511900000001'],
+  ['  55-11-90000-0001 ', '5511900000001'],
+  ['5511900000001', '5511900000001'],
+  // De 10 a 15 dígitos
+  ['(11) 3000-0002', '1130000002'],
+  ['+999 9999 9999-9999', '999999999999999'],
+  ['90000-0001', null],
+  ['+55 11 90000-0001111', null],
+  // Texto que não é só um telefone, mesmo com dígitos: o número no rótulo de um botão, nomes e travessão
+  ['Bloquear +55 11 90000-0001', null],
+  ['+55 11 90000-0001 (você)', null],
+  ['Loja 2', null],
+  ['~Maria', null],
+  ['+55 11 90000\u20130001', null],
+  ['+', null],
+  ['', null],
+  ['   ', null]
+];
+
+test('extractPhoneDigits: os dígitos quando o texto é só um telefone de 10 a 15 dígitos, null em qualquer outro texto', () => {
+  for (const [text, digits] of PHONE_TEXTS) {
+    assert.equal(extractPhoneDigits(text), digits, JSON.stringify(text));
+  }
+  for (const value of [null, undefined, 5511900000001, {}]) {
+    assert.equal(extractPhoneDigits(value), null, String(value));
+  }
+});
+
+test('extractPhoneDigits dá o mesmo resultado que phoneFromTitle, de que é espelho no content script', () => {
+  for (const [text] of PHONE_TEXTS) {
+    assert.equal(extractPhoneDigits(text), phoneFromTitle(text), JSON.stringify(text));
+  }
 });

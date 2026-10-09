@@ -1,7 +1,8 @@
 /**
  * Content Script (Injetado em https://web.whatsapp.com/*)
  * Atua estritamente como Mediador de Mensagens entre o Background/Popup da extensão
- * e os controladores especializados de DOM (ChatListScanner, ChatNavigator, ChatOptionsMenu, ExportModalHandler).
+ * e os controladores especializados de DOM (ChatListScanner, ChatNavigator, ContactInfoReader, ChatOptionsMenu,
+ * ExportModalHandler).
  */
 
 (function initWhatsAppContentMediator() {
@@ -14,6 +15,7 @@
   const { SELECTORS, OperationCancelledError } = window.DomUtils;
   const scanner = new window.ChatListScanner();
   const chatNavigator = new window.ChatNavigator();
+  const contactInfoReader = new window.ContactInfoReader();
   const optionsMenu = new window.ChatOptionsMenu();
   const modalHandler = new window.ExportModalHandler();
 
@@ -196,7 +198,7 @@
             // conversa anterior armada até o onBeforeConfirm desta, e um arquivo nesse intervalo seria
             // bloqueado na página e recusado pelo background, sem ir para o ZIP nem para a pasta Downloads
             armedCaptureId = null;
-            const { chat, captureId, queueIndex } = message;
+            const { chat, captureId, queueIndex, readContactInfo } = message;
             if (!chat?.title || !captureId) {
               sendResponse({ success: false, error: 'Parâmetros inválidos para exportação.' });
               return;
@@ -205,10 +207,27 @@
             const operation = beginOperation();
             /** Diagnóstico da busca e da rolagem da abertura (ChatNavigator.openChat), quando elas rodaram */
             let openDiagnostics = null;
+            /** Tipo da conversa, lido no menu de opções; undefined até o menu ser lido */
+            let chatKind;
+            /** Leitura do painel "Dados do contato", quando o background a pede: o resultado ou a falha, com o tempo */
+            let contactInfo = null;
+            let contactInfoError = null;
             try {
               const opened = await chatNavigator.openChat(chat, { signal: operation.signal, queueIndex });
               openDiagnostics = opened.diagnostics;
-              await optionsMenu.triggerExportOption({ signal: operation.signal });
+              if (readContactInfo) {
+                const startedAt = Date.now();
+                try {
+                  contactInfo = await contactInfoReader.read({ signal: operation.signal });
+                } catch (err) {
+                  if (err instanceof OperationCancelledError) throw err;
+                  // Sem o telefone a exportação segue: o background registra a falha como aviso da conversa
+                  console.warn('[WhatsApp Web Extractor] Falha ao ler o painel "Dados do contato":', err);
+                  contactInfoError = { message: err.message, ms: Date.now() - startedAt };
+                }
+              }
+              const exportOption = await optionsMenu.triggerExportOption({ signal: operation.signal });
+              chatKind = exportOption.chatKind;
               // A captura só é armada imediatamente antes do clique em "Exportar" (o link de download só
               // existe depois dele): até lá, um arquivo atrasado da conversa anterior não é tomado como desta
               const { allMessagesConfirmed } = await modalHandler.confirmExport({
@@ -216,12 +235,25 @@
                 onBeforeConfirm: () => armCaptureBeforeConfirm(captureId)
               });
               const warnings = allMessagesConfirmed ? [] : [DATE_RANGE_UNCONFIRMED_WARNING];
-              sendResponse({ success: true, triggered: true, via: opened.via, warnings, ...(openDiagnostics ? { openDiagnostics } : {}) });
+              sendResponse({
+                success: true,
+                triggered: true,
+                via: opened.via,
+                warnings,
+                chatKind,
+                ...(openDiagnostics ? { openDiagnostics } : {}),
+                ...(contactInfo ? { contactInfo } : {}),
+                ...(contactInfoError ? { contactInfoError } : {})
+              });
             } catch (err) {
               if (armedCaptureId === captureId) armedCaptureId = null;
-              // Uma falha no menu ou no modal também leva à resposta o diagnóstico da abertura que a precedeu;
-              // uma falha na abertura já o traz (openChat)
+              // Uma falha no menu ou no modal também leva à resposta o que já se sabia: o diagnóstico da abertura que a
+              // precedeu, o tipo da conversa e a leitura do painel. Uma falha na abertura já traz o diagnóstico
+              // (openChat), e a conversa não exportável, o tipo (triggerExportOption)
               if (openDiagnostics && !err.openDiagnostics) err.openDiagnostics = openDiagnostics;
+              if (chatKind !== undefined && err.chatKind === undefined) err.chatKind = chatKind;
+              if (contactInfo) err.contactInfo = contactInfo;
+              if (contactInfoError) err.contactInfoError = contactInfoError;
               throw err;
             } finally {
               endOperation(operation);
@@ -272,9 +304,21 @@
         if (!cancelled) console.error('[WhatsApp Web Extractor] Erro no mediator do content script:', err);
         // DOMException traz um `code` numérico legado; só os códigos em texto são da extensão (DomUtils.ERROR_CODES)
         const code = typeof err.code === 'string' ? err.code : null;
-        // Na exportação, o diagnóstico da abertura vai junto do erro, para o _execucao.log
+        // Na exportação, vão junto do erro o diagnóstico da abertura (para o _execucao.log), o tipo da conversa e a
+        // leitura do painel "Dados do contato"
         const openDiagnostics = err.openDiagnostics ?? null;
-        sendResponse({ success: false, cancelled, error: err.message, code, ...(openDiagnostics ? { openDiagnostics } : {}) });
+        const contactInfo = err.contactInfo ?? null;
+        const contactInfoError = err.contactInfoError ?? null;
+        sendResponse({
+          success: false,
+          cancelled,
+          error: err.message,
+          code,
+          ...(openDiagnostics ? { openDiagnostics } : {}),
+          ...(err.chatKind !== undefined ? { chatKind: err.chatKind } : {}),
+          ...(contactInfo ? { contactInfo } : {}),
+          ...(contactInfoError ? { contactInfoError } : {})
+        });
       }
     })();
 

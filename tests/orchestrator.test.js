@@ -83,19 +83,22 @@ function triggeredResponse(via = 'visible') {
  * como o content real faz quando a automação DOM falha. A falha é o texto do erro (sem código) ou
  * `{ error, code }`. `failures` vale para as duas tentativas (a da fila e a da repescagem);
  * `firstAttemptFailures`, só para a da fila, e a conversa é recuperada na repescagem. `files` troca os
- * bytes arbitrários de um título por um arquivo específico (ex: um ZIP nativo).
+ * bytes arbitrários de um título por um arquivo específico (ex: um ZIP nativo). `contacts` acrescenta à
+ * resposta de um título, de sucesso ou de falha e nas duas tentativas, o que o content real manda do tipo da
+ * conversa e do painel "Dados do contato" (`chatKind`, `contactInfo` ou `contactInfoError`).
  */
-function deliveringExport(orch, { sizes = {}, failures = {}, firstAttemptFailures = {}, files = {} } = {}) {
+function deliveringExport(orch, { sizes = {}, failures = {}, firstAttemptFailures = {}, files = {}, contacts = {} } = {}) {
   return (message) => {
     const { chat, captureId } = message;
+    const contactFields = contacts[chat.title] ?? {};
     const failure = failures[chat.title] ?? (isRetryAttempt(message) ? undefined : firstAttemptFailures[chat.title]);
     if (failure) {
       const { error, code = null } = typeof failure === 'string' ? { error: failure } : failure;
-      return { success: false, cancelled: false, error, code };
+      return { success: false, cancelled: false, error, code, ...contactFields };
     }
     armCapture(orch, captureId);
     deliverFile(orch, captureId, files[chat.title] ?? chatBytes(chat.title, sizes[chat.title] ?? 1536));
-    return triggeredResponse();
+    return { ...triggeredResponse(), ...contactFields };
   };
 }
 
@@ -2966,8 +2969,9 @@ function lineNotCheckedWarning(runPhone) {
 /**
  * Storage de uma execução interrompida no meio da fila: a instância A exporta as conversas antes de `stallAt` e
  * fica presa nela, como se o Chrome encerrasse o service worker ali
+ * @param {Object} [startOptions] Opções do início de A, além do intervalo zero (ex: `linePhone`)
  */
-async function snapshotStalledAt(fakeA, stallAt) {
+async function snapshotStalledAt(fakeA, stallAt, startOptions = {}) {
   const orchA = createOrchestrator();
   const deliverA = deliveringExport(orchA);
   const stalled = createDeferred();
@@ -2979,7 +2983,7 @@ async function snapshotStalledAt(fakeA, stallAt) {
     return { success: true, triggered: true };
   };
 
-  const loopA = orchA.start({ safeDelayMs: 0 });
+  const loopA = orchA.start({ safeDelayMs: 0, ...startOptions });
   await stalled.promise;
   await orchA.cancel();
   await loopA;
@@ -3293,4 +3297,419 @@ test('execução gravada por uma versão anterior, sem a linha: a retomada segue
   const { report, executionLog } = archive.calls[0];
   assert.equal(report.split('\n')[3], notRecorded);
   assert.equal(executionLog.split('\n')[2], notRecorded);
+});
+
+test('retomada com a linha digitada no popup com o 9 depois do DDD e a aba na mesma conta sem ele: segue, sem mudar a linha da execução; outro número continua recusado', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const chats = sidebarChats(['Ana', 'Bia', 'Caio']);
+  const { fake: fakeA, archive } = setUp({ chats });
+  // A aba não detectou a linha no início, e vale a digitada, com o 9
+  fakeA.content.line = null;
+  const snapshot = await snapshotStalledAt(fakeA, 'Caio', { linePhone: '+55 11 90000-0000' });
+  const typedLine = { phone: FAKE_LINE_PHONE, source: 'manual' };
+  assert.deepEqual(snapshot.extractionRun.line, typedLine);
+
+  // Na retomada, a aba detecta a mesma conta, sem o 9, como o WhatsApp grava o número da conta
+  const { fake: fakeB, orch: orchB } = await restartWith(snapshot, { chats, line: accountLine('551100000000') });
+  assert.equal(orchB.resume(), true);
+  await orchB._loopPromise;
+
+  assert.equal(orchB.getState().state, WORKFLOW_STATES.COMPLETED);
+  assert.deepEqual(fakeB.content.exportRequests.map((m) => m.chat.title), ['Caio']);
+  assert.deepEqual(fakeB.progressUpdates().map((m) => m.warningMessage).filter(Boolean), []);
+  // A linha da execução continua a digitada, no estado e no relatório
+  assert.deepEqual(orchB.run.line, typedLine);
+  assert.deepEqual(fakeB.readStorage('extractionRun').line, typedLine);
+  assert.equal(archive.calls[0].report.split('\n')[3], `Linha: ${FAKE_LINE_PHONE} (informada no popup)`);
+
+  // Outro número, com ou sem o 9, de outro DDD ou com outros dígitos, continua recusado
+  for (const otherPhone of ['551122222222', '5511922222222', '552100000000', '5521900000000']) {
+    const { fake, orch } = await restartWith(snapshot, { chats, line: accountLine(otherPhone) });
+    assert.equal(orch.resume(), true);
+    await orch._loopPromise;
+    assert.deepEqual(
+      [orch.getState().state, orch.getState().statusMessage],
+      [WORKFLOW_STATES.PAUSED, otherAccountMessage(otherPhone, FAKE_LINE_PHONE)],
+      otherPhone
+    );
+    assert.deepEqual(fake.content.exportRequests, [], otherPhone);
+    assert.deepEqual(orch.run.line, typedLine, otherPhone);
+  }
+  assert.equal(archive.calls.length, 1);
+});
+
+test('retomada com a linha detectada na aba no início: a comparação é exata, e a mesma conta sem o 9 é recusada como outra', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const chats = sidebarChats(['Ana', 'Bia', 'Caio']);
+  const { fake: fakeA, archive } = setUp({ chats });
+  const snapshot = await snapshotStalledAt(fakeA, 'Caio');
+  assert.deepEqual(snapshot.extractionRun.line, { phone: FAKE_LINE_PHONE, source: 'auto' });
+
+  const { fake: fakeB, orch: orchB } = await restartWith(snapshot, { chats, line: accountLine('551100000000') });
+  assert.equal(orchB.resume(), true);
+  await orchB._loopPromise;
+
+  assert.deepEqual(
+    [orchB.getState().state, orchB.getState().statusMessage],
+    [WORKFLOW_STATES.PAUSED, otherAccountMessage('551100000000', FAKE_LINE_PHONE)]
+  );
+  assert.deepEqual(fakeB.content.exportRequests, []);
+  assert.equal(archive.calls.length, 0);
+});
+
+// Tipo da conversa e telefone do contato: o tipo sai do menu de opções; o telefone, do título (contato não salvo) ou do
+// painel "Dados do contato", que a aba só abre quando o título não é um telefone
+
+// Números fictícios: o título de um contato não salvo, e os lidos no painel (pessoa e conta comercial)
+const UNSAVED_TITLE = '+55 11 90000-0001';
+const UNSAVED_PHONE = '5511900000001';
+const PANEL_PHONE = '5511900000002';
+const BUSINESS_PHONE = '551130000003';
+// Mensagem que o content (contact-info-reader.js) devolve quando o painel não abre no prazo
+const DRAWER_NOT_OPENED = "o painel 'Dados do contato' não abriu em 5 s";
+const PHONE_NOT_FOUND = 'número não encontrado no painel';
+
+/** Leitura do painel que terminou, como o content real a devolve (ContactInfoReader.read) */
+function contactInfo({ kind = 'chat', phone = null, ms = 1200, ...extra } = {}) {
+  return { kind, phone, ms, ...extra };
+}
+
+/** Tipo e telefone do contato como ficam no resultado da conversa */
+function contactRecord({ kind = null, phone = null, phoneSource = null, infoMs = null, infoError = null } = {}) {
+  return { kind, phone, phoneSource, infoMs, infoError };
+}
+
+/** Nota da linha do relatório quando o telefone de uma conversa individual não foi lido no painel */
+function contactNote(reason) {
+  return ` Aviso: telefone do contato não lido no painel (${reason}).`;
+}
+
+/** Linha do cabeçalho do relatório com as conversas sem o telefone do contato */
+function missingContactsHeader(count) {
+  return `Aviso: em ${count} conversa(s) o telefone do contato não foi lido no painel 'Dados do contato'; ` +
+    'o motivo está na linha de cada uma.';
+}
+
+/** Leitura do painel de cada tentativa no histórico da conversa; null na tentativa que não leu o painel */
+function contactInfoAttempts(results) {
+  return results.map((result) => result.history.map((entry) => entry.contactInfo ?? null));
+}
+
+test('tipo e telefone do contato: o título que é telefone dispensa o painel; o título com nome pede o painel, e o telefone dele é guardado; o grupo fica sem telefone e sem aviso', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const { fake, archive } = setUp({ chats: sidebarChats([UNSAVED_TITLE, 'Ana', 'Loja', 'Família']) });
+  const orch = createOrchestrator();
+  fake.content.onExport = deliveringExport(orch, {
+    contacts: {
+      [UNSAVED_TITLE]: { chatKind: 'chat' },
+      Ana: { chatKind: 'chat', contactInfo: contactInfo({ phone: PANEL_PHONE, ms: 1234 }) },
+      // Conta comercial: o número do painel tem 12 dígitos, sem o 9 depois do DDD, e fica como veio
+      Loja: { chatKind: 'chat', contactInfo: contactInfo({ phone: BUSINESS_PHONE, ms: 1500 }) },
+      Família: { chatKind: 'group', contactInfo: contactInfo({ kind: 'group', ms: 2000 }) }
+    }
+  });
+
+  await orch.start({ safeDelayMs: 0 });
+
+  assert.equal(orch.getState().state, WORKFLOW_STATES.COMPLETED);
+  // O painel só é pedido quando o título não é um telefone
+  assert.deepEqual(
+    fake.content.exportRequests.map((m) => [m.chat.title, m.readContactInfo]),
+    [[UNSAVED_TITLE, false], ['Ana', true], ['Loja', true], ['Família', true]]
+  );
+  const contacts = [
+    contactRecord({ kind: 'chat', phone: UNSAVED_PHONE, phoneSource: 'title' }),
+    contactRecord({ kind: 'chat', phone: PANEL_PHONE, phoneSource: 'contact_info', infoMs: 1234 }),
+    contactRecord({ kind: 'chat', phone: BUSINESS_PHONE, phoneSource: 'contact_info', infoMs: 1500 }),
+    contactRecord({ kind: 'group', infoMs: 2000 })
+  ];
+  assert.deepEqual(orch.run.results.map((r) => r.contact), contacts);
+  assert.deepEqual(persistedRun(fake.snapshotStorage()).results.map((r) => r.contact), contacts);
+  // A leitura do painel fica no histórico da tentativa que a fez
+  assert.deepEqual(contactInfoAttempts(orch.run.results), [
+    [null], [{ ms: 1234, error: null }], [{ ms: 1500, error: null }], [{ ms: 2000, error: null }]
+  ]);
+
+  // Nenhum aviso no relatório; no log, o tempo do painel no fim da linha da tentativa que o leu
+  const { report, executionLog } = archive.calls[0];
+  assert.deepEqual(report.split('\n').slice(6), [
+    'Conversas na fila: 4 | no ZIP: 4 (vazias: 0) | na pasta Downloads: 0 | não exportáveis: 0 | falhas: 0',
+    '',
+    `[OK] 1. "${UNSAVED_TITLE}" salvo (1.5 KB).`,
+    '[OK] 2. "Ana" salvo (1.5 KB).',
+    '[OK] 3. "Loja" salvo (1.5 KB).',
+    '[OK] 4. "Família" salvo (1.5 KB).',
+    ''
+  ]);
+  assert.deepEqual(executionLog.split('\n').slice(6, -1).map(withoutClockAndDuration), [
+    `nº 1 "${UNSAVED_TITLE}" | tentativa 1 | <duração> | abertura: lista visível | OK`,
+    'nº 2 "Ana" | tentativa 1 | <duração> | abertura: lista visível | OK | dados do contato: 1.2 s',
+    'nº 3 "Loja" | tentativa 1 | <duração> | abertura: lista visível | OK | dados do contato: 1.5 s',
+    'nº 4 "Família" | tentativa 1 | <duração> | abertura: lista visível | OK | dados do contato: 2 s'
+  ]);
+});
+
+test('painel "Dados do contato" que falha ou não mostra o número: a conversa é salva, com a nota na linha do relatório, a contagem no cabeçalho e o tempo do painel no log', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const { fake, archive } = setUp({ chats: sidebarChats(['Ana', 'Bia', 'Caio', 'Davi', 'Eva']) });
+  const orch = createOrchestrator();
+  const unknownTitle = 'título do painel não reconhecido: "Contact info"';
+  fake.content.onExport = deliveringExport(orch, {
+    contacts: {
+      Ana: { chatKind: 'chat', contactInfoError: { message: DRAWER_NOT_OPENED, ms: 5012 } },
+      Bia: { chatKind: 'chat', contactInfo: contactInfo({ ms: 900 }) },
+      // Nem o menu nem o painel com os textos esperados: o tipo fica desconhecido, e a aba diz o motivo
+      Caio: { chatKind: null, contactInfo: contactInfo({ kind: null, ms: 800, reason: unknownTitle }) },
+      // O número foi lido, e o painel continuou aberto: só o log registra
+      Davi: { chatKind: 'chat', contactInfo: contactInfo({ phone: PANEL_PHONE, ms: 7100, warning: 'o painel não fechou' }) },
+      // Telefone com dígitos de menos não é aceito
+      Eva: { chatKind: 'chat', contactInfo: contactInfo({ phone: '119000', ms: 1000 }) }
+    }
+  });
+
+  await orch.start({ safeDelayMs: 0 });
+
+  const state = orch.getState();
+  assert.equal(state.state, WORKFLOW_STATES.COMPLETED);
+  // A falha do painel não derruba a exportação: todas foram salvas, e nenhuma entrou na repescagem
+  assert.deepEqual(state.summary, { saved: 5, empty: 0, savedToDisk: 0, notExportable: 0, failed: 0 });
+  assert.equal(fake.content.exportRequests.length, 5);
+  assert.deepEqual(orch.run.results.map((r) => r.contact), [
+    contactRecord({ kind: 'chat', infoMs: 5012, infoError: DRAWER_NOT_OPENED }),
+    contactRecord({ kind: 'chat', infoMs: 900, infoError: PHONE_NOT_FOUND }),
+    contactRecord({ infoMs: 800, infoError: unknownTitle }),
+    contactRecord({ kind: 'chat', phone: PANEL_PHONE, phoneSource: 'contact_info', infoMs: 7100 }),
+    contactRecord({ kind: 'chat', infoMs: 1000, infoError: PHONE_NOT_FOUND })
+  ]);
+  assert.deepEqual(contactInfoAttempts(orch.run.results), [
+    [{ ms: 5012, error: DRAWER_NOT_OPENED }],
+    [{ ms: 900, error: PHONE_NOT_FOUND }],
+    [{ ms: 800, error: unknownTitle }],
+    [{ ms: 7100, error: null, warning: 'o painel não fechou' }],
+    [{ ms: 1000, error: PHONE_NOT_FOUND }]
+  ]);
+  // A mensagem da conversa não muda: o aviso fica no relatório, e o popup não recebe aviso nenhum
+  assert.equal(orch.run.results[0].message, '"Ana" salvo (1.5 KB).');
+  assert.deepEqual(fake.progressUpdates().map((m) => m.warningMessage).filter(Boolean), []);
+
+  const { report, executionLog } = archive.calls[0];
+  assert.deepEqual(report.split('\n').slice(6), [
+    'Conversas na fila: 5 | no ZIP: 5 (vazias: 0) | na pasta Downloads: 0 | não exportáveis: 0 | falhas: 0',
+    missingContactsHeader(4),
+    '',
+    `[OK] 1. "Ana" salvo (1.5 KB).${contactNote(DRAWER_NOT_OPENED)}`,
+    `[OK] 2. "Bia" salvo (1.5 KB).${contactNote(PHONE_NOT_FOUND)}`,
+    `[OK] 3. "Caio" salvo (1.5 KB).${contactNote(unknownTitle)}`,
+    '[OK] 4. "Davi" salvo (1.5 KB).',
+    `[OK] 5. "Eva" salvo (1.5 KB).${contactNote(PHONE_NOT_FOUND)}`,
+    ''
+  ]);
+  assert.deepEqual(executionLog.split('\n').slice(6, -1).map(withoutClockAndDuration), [
+    `nº 1 "Ana" | tentativa 1 | <duração> | abertura: lista visível | OK | dados do contato: falhou em 5 s (${DRAWER_NOT_OPENED})`,
+    `nº 2 "Bia" | tentativa 1 | <duração> | abertura: lista visível | OK | dados do contato: falhou em 0.9 s (${PHONE_NOT_FOUND})`,
+    `nº 3 "Caio" | tentativa 1 | <duração> | abertura: lista visível | OK | dados do contato: falhou em 0.8 s (${unknownTitle})`,
+    'nº 4 "Davi" | tentativa 1 | <duração> | abertura: lista visível | OK | dados do contato: 7.1 s (aviso: o painel não fechou)',
+    `nº 5 "Eva" | tentativa 1 | <duração> | abertura: lista visível | OK | dados do contato: falhou em 1 s (${PHONE_NOT_FOUND})`
+  ]);
+});
+
+test('tipo e telefone do contato também na falha: a não exportável guarda o chatKind e o telefone lido antes do menu; a falha na abertura fica só com o telefone do título', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const { fake, archive } = setUp({ chats: sidebarChats(['Ana', 'Bia', UNSAVED_TITLE, 'Caio', 'Davi']) });
+  const orch = createOrchestrator();
+  const ambiguous = (title) => ({ error: `Há mais de uma conversa chamada "${title}"; não é possível escolher com segurança.`, code: 'AMBIGUOUS_TITLE' });
+  fake.content.onExport = deliveringExport(orch, {
+    failures: {
+      Ana: { error: EXPORT_UNAVAILABLE_MESSAGE, code: 'EXPORT_OPTION_UNAVAILABLE' },
+      // Falham na abertura, antes do painel e do menu: a aba não manda nada do contato
+      Bia: ambiguous('Bia'),
+      [UNSAVED_TITLE]: ambiguous(UNSAVED_TITLE),
+      // Falha no modal, depois do painel e do menu
+      Caio: { error: 'O modal de exportação não oferece "Todas as mensagens".', code: 'DATE_RANGE_NOT_ALL' }
+    },
+    contacts: {
+      Ana: { chatKind: 'chat', contactInfo: contactInfo({ phone: PANEL_PHONE, ms: 1100 }) },
+      Caio: { chatKind: 'group', contactInfo: contactInfo({ kind: 'group', ms: 1300 }) }
+    }
+  });
+
+  await orch.start({ safeDelayMs: 0 });
+
+  assert.equal(orch.getState().state, WORKFLOW_STATES.COMPLETED);
+  assert.deepEqual(orch.run.results.map(({ status, code }) => [status, code]), [
+    ['not_exportable', 'EXPORT_OPTION_UNAVAILABLE'],
+    ['failed', 'AMBIGUOUS_TITLE'],
+    ['failed', 'AMBIGUOUS_TITLE'],
+    ['failed', 'DATE_RANGE_NOT_ALL'],
+    ['saved', null]
+  ]);
+  const contacts = [
+    contactRecord({ kind: 'chat', phone: PANEL_PHONE, phoneSource: 'contact_info', infoMs: 1100 }),
+    null,
+    contactRecord({ phone: UNSAVED_PHONE, phoneSource: 'title' }),
+    contactRecord({ kind: 'group', infoMs: 1300 }),
+    // A aba simulada não mandou o tipo nem a leitura do painel
+    null
+  ];
+  assert.deepEqual(orch.run.results.map((r) => r.contact ?? null), contacts);
+  // Sem nada conhecido do contato, o resultado fica sem o campo
+  assert.equal('contact' in orch.run.results[1], false);
+  assert.deepEqual(persistedRun(fake.snapshotStorage()).results.map((r) => r.contact ?? null), contacts);
+  assert.deepEqual(contactInfoAttempts(orch.run.results), [[{ ms: 1100, error: null }], [null], [null], [{ ms: 1300, error: null }], [null]]);
+
+  // A não exportável continua contada à parte, e nenhuma linha leva o aviso do telefone
+  const { report } = archive.calls[0];
+  assert.equal(report.includes('telefone do contato'), false);
+  const lines = report.split('\n');
+  assert.equal(lines[6], 'Conversas na fila: 5 | no ZIP: 1 (vazias: 0) | na pasta Downloads: 0 | não exportáveis: 1 | falhas: 3');
+  assert.equal(lines[8], `[NÃO EXPORTÁVEL] 1. "Ana": ${EXPORT_UNAVAILABLE_MESSAGE}`);
+});
+
+test('repescagem: o resultado da 2ª tentativa não perde o telefone nem o tipo lidos na 1ª, e o log mostra o painel de cada tentativa', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const { fake, archive } = setUp({ chats: sidebarChats(['Ana', 'Bia', 'Caio']) });
+  const orch = createOrchestrator();
+  const menuTimeout = 'Timeout de 15s aguardando o menu de opções da conversa.';
+  const modalTimeout = 'Timeout de 30s aguardando o modal "Exportar conversa".';
+  const failure = (error, code, fields) => ({ success: false, cancelled: false, error, code, ...fields });
+  // Resposta da aba em cada tentativa de cada conversa: [fila, repescagem]. Sem `success: false`, a exportação deu certo
+  const responses = {
+    // Na fila, o painel deu o número, e o menu não abriu; na repescagem, exportada, mas o painel não abriu
+    Ana: [
+      failure(menuTimeout, 'TIMEOUT', { contactInfo: contactInfo({ phone: PANEL_PHONE, ms: 1000 }) }),
+      { chatKind: 'chat', contactInfoError: { message: DRAWER_NOT_OPENED, ms: 5000 } }
+    ],
+    // Na fila, um grupo que falhou no modal; na repescagem, não encontrada, sem nada do contato
+    Bia: [
+      failure(modalTimeout, 'TIMEOUT', { chatKind: 'group', contactInfo: contactInfo({ kind: 'group', ms: 1500 }) }),
+      failure(notFound('Bia').error, 'CHAT_NOT_FOUND')
+    ],
+    // Na fila, nem o painel nem o menu abriram; na repescagem, exportada com o número do painel
+    Caio: [
+      failure(menuTimeout, 'TIMEOUT', { contactInfoError: { message: DRAWER_NOT_OPENED, ms: 5000 } }),
+      { chatKind: 'chat', contactInfo: contactInfo({ phone: '5511900000003', ms: 1200 }) }
+    ]
+  };
+  const deliver = deliveringExport(orch);
+  fake.content.onExport = (message) => {
+    const response = responses[message.chat.title][isRetryAttempt(message) ? 1 : 0];
+    return response.success === false ? response : { ...deliver(message), ...response };
+  };
+
+  await orch.start({ safeDelayMs: 0, retryCooldownMs: 0 });
+
+  assert.equal(orch.getState().state, WORKFLOW_STATES.COMPLETED);
+  assert.deepEqual(orch.run.retry.indices, [0, 1, 2]);
+  assert.deepEqual(orch.run.results.map(({ status, attempts }) => [status, attempts]), [['saved', 2], ['failed', 2], ['saved', 2]]);
+  const contacts = [
+    // O número da fila fica, e a falha do painel na repescagem não vira aviso
+    contactRecord({ kind: 'chat', phone: PANEL_PHONE, phoneSource: 'contact_info', infoMs: 1000 }),
+    // O tipo lido na fila fica
+    contactRecord({ kind: 'group', infoMs: 1500 }),
+    // O número da repescagem vale, e a falha do painel na fila deixa de ser aviso
+    contactRecord({ kind: 'chat', phone: '5511900000003', phoneSource: 'contact_info', infoMs: 1200 })
+  ];
+  assert.deepEqual(orch.run.results.map((r) => r.contact), contacts);
+  assert.deepEqual(persistedRun(fake.snapshotStorage()).results.map((r) => r.contact), contacts);
+  // O histórico guarda a leitura do painel de cada tentativa que a fez
+  assert.deepEqual(contactInfoAttempts(orch.run.results), [
+    [{ ms: 1000, error: null }, { ms: 5000, error: DRAWER_NOT_OPENED }],
+    [{ ms: 1500, error: null }, null],
+    [{ ms: 5000, error: DRAWER_NOT_OPENED }, { ms: 1200, error: null }]
+  ]);
+
+  const { report, executionLog } = archive.calls[0];
+  assert.deepEqual(report.split('\n').slice(6), [
+    'Conversas na fila: 3 | no ZIP: 2 (vazias: 0) | na pasta Downloads: 0 | não exportáveis: 0 | falhas: 1',
+    retryHeader(3, 2),
+    '',
+    '[OK] 1. "Ana" salvo (1.5 KB). Tentativas: 2.',
+    `[FALHA] 2. "Bia": ${notFound('Bia').error} Tentativas: 2.`,
+    '[OK] 3. "Caio" salvo (1.5 KB). Tentativas: 2.',
+    ''
+  ]);
+  assert.deepEqual(executionLog.split('\n').slice(6, -1).map(withoutClockAndDuration), [
+    `nº 1 "Ana" | tentativa 1 | <duração> | abertura: não informada | FALHA (TIMEOUT) | motivo: ${menuTimeout} | dados do contato: 1 s`,
+    `nº 2 "Bia" | tentativa 1 | <duração> | abertura: não informada | FALHA (TIMEOUT) | motivo: ${modalTimeout} | dados do contato: 1.5 s`,
+    `nº 3 "Caio" | tentativa 1 | <duração> | abertura: não informada | FALHA (TIMEOUT) | motivo: ${menuTimeout} | ` +
+      `dados do contato: falhou em 5 s (${DRAWER_NOT_OPENED})`,
+    'Repescagem: rodada prevista para este horário (fim da espera; uma pausa a adia), com 3 conversa(s) que falharam na fila.',
+    `nº 1 "Ana" | tentativa 2 | <duração> | abertura: lista visível | OK | dados do contato: falhou em 5 s (${DRAWER_NOT_OPENED})`,
+    `nº 2 "Bia" | tentativa 2 | <duração> | abertura: não informada | FALHA (CHAT_NOT_FOUND) | motivo: ${notFound('Bia').error}`,
+    'nº 3 "Caio" | tentativa 2 | <duração> | abertura: lista visível | OK | dados do contato: 1.2 s'
+  ]);
+});
+
+test('tipo e telefone do contato persistidos com o resultado: depois de um reinício, a retomada os lê de volta para o relatório e o log; a execução gravada sem eles segue sem a nota', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const chats = sidebarChats(['Ana', 'Bia', 'Caio']);
+  const { fake: fakeA, archive } = setUp({ chats });
+  const contacts = {
+    Ana: { chatKind: 'chat', contactInfo: contactInfo({ phone: PANEL_PHONE, ms: 1234 }) },
+    Bia: { chatKind: 'chat', contactInfoError: { message: DRAWER_NOT_OPENED, ms: 5012 } },
+    Caio: { chatKind: 'group', contactInfo: contactInfo({ kind: 'group', ms: 1500 }) }
+  };
+  const orchA = createOrchestrator();
+  const deliverA = deliveringExport(orchA, { contacts });
+  const stalled = createDeferred();
+  let snapshot = null;
+  // Em Caio, o storage é copiado como estaria se o Chrome encerrasse o service worker ali
+  fakeA.content.onExport = (message) => {
+    if (message.chat.title !== 'Caio') return deliverA(message);
+    snapshot = fakeA.snapshotStorage();
+    stalled.resolve();
+    return { success: true, triggered: true };
+  };
+  const loopA = orchA.start({ safeDelayMs: 0 });
+  await stalled.promise;
+  await orchA.cancel();
+  await loopA;
+
+  const savedBeforeRestart = [
+    contactRecord({ kind: 'chat', phone: PANEL_PHONE, phoneSource: 'contact_info', infoMs: 1234 }),
+    contactRecord({ kind: 'chat', infoMs: 5012, infoError: DRAWER_NOT_OPENED })
+  ];
+  assert.deepEqual(persistedRun(snapshot).results.map((r) => r.contact), savedBeforeRestart);
+
+  /** Nova instância com o storage dado, retomada até o fim; devolve a instância, o relatório e o log */
+  async function resumeFrom(storage) {
+    const fake = createFakeChrome({ chats, storage });
+    installFakeChrome(fake);
+    const orch = createOrchestrator();
+    fake.content.onExport = deliveringExport(orch, { contacts });
+    await orch.restore();
+    assert.equal(orch.resume(), true);
+    await orch._loopPromise;
+    assert.equal(orch.getState().state, WORKFLOW_STATES.COMPLETED);
+    assert.deepEqual(fake.content.exportRequests.map((m) => m.chat.title), ['Caio']);
+    const { report, executionLog } = archive.calls.at(-1);
+    return { orch, report, executionLog };
+  }
+
+  // Os contatos de antes do reinício voltam do storage; o de Caio é o da retomada
+  const resumed = await resumeFrom(snapshot);
+  assert.deepEqual(resumed.orch.run.results.map((r) => r.contact), [...savedBeforeRestart, contactRecord({ kind: 'group', infoMs: 1500 })]);
+  assert.deepEqual(resumed.report.split('\n').slice(6), [
+    'Conversas na fila: 3 | no ZIP: 3 (vazias: 0) | na pasta Downloads: 0 | não exportáveis: 0 | falhas: 0',
+    missingContactsHeader(1),
+    '',
+    '[OK] 1. "Ana" salvo (1.5 KB).',
+    `[OK] 2. "Bia" salvo (1.5 KB).${contactNote(DRAWER_NOT_OPENED)}`,
+    '[OK] 3. "Caio" salvo (1.5 KB).',
+    ''
+  ]);
+  assert.deepEqual(resumed.executionLog.split('\n').slice(6, -1).map(withoutClockAndDuration), [
+    'nº 1 "Ana" | tentativa 1 | <duração> | abertura: lista visível | OK | dados do contato: 1.2 s',
+    `nº 2 "Bia" | tentativa 1 | <duração> | abertura: lista visível | OK | dados do contato: falhou em 5 s (${DRAWER_NOT_OPENED})`,
+    'nº 3 "Caio" | tentativa 1 | <duração> | abertura: lista visível | OK | dados do contato: 1.5 s'
+  ]);
+
+  // Uma versão anterior da extensão não gravava o contato nem a leitura do painel no histórico
+  const previousVersion = structuredClone(snapshot);
+  for (const [key, result] of Object.entries(previousVersion)) {
+    if (!RESULT_KEY.test(key)) continue;
+    delete result.contact;
+    for (const entry of result.history) delete entry.contactInfo;
+  }
+  const legacy = await resumeFrom(previousVersion);
+  assert.deepEqual(legacy.orch.run.results.map((r) => r.contact ?? null), [null, null, contactRecord({ kind: 'group', infoMs: 1500 })]);
+  assert.equal(legacy.report.includes('telefone do contato'), false);
+  assert.deepEqual(legacy.executionLog.split('\n').slice(6, -1).map(withoutClockAndDuration), [
+    'nº 1 "Ana" | tentativa 1 | <duração> | abertura: lista visível | OK',
+    'nº 2 "Bia" | tentativa 1 | <duração> | abertura: lista visível | OK',
+    'nº 3 "Caio" | tentativa 1 | <duração> | abertura: lista visível | OK | dados do contato: 1.5 s'
+  ]);
 });

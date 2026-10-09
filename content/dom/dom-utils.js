@@ -1,7 +1,7 @@
 /**
  * DomUtils
  * Responsabilidade Única: Utilitários compartilhados pelas classes de automação DOM
- * (seletores, códigos de erro, esperas com timeout/cancelamento, clique simulado e leitura de títulos).
+ * (seletores, códigos de erro, esperas com timeout/cancelamento, clique simulado e leitura de títulos e telefones).
  *
  * Content scripts clássicos não importam módulos ES, por isso o compartilhamento é via window.
  * Deve ser o primeiro arquivo da lista de content scripts no manifest.
@@ -36,12 +36,30 @@
     MAIN_HEADER_TITLE: '#main header [data-testid="conversation-info-header-chat-title"]',
     MAIN_HEADER_TITLE_FALLBACK: '#main header span[dir="auto"]',
     BTN_MORE_OPTIONS: '#main header button[aria-label="Mais opções"], #main header [role="button"][aria-label="Mais opções"]',
+    // O clique nele abre o painel "Dados do contato" (ou "Dados do grupo")
+    CONVERSATION_INFO_HEADER: '#main header [data-testid="conversation-info-header"]',
 
     // Menu suspenso ("Mais opções")
     MENU_CONTAINER: 'div[role="menu"]',
     MENU_ITEM: '[role="menuitem"]',
     MENU_ITEM_EXPORT_CHAT: 'div[role="menu"] button[role="menuitem"][aria-label="Exportar conversa"]',
     EXPORT_MENU_TEXT: 'Exportar conversa',
+    // Dizem o tipo da conversa: "Dados do contato" numa individual (snapshot chatopen_options) e "Dados do
+    // grupo" num grupo (chat_options_selected)
+    MENU_ITEM_CONTACT_INFO: 'div[role="menu"] [aria-label="Dados do contato"]',
+    MENU_ITEM_GROUP_INFO: 'div[role="menu"] [aria-label="Dados do grupo"]',
+
+    // Painel "Dados do contato", à direita da conversa (snapshots contact_info_drawer). Não há snapshot do painel
+    // de um grupo: o título "Dados do grupo" é presumido pelo item do menu
+    CONTACT_INFO_DRAWER: '[data-testid="chat-info-drawer"]',
+    CONTACT_INFO_HEADER_TITLE: '[data-testid="contact-info-header"] h2',
+    CONTACT_INFO_CHAT_TEXT: 'Dados do contato',
+    CONTACT_INFO_GROUP_TEXT: 'Dados do grupo',
+    // O atributo é "contact-info-subtitle selectable-text"; o contato não salvo tem o número nele, e a conta
+    // comercial não tem o subtítulo
+    CONTACT_INFO_SUBTITLE: '[data-testid^="contact-info-subtitle"]',
+    // Procurado dentro do painel: o cabeçalho dele tem só este botão
+    CONTACT_INFO_CLOSE_BUTTON: 'header button[aria-label="Fechar"]',
 
     // Modal nativo de exportação de conversa
     EXPORT_MODAL: 'div[data-testid="export-chat-modal"]',
@@ -73,8 +91,23 @@
     OPEN_SCROLL_MS: 60000,
     // Curto: sair da busca só devolve a lista que já existe, e sem confirmação a abertura segue mesmo assim
     SEARCH_EXIT_MS: 3000,
-    MODAL_CLOSE_MS: 5000
+    MODAL_CLOSE_MS: 5000,
+    // Curtos: o painel "Dados do contato" é aberto em toda conversa com nome, e uma falha nele vira só um aviso
+    CONTACT_INFO_OPEN_MS: 5000,
+    CONTACT_INFO_CLOSE_MS: 3000,
+    // O painel aparece antes do conteúdo: o cartão de uma conta comercial pode chegar depois do resto
+    CONTACT_INFO_CONTENT_MS: 1500
   });
+
+  /** Tipo da conversa, como vai ao background (`chatKind` do menu e `kind` do painel "Dados do contato") */
+  const CHAT_KINDS = Object.freeze({ CHAT: 'chat', GROUP: 'group' });
+
+  // Espelho de phoneFromTitle (shared/utils/phone.js), que o content script não importa por ser módulo ES: as marcas
+  // invisíveis de direção do texto, a forma de um número formatado e os limites de 10 a 15 dígitos
+  const PHONE_DIRECTION_MARKS_PATTERN = /[\u200E\u200F\u202A-\u202E\u2066-\u2069]/g;
+  const PHONE_TEXT_PATTERN = /^\+?[\d\s().-]+$/;
+  const PHONE_MIN_DIGITS = 10;
+  const PHONE_MAX_DIGITS = 15;
 
   /**
    * Códigos de erro da automação DOM. Vão na resposta ao background, que classifica o resultado
@@ -130,6 +163,20 @@
 
   function formatSeconds(ms) {
     return `${Number((ms / 1000).toFixed(2))} s`;
+  }
+
+  /**
+   * Os dígitos quando o texto é só um telefone, como "+55 11 99999-9999"; null quando é outra coisa, mesmo com
+   * dígitos ("Bloquear +55 …"). Não toca no DOM, para ser testada no Node.
+   * @param {string|null|undefined} text
+   * @returns {string|null}
+   */
+  function extractPhoneDigits(text) {
+    if (typeof text !== 'string') return null;
+    const clean = text.replace(PHONE_DIRECTION_MARKS_PATTERN, '').trim();
+    if (!PHONE_TEXT_PATTERN.test(clean)) return null;
+    const digits = clean.replace(/\D/g, '');
+    return digits.length >= PHONE_MIN_DIGITS && digits.length <= PHONE_MAX_DIGITS ? digits : null;
   }
 
   /**
@@ -357,9 +404,12 @@
     TIMEOUTS,
     ERROR_CODES,
     LOCATE_FAILURES,
+    CHAT_KINDS,
     OperationCancelledError,
     OperationTimeoutError,
     DomAutomationError,
+    formatSeconds,
+    extractPhoneDigits,
     buildChatNotFoundMessage,
     estimateScrollStart,
     throwIfAborted,
