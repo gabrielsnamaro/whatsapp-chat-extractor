@@ -3,7 +3,7 @@ import { ACTIONS } from '../shared/constants/actions.js';
 import { StagingRepository } from '../shared/storage/staging-repository.js';
 import { StorageClient } from '../shared/clients/storage-client.js';
 import { inspectChatExport } from '../shared/archive/chat-export-inspector.js';
-import { REPORT_FILENAME } from '../shared/archive/archive-packager.js';
+import { REPORT_FILENAME, MESSAGES_JSON_FILENAME } from '../shared/archive/archive-packager.js';
 import { findWhatsAppTab } from '../shared/utils/whatsapp-tab.js';
 import { normalizePhoneDigits, phoneFromTitle } from '../shared/utils/phone.js';
 import { Logger } from '../shared/utils/logger.js';
@@ -96,6 +96,11 @@ const EMPTY_EXPORT_LABEL = 'OK – VAZIA';
 
 // Conversa da fila sem resultado, no relatório e no índice
 const NOT_PROCESSED_LABEL = 'NÃO PROCESSADA';
+
+// Status da conversa no JSON (export_status), em código: os do resultado (RESULT_STATUS), mais a exportação vazia e a
+// conversa sem resultado
+const EMPTY_EXPORT_STATUS = 'empty';
+const NOT_PROCESSED_STATUS = 'not_processed';
 
 const LATE_FILE_NOTE = ' Chegou atrasado: o arquivo foi entregue na quarentena, depois do prazo de espera.';
 
@@ -205,12 +210,19 @@ function resultStorageKeyOf(index) {
  * @param {import('../shared/archive/archive-packager.js').ArchiveCheck} check
  * @returns {string|null} null quando confere
  */
-function describeCheckDivergence({ missingKeys, unreadable, unexpected, crcMismatch }) {
+function describeCheckDivergence({ missingKeys, unreadable, unexpected, crcMismatch, jsonUnparsed = [] }) {
   const issues = [];
   if (missingKeys.length) issues.push(`${missingKeys.length} conversa(s) esperada(s) não está(ão) no ZIP`);
   if (unreadable.length) issues.push(`${unreadable.length} com o ZIP do WhatsApp ilegível, gravado(s) como o arquivo original`);
   if (crcMismatch.length) issues.push(`${crcMismatch.length} com texto de CRC que não confere, copiado como estava, sem compressão`);
   if (unexpected.length) issues.push(`${unexpected.length} no ZIP sem ser esperada(s)`);
+  // jsonUnparsed fica ausente quando o ZIP foi montado sem o JSON. O ZIP nativo ilegível também está nele, e já foi
+  // contado acima: sem tirá-lo, a mesma conversa entraria duas vezes no aviso
+  const unreadableKeys = new Set(unreadable);
+  const unparsedCount = jsonUnparsed.filter((key) => !unreadableKeys.has(key)).length;
+  if (unparsedCount) {
+    issues.push(`${unparsedCount} com o texto da conversa não interpretado, sem as mensagens no ${MESSAGES_JSON_FILENAME}`);
+  }
   if (!issues.length) return null;
   return `Conferência do ZIP: ${issues.join('; ')}. Veja a seção "Conferência do ZIP" no ${REPORT_FILENAME}.`;
 }
@@ -1915,7 +1927,8 @@ export class ExtractionOrchestrator {
   /**
    * Linhas do _indice.csv, uma por conversa da fila, inclusive as que não foram para o ZIP (falha, não
    * exportável, pasta Downloads). A pasta só se conhece no empacotamento, que a acha pela chave do
-   * staging (`chatId`); sem arquivo no staging, a chave é null e a pasta fica vazia.
+   * staging (`chatId`); sem arquivo no staging, a chave é null e a pasta fica vazia. As mesmas linhas dão as
+   * conversas do JSON, com o status em código, o tipo, o telefone do contato e o início da tentativa que recebeu o arquivo.
    * @private
    * @returns {import('../shared/archive/archive-packager.js').IndexRow[]}
    */
@@ -1928,6 +1941,7 @@ export class ExtractionOrchestrator {
         order: index + 1,
         title: chat.title,
         status: NOT_PROCESSED_LABEL,
+        exportStatus: NOT_PROCESSED_STATUS,
         code: null,
         attempts: null,
         bytes: null,
@@ -1937,17 +1951,24 @@ export class ExtractionOrchestrator {
         firstTimestamp: null,
         lastTimestamp: null,
         durationMs: null,
-        via: null
+        via: null,
+        kind: null,
+        contactPhone: null,
+        contactPhoneSource: null,
+        exportedAt: null
       };
       if (!result) return row;
 
       const history = historyOf(result);
       const durations = history.map((entry) => entry.durationMs);
       const { via } = history.at(-1);
+      // Sem `contact` quando nada do contato foi lido, e numa execução gravada por uma versão anterior da extensão
+      const { contact } = result;
       return {
         ...row,
         chatId: result.staged ? stagingKeyOf(index) : null,
         status: result.empty ? EMPTY_EXPORT_LABEL : (RESULT_LABELS[result.status] ?? result.status),
+        exportStatus: result.empty ? EMPTY_EXPORT_STATUS : result.status,
         code: result.code ?? null,
         attempts: history.length,
         bytes: result.size ?? null,
@@ -1958,7 +1979,12 @@ export class ExtractionOrchestrator {
         lastTimestamp: result.lastTimestamp ?? null,
         // Uma tentativa sem duração (registrada por uma versão anterior da extensão) deixaria a soma abaixo do real
         durationMs: durations.every(Number.isFinite) ? durations.reduce((total, ms) => total + ms, 0) : null,
-        via: via ? (VIA_LABELS[via] ?? via) : null
+        via: via ? (VIA_LABELS[via] ?? via) : null,
+        kind: contact?.kind ?? null,
+        contactPhone: contact?.phone ?? null,
+        contactPhoneSource: contact?.phoneSource ?? null,
+        // No ZIP ou na pasta Downloads; null também numa tentativa registrada por uma versão anterior, sem o início
+        exportedAt: history.find(gotFile)?.startedAt ?? null
       };
     });
   }
@@ -1986,6 +2012,12 @@ export class ExtractionOrchestrator {
       report: this._buildReport(),
       executionLog: this._buildExecutionLog(),
       indexRows: this._buildIndexRows(),
+      runMeta: {
+        runId: this.run.runId,
+        // Uma execução iniciada por uma versão anterior da extensão não tem a linha
+        linePhone: this.run.line?.phone ?? null,
+        extensionVersion: chrome.runtime.getManifest().version
+      },
       expectedKeys,
       signal
     });

@@ -2635,23 +2635,37 @@ test('linhas do _indice.csv: uma por conversa da fila, também as fora do ZIP, c
     assert.ok(Number.isInteger(row.durationMs), `duração inválida na linha ${index + 1}: ${row.durationMs}`);
     assert.equal(row.durationMs, history.reduce((total, entry) => total + entry.durationMs, 0));
   });
+  // Para o JSON: o início da tentativa que recebeu o arquivo, no ZIP ou na pasta Downloads (a de Bia é a da repescagem);
+  // na não exportável e na falha, nenhuma recebeu
+  const startedAt = (index, attempt) => orch.run.results[index].history[attempt - 1].startedAt;
+  assert.deepEqual(indexRows.map((row) => row.exportedAt), [startedAt(0, 1), startedAt(1, 2), startedAt(2, 1), startedAt(3, 1), null, null]);
   const noFile = { bytes: null, messageCount: null, systemEventCount: null, omittedMediaCount: null, firstTimestamp: null, lastTimestamp: null };
-  assert.deepEqual(indexRows.map(({ durationMs, ...row }) => row), [
+  // Títulos que são nomes, e a aba simulada não manda o tipo nem o painel: o contato fica desconhecido
+  const noContact = { kind: null, contactPhone: null, contactPhoneSource: null };
+  assert.deepEqual(indexRows.map(({ durationMs, exportedAt, ...row }) => row), [
     {
-      chatId: '000000', order: 1, title: 'Ana', status: 'OK', code: null, attempts: 1, bytes: anaZip.length, messageCount: 3,
-      systemEventCount: 1, omittedMediaCount: 2, firstTimestamp: '01/02/2026, 09:00:00', lastTimestamp: '01/02/2026, 09:03:00', via: 'lista visível'
+      chatId: '000000', order: 1, title: 'Ana', status: 'OK', exportStatus: 'saved', code: null, attempts: 1, bytes: anaZip.length, messageCount: 3,
+      systemEventCount: 1, omittedMediaCount: 2, firstTimestamp: '01/02/2026, 09:00:00', lastTimestamp: '01/02/2026, 09:03:00', via: 'lista visível',
+      ...noContact
     },
     {
-      chatId: '000001', order: 2, title: 'Bia', status: 'OK', code: null, attempts: 2, bytes: 1536, messageCount: 1, systemEventCount: 0,
-      omittedMediaCount: 0, firstTimestamp: '01/01/2026, 09:00:00', lastTimestamp: '01/01/2026, 09:00:00', via: 'busca'
+      chatId: '000001', order: 2, title: 'Bia', status: 'OK', exportStatus: 'saved', code: null, attempts: 2, bytes: 1536, messageCount: 1,
+      systemEventCount: 0, omittedMediaCount: 0, firstTimestamp: '01/01/2026, 09:00:00', lastTimestamp: '01/01/2026, 09:00:00', via: 'busca',
+      ...noContact
     },
     {
-      chatId: '000002', order: 3, title: 'Caio', status: 'OK – VAZIA', code: null, attempts: 1, bytes: emptyZip.length, messageCount: 0,
-      systemEventCount: 0, omittedMediaCount: 0, firstTimestamp: null, lastTimestamp: null, via: 'lista visível'
+      chatId: '000002', order: 3, title: 'Caio', status: 'OK – VAZIA', exportStatus: 'empty', code: null, attempts: 1, bytes: emptyZip.length,
+      messageCount: 0, systemEventCount: 0, omittedMediaCount: 0, firstTimestamp: null, lastTimestamp: null, via: 'lista visível', ...noContact
     },
-    { chatId: null, order: 4, title: 'Davi', status: 'NA PASTA DOWNLOADS', code: null, attempts: 1, ...noFile, via: 'lista visível' },
-    { chatId: null, order: 5, title: 'Eva', status: 'NÃO EXPORTÁVEL', code: 'EXPORT_OPTION_UNAVAILABLE', attempts: 1, ...noFile, via: null },
-    { chatId: null, order: 6, title: 'Fabi', status: 'FALHA', code: 'TIMEOUT', attempts: 2, ...noFile, via: null }
+    {
+      chatId: null, order: 4, title: 'Davi', status: 'NA PASTA DOWNLOADS', exportStatus: 'saved_to_disk', code: null, attempts: 1, ...noFile,
+      via: 'lista visível', ...noContact
+    },
+    {
+      chatId: null, order: 5, title: 'Eva', status: 'NÃO EXPORTÁVEL', exportStatus: 'not_exportable', code: 'EXPORT_OPTION_UNAVAILABLE',
+      attempts: 1, ...noFile, via: null, ...noContact
+    },
+    { chatId: null, order: 6, title: 'Fabi', status: 'FALHA', exportStatus: 'failed', code: 'TIMEOUT', attempts: 2, ...noFile, via: null, ...noContact }
   ]);
   // As chaves das linhas são as das conversas esperadas no ZIP: o empacotamento acha a pasta de cada uma por ela
   assert.deepEqual(indexRows.flatMap((row) => row.chatId ?? []), expectedKeys);
@@ -3712,4 +3726,106 @@ test('tipo e telefone do contato persistidos com o resultado: depois de um rein�
     'nº 2 "Bia" | tentativa 1 | <duração> | abertura: lista visível | OK',
     'nº 3 "Caio" | tentativa 1 | <duração> | abertura: lista visível | OK | dados do contato: 1.5 s'
   ]);
+});
+
+// JSON no ZIP (_conversas.jsonl e _mensagens.jsonl): o orquestrador passa ao empacotamento os dados da execução e, nas linhas
+// do índice, o que só ele sabe de cada conversa; o JSON em si é montado e testado no packager
+
+test('JSON no ZIP: o empacotamento recebe o id da execução, a linha e a versão da extensão, e as linhas do índice levam o tipo, o telefone do contato, o status em código e o início da tentativa que recebeu o arquivo', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const { fake, archive } = setUp({ chats: sidebarChats([UNSAVED_TITLE, 'Ana', 'Bia', 'Família', 'Caio']) });
+  const orch = createOrchestrator();
+  fake.content.onExport = deliveringExport(orch, {
+    failures: { Caio: { error: EXPORT_UNAVAILABLE_MESSAGE, code: 'EXPORT_OPTION_UNAVAILABLE' } },
+    contacts: {
+      [UNSAVED_TITLE]: { chatKind: 'chat' },
+      Ana: { chatKind: 'chat', contactInfo: contactInfo({ phone: PANEL_PHONE }) },
+      // O painel não abriu: no empacotamento, o telefone pode sair do texto exportado
+      Bia: { chatKind: 'chat', contactInfoError: { message: DRAWER_NOT_OPENED, ms: 5000 } },
+      Família: { chatKind: 'group', contactInfo: contactInfo({ kind: 'group' }) },
+      // Não exportável: o tipo e o telefone lidos antes do menu também vão para o JSON
+      Caio: { chatKind: 'chat', contactInfo: contactInfo({ phone: BUSINESS_PHONE }) }
+    }
+  });
+
+  await orch.start({ safeDelayMs: 0 });
+
+  assert.equal(orch.getState().state, WORKFLOW_STATES.COMPLETED);
+  const [{ runMeta, indexRows }] = archive.calls;
+  assert.deepEqual(runMeta, { runId: orch.run.runId, linePhone: FAKE_LINE_PHONE, extensionVersion: fake.api.runtime.getManifest().version });
+  assert.deepEqual(
+    indexRows.map(({ title, kind, contactPhone, contactPhoneSource, exportStatus }) => ({ title, kind, contactPhone, contactPhoneSource, exportStatus })),
+    [
+      { title: UNSAVED_TITLE, kind: 'chat', contactPhone: UNSAVED_PHONE, contactPhoneSource: 'title', exportStatus: 'saved' },
+      { title: 'Ana', kind: 'chat', contactPhone: PANEL_PHONE, contactPhoneSource: 'contact_info', exportStatus: 'saved' },
+      { title: 'Bia', kind: 'chat', contactPhone: null, contactPhoneSource: null, exportStatus: 'saved' },
+      { title: 'Família', kind: 'group', contactPhone: null, contactPhoneSource: null, exportStatus: 'saved' },
+      { title: 'Caio', kind: 'chat', contactPhone: BUSINESS_PHONE, contactPhoneSource: 'contact_info', exportStatus: 'not_exportable' }
+    ]
+  );
+  assert.deepEqual(indexRows.map((row) => row.exportedAt), [...orch.run.results.slice(0, 4).map((r) => r.history[0].startedAt), null]);
+});
+
+test('JSON no ZIP: execução sem a linha (iniciada por uma versão anterior) passa a linha null, e a conversa sem resultado vai como not_processed, sem contato nem exportedAt', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const chats = sidebarChats(['Ana', 'Bia', 'Caio']);
+  const { fake: fakeA, archive } = setUp({ chats });
+  const snapshot = await snapshotStalledAt(fakeA, 'Caio');
+  delete snapshot.extractionRun.line;
+  // O resultado de Bia não está no storage: na retomada, ela fica sem resultado
+  delete snapshot['extractionRun:result:000001'];
+
+  const { fake, orch } = await restartWith(snapshot, { chats, line: accountLine(FAKE_LINE_PHONE) });
+  assert.equal(orch.resume(), true);
+  await orch._loopPromise;
+
+  assert.equal(orch.getState().state, WORKFLOW_STATES.COMPLETED);
+  const [{ runMeta, indexRows, report }] = archive.calls;
+  assert.deepEqual(runMeta, { runId: snapshot.extractionRun.runId, linePhone: null, extensionVersion: fake.api.runtime.getManifest().version });
+  assert.deepEqual(indexRows.map((row) => row.exportStatus), ['saved', 'not_processed', 'saved']);
+  assert.deepEqual(indexRows[1], {
+    chatId: null, order: 2, title: 'Bia', status: 'NÃO PROCESSADA', exportStatus: 'not_processed', code: null, attempts: null, bytes: null,
+    messageCount: null, systemEventCount: null, omittedMediaCount: null, firstTimestamp: null, lastTimestamp: null, durationMs: null,
+    via: null, kind: null, contactPhone: null, contactPhoneSource: null, exportedAt: null
+  });
+  assert.equal(report.split('\n').find((line) => line.includes('"Bia"')), '[NÃO PROCESSADA] 2. "Bia"');
+});
+
+test('JSON no ZIP: conversa com o texto não interpretado no empacotamento vira aviso de divergência no popup, sem contar de novo a de ZIP nativo ilegível, e a mensagem final não muda', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const { fake, staging } = setUp({ chats: sidebarChats(['Ana', 'Bia', 'Caio']) });
+  const orch = createOrchestrator();
+  fake.content.onExport = deliveringExport(orch);
+  const seeReport = 'Veja a seção "Conferência do ZIP" no _relatorio.txt.';
+  const unparsedIssue = 'com o texto da conversa não interpretado, sem as mensagens no _mensagens.jsonl';
+  const unreadableIssue = 'com o ZIP do WhatsApp ilegível, gravado(s) como o arquivo original';
+
+  /** Execução inteira com a conferência que o ArchivePackager devolve; o resultado é o fim dela no popup */
+  async function runWithCheck(check) {
+    harness.archive.restore();
+    harness.archive = stubArchiveDownloader({
+      staging,
+      outcome: {
+        completed: true,
+        size: 2048,
+        chatCount: 3,
+        check: { expected: 3, packed: 3, missingKeys: [], unreadable: [], unexpected: [], crcMismatch: [], jsonUnparsed: [], ...check }
+      }
+    });
+    await orch.start({ safeDelayMs: 0 });
+    const state = orch.getState();
+    assert.equal(state.state, WORKFLOW_STATES.COMPLETED);
+    // As conversas continuam no ZIP: a mensagem final não muda
+    assert.equal(state.statusMessage, `Backup salvo: ${harness.archive.calls[0].archiveFilename} (2.0 KB). 3 conversa(s) no ZIP, 0 falha(s).`);
+    const final = fake.progressUpdates().at(-1);
+    assert.equal(final.infoMessage, `🎉 ${state.statusMessage}`);
+    return final.warningMessage;
+  }
+
+  // Bia, com o texto não interpretado
+  assert.equal(await runWithCheck({ jsonUnparsed: ['000001'] }), `⚠️ Conferência do ZIP: 1 ${unparsedIssue}. ${seeReport}`);
+  // Bia com o ZIP nativo ilegível, que também fica em jsonUnparsed, e Caio com o texto não interpretado: uma de cada
+  assert.equal(
+    await runWithCheck({ unreadable: ['000001'], jsonUnparsed: ['000001', '000002'] }),
+    `⚠️ Conferência do ZIP: 1 ${unreadableIssue}; 1 ${unparsedIssue}. ${seeReport}`
+  );
+  // Só a de ZIP nativo ilegível: o aviso a conta uma vez
+  assert.equal(await runWithCheck({ unreadable: ['000001'], jsonUnparsed: ['000001'] }), `⚠️ Conferência do ZIP: 1 ${unreadableIssue}. ${seeReport}`);
 });

@@ -248,6 +248,40 @@ test('mensagem de várias linhas, com linha em branco, e "Nome:" com o texto na 
   ]);
 });
 
+test('o texto de toda entrada, não só o da última, sai sem as linhas em branco e os espaços do fim', () => {
+  const parsed = parseChatText(chatText(
+    '[8/1/26, 9:00:00 AM] Ana: primeira linha',
+    '  segunda linha, com espaços no começo  ',
+    '',
+    '   ',
+    '[8/1/26, 9:01:00 AM] Bia: oi\t ',
+    '',
+    '[8/1/26, 9:02:00 AM] - Bia saiu',
+    '',
+    '[8/1/26, 9:03:00 AM] Ana: <imagem ocultada> ',
+    'legenda <Mensagem editada>',
+    '',
+    '[8/1/26, 9:04:00 AM] Ana: até logo',
+    '',
+    ''
+  ));
+  assert.deepEqual(parsed.entries.map(({ text, msgType, edited }) => ({ text, msgType, edited })), [
+    // Os espaços do começo de uma linha ficam
+    { text: 'primeira linha\n  segunda linha, com espaços no começo', msgType: 'chat', edited: false },
+    { text: 'oi', msgType: 'chat', edited: false },
+    { text: 'Bia saiu', msgType: 'system', edited: false },
+    { text: '<imagem ocultada> \nlegenda', msgType: 'image', edited: true },
+    { text: 'até logo', msgType: 'chat', edited: false }
+  ]);
+
+  // A mesma mensagem seguida de linha em branco dá a mesma entrada no fim do arquivo e no meio dele
+  const lines = ['[8/1/26, 9:00:00 AM] Ana: primeira linha', 'segunda linha', ''];
+  const asLast = parseChatText(chatText(...lines));
+  const inTheMiddle = parseChatText(chatText(...lines, '[8/1/26, 9:01:00 AM] Bia: oi'));
+  assert.equal(inTheMiddle.entries[0].text, 'primeira linha\nsegunda linha');
+  assert.deepEqual(inTheMiddle.entries[0], asLast.entries[0]);
+});
+
 test('eventos: [Ligação] é call_log, a mensagem não compatível é unsupported e os demais são system, sem remetente', () => {
   const parsed = parseChatText(chatText(
     '[8/1/26, 9:00:00 AM] - [Ligação]',

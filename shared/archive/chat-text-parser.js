@@ -53,9 +53,10 @@ const UNSUPPORTED_EVENT_PATTERN = /não é compatível com sua versão do WhatsA
  * @property {string|null} senderName null em evento
  * @property {string|null} senderPhone Dígitos do remetente quando o nome dele é só um telefone
  * @property {boolean|null} isOut true para "Você" (a própria conta); null em evento
- * @property {string} msgType Nomes do visualizador (chat, image, video, audio, ptt, document, sticker,
- *   revoked, call_log), mais media (anexo fora desse mapa), unsupported e system
- * @property {string} text Texto de todas as linhas da entrada, sem "[Encaminhada]" nem "<Mensagem editada>"
+ * @property {string} msgType Tipo da mensagem: chat, image, video, audio, ptt, document, sticker, revoked, call_log,
+ *   media (anexo fora desse mapa), unsupported e system
+ * @property {string} text Texto de todas as linhas da entrada, sem "[Encaminhada]" nem "<Mensagem editada>", e sem
+ *   espaços e quebras de linha no fim
  * @property {boolean} forwarded
  * @property {string|null} fileName Nome do documento escrito depois de "<documento omitido>", na mesma linha
  * @property {boolean} edited
@@ -200,10 +201,21 @@ function stripEditedMarker(text) {
 }
 
 /**
+ * Texto das linhas de uma entrada. As linhas em branco e os espaços do fim não fazem parte dela: sem isso, o texto de
+ * uma mensagem seguida de linha em branco mudaria quando ela deixasse de ser a última do arquivo, e com ele o
+ * message_id, que é calculado sobre o texto
+ * @param {string[]} lines
+ * @returns {string}
+ */
+function joinEntryLines(lines) {
+  return lines.join('\n').trimEnd();
+}
+
+/**
  * @returns {ChatTextEntry}
  */
 function buildMessage(seq, draft, timestamp) {
-  const fullText = draft.lines.join('\n');
+  const fullText = joinEntryLines(draft.lines);
   const forwardedPrefix = FORWARDED_PREFIX_PATTERN.exec(fullText);
   const { text, edited } = stripEditedMarker(forwardedPrefix ? fullText.slice(forwardedPrefix[0].length) : fullText);
   const { msgType, fileName } = classifyMessageBody(text);
@@ -227,7 +239,7 @@ function buildMessage(seq, draft, timestamp) {
  * @returns {ChatTextEntry}
  */
 function buildEvent(seq, draft, timestamp) {
-  const text = draft.lines.join('\n');
+  const text = joinEntryLines(draft.lines);
   return {
     seq,
     kind: 'event',
@@ -266,8 +278,6 @@ export function parseChatText(text) {
   }
 
   const lines = text.split('\n').map((line) => (line.endsWith('\r') ? line.slice(0, -1) : line));
-  // A quebra de linha no fim do arquivo não faz parte da última mensagem
-  while (lines.length > 0 && lines.at(-1) === '') lines.pop();
 
   // As linhas antes da primeira entrada (o aviso de criptografia, sem data) não são mensagem e ficam de fora
   const drafts = [];

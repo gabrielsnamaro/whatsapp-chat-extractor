@@ -21,7 +21,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             report: message.report,
             expectedKeys: message.expectedKeys,
             executionLog: message.executionLog,
-            indexRows: message.indexRows
+            indexRows: message.indexRows,
+            runMeta: message.runMeta
           });
           const url = URL.createObjectURL(blob);
           sendResponse({ success: true, url, size: blob.size, chatCount, check });
