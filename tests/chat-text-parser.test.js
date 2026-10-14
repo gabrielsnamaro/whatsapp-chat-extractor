@@ -208,19 +208,71 @@ test('data impossível depois de decidida a ordem fica com timestamp null, e a e
     '[30/2/26, 9:00:00 AM] Ana: 30 de fevereiro',
     '[2/1/26, 13:00:00 PM] Ana: 13 PM',
     '[2/1/2026, 24:00:00] Ana: 24 h',
-    '[2/1/26, 9:60:00 AM] Ana: minuto 60',
-    // Colchete sem data seguido de "Nome: ": abre uma entrada, como no inspetor, mas sem data
-    '[lembrete] Ana: sem data'
+    '[2/1/26, 9:60:00 AM] Ana: minuto 60'
   ));
-  assert.deepEqual(timestampsOf(parsed), ['2026-01-13T12:00:00Z', null, null, null, null, null, null]);
-  assert.equal(parsed.messageCount, 7);
-  assert.equal(parsed.entries.at(-1).timestampRaw, 'lembrete');
+  // Todas têm a forma de data, então todas abrem entrada
+  assert.deepEqual(timestampsOf(parsed), ['2026-01-13T12:00:00Z', null, null, null, null, null]);
+  assert.equal(parsed.messageCount, 6);
 
   // Nenhuma data com a forma esperada: sem ordem decidida, e a conversa é lida mesmo assim
   const undated = parseChatText(chatText('[ontem] Ana: oi'));
   assert.equal(undated.dateOrder, null);
   assert.deepEqual(timestampsOf(undated), [null]);
   assert.equal(undated.messageCount, 1);
+});
+
+test('com alguma data no arquivo, só o colchete com data abre entrada: "[lembrete] Ana: …" no meio de uma mensagem a continua', () => {
+  const parsed = parseChatText(chatText(
+    '[8/1/26, 9:00:00 AM] Ana: Lista para amanhã:',
+    '[lembrete] Ana: levar os documentos',
+    '[urgente] Você: confirmar o horário',
+    '[obs] - chegar 10 min antes',
+    '[8/1/26, 9:01:00 AM] Você: ok'
+  ));
+  assert.deepEqual(parsed.entries.map(({ seq, kind, senderName, isOut, text }) => ({ seq, kind, senderName, isOut, text })), [
+    {
+      seq: 1,
+      kind: 'message',
+      senderName: 'Ana',
+      isOut: false,
+      text: 'Lista para amanhã:\n[lembrete] Ana: levar os documentos\n[urgente] Você: confirmar o horário\n[obs] - chegar 10 min antes'
+    },
+    { seq: 2, kind: 'message', senderName: 'Você', isOut: true, text: 'ok' }
+  ]);
+  assert.equal(parsed.messageCount, 2);
+  assert.equal(parsed.systemEventCount, 0);
+
+  // Uma linha digitada com a forma exata de cabeçalho, com data, não tem como ser distinguida de uma mensagem de verdade
+  const typedHeader = parseChatText(chatText(
+    '[8/1/26, 9:00:00 AM] Ana: copiei a conversa:',
+    '[7/31/26, 6:00:00 PM] Você: fechado'
+  ));
+  assert.deepEqual(typedHeader.entries.map(({ senderName, isOut, text }) => ({ senderName, isOut, text })), [
+    { senderName: 'Ana', isOut: false, text: 'copiei a conversa:' },
+    { senderName: 'Você', isOut: true, text: 'fechado' }
+  ]);
+});
+
+test('sem nenhuma data no arquivo, qualquer colchete abre entrada, como antes; sem nenhum, o formato não é reconhecido', () => {
+  // Datas num formato que o parser não lê: as entradas são contadas, sem data
+  const parsed = parseChatText(chatText(
+    '[2026-08-01 09:00] Ana: oi',
+    'segunda linha',
+    '[lembrete] Bia: tchau',
+    '[2026-08-01 09:02] - Bia saiu'
+  ));
+  assert.equal(parsed.recognized, true);
+  assert.equal(parsed.dateOrder, null);
+  assert.deepEqual(parsed.entries.map(({ kind, senderName, text, timestamp }) => ({ kind, senderName, text, timestamp })), [
+    { kind: 'message', senderName: 'Ana', text: 'oi\nsegunda linha', timestamp: null },
+    { kind: 'message', senderName: 'Bia', text: 'tchau', timestamp: null },
+    { kind: 'event', senderName: null, text: 'Bia saiu', timestamp: null }
+  ]);
+  assert.deepEqual([parsed.messageCount, parsed.systemEventCount], [2, 1]);
+
+  const unrecognized = parseChatText(chatText('01/02/2026 09:01 - Ana: Bom dia!', '[sem data]'));
+  assert.equal(unrecognized.recognized, false);
+  assert.deepEqual([unrecognized.messageCount, unrecognized.systemEventCount, unrecognized.entries.length], [null, null, 0]);
 });
 
 test('conversão para UTC pelas regras do fuso local no dia da mensagem (UTC−3 hoje, UTC−2 no horário de verão de 2019)', () => {

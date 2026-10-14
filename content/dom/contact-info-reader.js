@@ -5,8 +5,8 @@
  */
 (function registerContactInfoReader() {
   const {
-    SELECTORS, TIMEOUTS, CHAT_KINDS, OperationCancelledError, OperationTimeoutError, formatSeconds, extractPhoneDigits, waitFor,
-    sleep, isVisible, simulateClick, pressEscape
+    SELECTORS, TIMEOUTS, CHAT_KINDS, DRAWER_PHONE_SOURCES, OperationCancelledError, OperationTimeoutError, formatSeconds,
+    extractPhoneDigits, chooseDrawerPhone, waitFor, sleep, isVisible, simulateClick, pressEscape
   } = window.DomUtils;
 
   // Intervalo entre duas leituras do painel enquanto o conteúdo dele carrega
@@ -19,16 +19,44 @@
   /**
    * @typedef {Object} ContactInfo Leitura do painel
    * @property {'chat'|'group'|null} kind Pelo título do painel; null quando ele não é nenhum dos dois esperados
-   * @property {string|null} phone Só os dígitos; null num grupo e quando o painel não mostra um número
-   * @property {string} [reason] Por que o painel não foi lido, quando o título dele não é o esperado
+   * @property {string|null} phone Só os dígitos; null num grupo e quando o painel não dá um número
+   * @property {string} [reason] Por que uma conversa individual ficou sem o número: o título do painel não é o esperado,
+   *   ou a escolha do telefone (DomUtils.chooseDrawerPhone) não deu nenhum
    */
+
+  /**
+   * @typedef {ContactInfo & { source?: string }} DrawerInspection Leitura do painel com a origem do telefone escolhido
+   *   (DomUtils.DRAWER_PHONE_SOURCES), que decide quando a releitura para
+   */
+
+  /**
+   * @param {DrawerInspection} inspection
+   * @returns {ContactInfo} A leitura sem a origem do telefone, que não vai ao background
+   */
+  function toContactInfo({ kind, phone, reason }) {
+    return reason ? { kind, phone, reason } : { kind, phone };
+  }
+
+  /**
+   * A leitura do painel não muda mais: é de grupo, o telefone veio do subtítulo, ou veio da conta comercial e é o mesmo
+   * da leitura anterior. Os números fora do subtítulo podem aparecer aos poucos, e um que chegue depois muda a escolha
+   * @param {DrawerInspection} current
+   * @param {DrawerInspection|null} previous
+   * @returns {boolean}
+   */
+  function isSettledInspection(current, previous) {
+    if (current.kind === CHAT_KINDS.GROUP || current.source === DRAWER_PHONE_SOURCES.SUBTITLE) return true;
+    return current.source === DRAWER_PHONE_SOURCES.BUSINESS_CARD &&
+      previous?.source === DRAWER_PHONE_SOURCES.BUSINESS_CARD &&
+      previous.phone === current.phone;
+  }
 
   class ContactInfoReader {
     /**
      * @param {Object} [options]
      * @param {Object} [options.timeouts] Sobrescrita dos timeouts padrão (ms): `openMs` (o painel aparecer depois do
-     *   clique no cabeçalho), `contentMs` (o número ou o tipo de grupo aparecer no painel já aberto) e `closeMs` (o
-     *   painel sumir depois de "Fechar")
+     *   clique no cabeçalho), `contentMs` (a releitura do painel já aberto enquanto o conteúdo dele carrega) e `closeMs`
+     *   (o painel sumir depois de "Fechar")
      */
     constructor(options = {}) {
       this.timeouts = {
@@ -56,13 +84,23 @@
     }
 
     /**
-     * Lê o tipo e o telefone de um painel já aberto, sem clique nem espera. O número sai do subtítulo, quando ele é
-     * só um telefone (contato não salvo), ou do primeiro texto do painel que seja só um telefone (conta comercial).
-     * Atributos não são lidos: o "Bloquear +55 …" e o "Denunciar +55 …" ficam no aria-label dos botões.
+     * Lê o tipo e o telefone de um painel já aberto, sem clique nem espera. O número sai da escolha do
+     * DomUtils.chooseDrawerPhone: o subtítulo, quando ele é só um telefone (contato não salvo), ou, no painel de uma
+     * conta comercial, o número que todos os textos do painel que são só um telefone dão. Atributos não são lidos: o
+     * "Bloquear +55 …" e o "Denunciar +55 …" ficam no aria-label dos botões.
      * @param {HTMLElement} drawer `[data-testid="chat-info-drawer"]`
      * @returns {ContactInfo}
      */
     readDrawer(drawer) {
+      return toContactInfo(this._inspectDrawer(drawer));
+    }
+
+    /**
+     * @private
+     * @param {HTMLElement} drawer
+     * @returns {DrawerInspection}
+     */
+    _inspectDrawer(drawer) {
       const title = (drawer.querySelector(SELECTORS.CONTACT_INFO_HEADER_TITLE)?.textContent ?? '').trim();
       // O painel de um grupo lista os números dos participantes, que não são o contato da conversa
       if (title === SELECTORS.CONTACT_INFO_GROUP_TEXT) return { kind: CHAT_KINDS.GROUP, phone: null };
@@ -74,23 +112,26 @@
         };
       }
 
-      const subtitle = drawer.querySelector(SELECTORS.CONTACT_INFO_SUBTITLE);
-      const phone = extractPhoneDigits(subtitle?.textContent) ?? this._findPhoneText(drawer);
-      return { kind: CHAT_KINDS.CHAT, phone };
+      const choice = chooseDrawerPhone({
+        subtitleText: drawer.querySelector(SELECTORS.CONTACT_INFO_SUBTITLE)?.textContent ?? null,
+        phoneTexts: this._findPhoneTexts(drawer),
+        businessCardPresent: Boolean(drawer.querySelector(SELECTORS.CONTACT_INFO_BUSINESS_CARD))
+      });
+      return { kind: CHAT_KINDS.CHAT, ...choice };
     }
 
     /**
      * @private
      * @param {HTMLElement} drawer
-     * @returns {string|null} Os dígitos do primeiro nó de texto do painel, na ordem do documento, que é só um telefone
+     * @returns {string[]} Os nós de texto do painel que são só um telefone, na ordem do documento
      */
-    _findPhoneText(drawer) {
+    _findPhoneTexts(drawer) {
+      const phoneTexts = [];
       const walker = drawer.ownerDocument.createTreeWalker(drawer, NodeFilter.SHOW_TEXT);
       for (let node = walker.nextNode(); node; node = walker.nextNode()) {
-        const phone = extractPhoneDigits(node.nodeValue);
-        if (phone) return phone;
+        if (extractPhoneDigits(node.nodeValue)) phoneTexts.push(node.nodeValue);
       }
-      return null;
+      return phoneTexts;
     }
 
     /**
@@ -137,20 +178,24 @@
     }
 
     /**
-     * Relê o painel até aparecer o número ou o tipo de grupo, ou até `contentMs`, e fica com a última leitura
+     * Relê o painel até `contentMs` e fica com a última leitura. Para antes quando ela não muda mais
+     * (isSettledInspection): o tipo de grupo, o telefone do subtítulo, ou o da conta comercial em duas leituras seguidas
+     * iguais
      * @private
      * @param {HTMLElement} drawer
      * @param {AbortSignal} [signal]
      * @returns {Promise<ContactInfo>}
      */
     async _readWhenLoaded(drawer, signal) {
-      let info = this.readDrawer(drawer);
       const deadline = Date.now() + this.timeouts.contentMs;
-      while (!info.phone && info.kind !== CHAT_KINDS.GROUP && Date.now() < deadline) {
+      let previous = null;
+      let current = this._inspectDrawer(drawer);
+      while (!isSettledInspection(current, previous) && Date.now() < deadline) {
         await sleep(CONTENT_POLL_MS, signal);
-        info = this.readDrawer(this.findDrawer() ?? drawer);
+        previous = current;
+        current = this._inspectDrawer(this.findDrawer() ?? drawer);
       }
-      return info;
+      return toContactInfo(current);
     }
 
     /**

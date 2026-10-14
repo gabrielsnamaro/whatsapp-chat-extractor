@@ -9,7 +9,7 @@ import { phoneFromTitle } from '../shared/utils/phone.js';
 const context = vm.createContext({ window: {} });
 vm.runInContext(readFileSync(new URL('../content/dom/dom-utils.js', import.meta.url), 'utf8'), context);
 const {
-  isTitleMatch, normalizeTitle, buildChatNotFoundMessage, estimateScrollStart, waitFor, extractPhoneDigits,
+  isTitleMatch, normalizeTitle, buildChatNotFoundMessage, estimateScrollStart, waitFor, extractPhoneDigits, chooseDrawerPhone,
   ERROR_CODES, LOCATE_FAILURES, TIMEOUTS, DomAutomationError, OperationTimeoutError
 } = context.window.DomUtils;
 // Os erros são criados no contexto do vm, com o Error de lá
@@ -23,8 +23,8 @@ test('títulos parciais não casam (evita exportar a conversa errada)', () => {
 
 test('igualdade tolera espaços, marcas invisíveis e seletores de variação', () => {
   assert.equal(isTitleMatch('  Ana ', 'Ana'), true);
-  assert.equal(isTitleMatch('‎João‏', 'João'), true);
-  assert.equal(isTitleMatch('Casa ☺️', 'Casa ☺'), true);
+  assert.equal(isTitleMatch('\u200EJoão\u200F', 'João'), true);
+  assert.equal(isTitleMatch('Casa ☺\uFE0F', 'Casa ☺'), true);
   assert.equal(isTitleMatch('Grupo   da   Família', 'Grupo da Família'), true);
 });
 
@@ -45,7 +45,7 @@ test('normalização NFC iguala acentos compostos e decompostos', () => {
 test('títulos vazios nunca casam', () => {
   assert.equal(isTitleMatch('', ''), false);
   assert.equal(isTitleMatch(null, 'Ana'), false);
-  assert.equal(isTitleMatch('​', '​'), false);
+  assert.equal(isTitleMatch('\u200B', '\u200B'), false);
 });
 
 test('mensagem "não encontrada" traz o motivo de cada tentativa, na ordem em que rodaram', () => {
@@ -191,4 +191,76 @@ test('extractPhoneDigits dá o mesmo resultado que phoneFromTitle, de que é esp
   for (const [text] of PHONE_TEXTS) {
     assert.equal(extractPhoneDigits(text), phoneFromTitle(text), JSON.stringify(text));
   }
+});
+
+// Escolha do telefone no painel "Dados do contato", nas formas dos snapshots contact_info_drawer: o contato não salvo tem o
+// número no subtítulo, repetido nos textos dos botões "Bloquear" e "Denunciar"; a conta comercial não tem o subtítulo, e
+// sim o cartão com o nome, e o número aparece duas vezes. Números fictícios
+const CONTACT_PHONE = '+55 11 90000-0001';
+const BUSINESS_PHONE = '+55 11 3000-0002';
+const OTHER_PHONE = '+55 11 90000-0003';
+const NO_SUBTITLE_NOR_BUSINESS_CARD = 'painel sem telefone no subtítulo e sem o cartão de conta comercial';
+
+/** O resultado de chooseDrawerPhone, criado no contexto do vm, como um objeto deste arquivo, para o deepEqual */
+function choose(params) {
+  return { ...chooseDrawerPhone(params) };
+}
+
+test('chooseDrawerPhone: o subtítulo que é só um telefone é o número, mesmo com outro número no painel', () => {
+  // Contato não salvo
+  assert.deepEqual(
+    choose({ subtitleText: CONTACT_PHONE, phoneTexts: [CONTACT_PHONE, CONTACT_PHONE, CONTACT_PHONE], businessCardPresent: false }),
+    { phone: '5511900000001', source: 'subtitle' }
+  );
+  // Com as marcas de direção em volta do número, e um "Recado" com outro: o subtítulo é o WhatsApp que escreve
+  assert.deepEqual(
+    choose({ subtitleText: '\u202A+55 11 90000-0001\u202C', phoneTexts: [CONTACT_PHONE, OTHER_PHONE], businessCardPresent: true }),
+    { phone: '5511900000001', source: 'subtitle' }
+  );
+});
+
+test('chooseDrawerPhone: sem o subtítulo, o número do painel da conta comercial quando todos os textos que são só um telefone dão o mesmo', () => {
+  // O número abaixo do nome e o da seção "Recado e número de telefone"
+  assert.deepEqual(
+    choose({ subtitleText: null, phoneTexts: [BUSINESS_PHONE, BUSINESS_PHONE], businessCardPresent: true }),
+    { phone: '551130000002', source: 'business-card' }
+  );
+  // O mesmo número escrito de outro jeito é um número só, e um texto que não é só um telefone não conta
+  assert.deepEqual(
+    choose({ phoneTexts: [BUSINESS_PHONE, '55 (11) 3000.0002', 'Ligue +55 11 90000-0003', 'Loja 2'], businessCardPresent: true }),
+    { phone: '551130000002', source: 'business-card' }
+  );
+  // Um subtítulo que não é um telefone não muda a regra
+  assert.deepEqual(
+    choose({ subtitleText: 'Loja de roupas', phoneTexts: [BUSINESS_PHONE], businessCardPresent: true }),
+    { phone: '551130000002', source: 'business-card' }
+  );
+});
+
+test('chooseDrawerPhone: dois números diferentes no painel da conta comercial não dão nenhum, com o aviso', () => {
+  // Um "Recado" que é só outro número, escrito pela própria conta, daria à conversa o chat_id de outra
+  assert.deepEqual(
+    choose({ phoneTexts: [BUSINESS_PHONE, BUSINESS_PHONE, OTHER_PHONE], businessCardPresent: true }),
+    { phone: null, reason: 'mais de um número no painel' }
+  );
+  assert.deepEqual(
+    choose({ subtitleText: 'Loja de roupas', phoneTexts: [OTHER_PHONE, BUSINESS_PHONE], businessCardPresent: true }),
+    { phone: null, reason: 'mais de um número no painel' }
+  );
+});
+
+test('chooseDrawerPhone: sem telefone no subtítulo e sem o cartão da conta comercial, nenhum número, com o motivo, mesmo com um número no painel', () => {
+  for (const subtitleText of [null, '', '~Maria', 'Bloquear +55 11 90000-0001']) {
+    assert.deepEqual(
+      choose({ subtitleText, phoneTexts: [OTHER_PHONE], businessCardPresent: false }),
+      { phone: null, reason: NO_SUBTITLE_NOR_BUSINESS_CARD },
+      JSON.stringify(subtitleText)
+    );
+  }
+  assert.deepEqual(choose({}), { phone: null, reason: NO_SUBTITLE_NOR_BUSINESS_CARD });
+  // Conta comercial sem número nenhum no painel
+  assert.deepEqual(
+    choose({ phoneTexts: ['Loja 2'], businessCardPresent: true }),
+    { phone: null, reason: 'nenhum número no painel da conta comercial' }
+  );
 });

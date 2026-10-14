@@ -3380,6 +3380,8 @@ const BUSINESS_PHONE = '551130000003';
 // Mensagem que o content (contact-info-reader.js) devolve quando o painel não abre no prazo
 const DRAWER_NOT_OPENED = "o painel 'Dados do contato' não abriu em 5 s";
 const PHONE_NOT_FOUND = 'número não encontrado no painel';
+// Motivo do content (DomUtils.chooseDrawerPhone) quando o painel tem números diferentes
+const MORE_THAN_ONE_NUMBER = 'mais de um número no painel';
 
 /** Leitura do painel que terminou, como o content real a devolve (ContactInfoReader.read) */
 function contactInfo({ kind = 'chat', phone = null, ms = 1200, ...extra } = {}) {
@@ -3461,7 +3463,7 @@ test('tipo e telefone do contato: o título que é telefone dispensa o painel; o
 });
 
 test('painel "Dados do contato" que falha ou não mostra o número: a conversa é salva, com a nota na linha do relatório, a contagem no cabeçalho e o tempo do painel no log', { timeout: TEST_TIMEOUT_MS }, async () => {
-  const { fake, archive } = setUp({ chats: sidebarChats(['Ana', 'Bia', 'Caio', 'Davi', 'Eva']) });
+  const { fake, archive } = setUp({ chats: sidebarChats(['Ana', 'Bia', 'Caio', 'Davi', 'Eva', 'Fabi']) });
   const orch = createOrchestrator();
   const unknownTitle = 'título do painel não reconhecido: "Contact info"';
   fake.content.onExport = deliveringExport(orch, {
@@ -3473,7 +3475,9 @@ test('painel "Dados do contato" que falha ou não mostra o número: a conversa �
       // O número foi lido, e o painel continuou aberto: só o log registra
       Davi: { chatKind: 'chat', contactInfo: contactInfo({ phone: PANEL_PHONE, ms: 7100, warning: 'o painel não fechou' }) },
       // Telefone com dígitos de menos não é aceito
-      Eva: { chatKind: 'chat', contactInfo: contactInfo({ phone: '119000', ms: 1000 }) }
+      Eva: { chatKind: 'chat', contactInfo: contactInfo({ phone: '119000', ms: 1000 }) },
+      // Painel de conversa individual com números diferentes: a aba não escolhe nenhum e diz o motivo
+      Fabi: { chatKind: 'chat', contactInfo: contactInfo({ ms: 1100, reason: MORE_THAN_ONE_NUMBER }) }
     }
   });
 
@@ -3482,21 +3486,23 @@ test('painel "Dados do contato" que falha ou não mostra o número: a conversa �
   const state = orch.getState();
   assert.equal(state.state, WORKFLOW_STATES.COMPLETED);
   // A falha do painel não derruba a exportação: todas foram salvas, e nenhuma entrou na repescagem
-  assert.deepEqual(state.summary, { saved: 5, empty: 0, savedToDisk: 0, notExportable: 0, failed: 0 });
-  assert.equal(fake.content.exportRequests.length, 5);
+  assert.deepEqual(state.summary, { saved: 6, empty: 0, savedToDisk: 0, notExportable: 0, failed: 0 });
+  assert.equal(fake.content.exportRequests.length, 6);
   assert.deepEqual(orch.run.results.map((r) => r.contact), [
     contactRecord({ kind: 'chat', infoMs: 5012, infoError: DRAWER_NOT_OPENED }),
     contactRecord({ kind: 'chat', infoMs: 900, infoError: PHONE_NOT_FOUND }),
     contactRecord({ infoMs: 800, infoError: unknownTitle }),
     contactRecord({ kind: 'chat', phone: PANEL_PHONE, phoneSource: 'contact_info', infoMs: 7100 }),
-    contactRecord({ kind: 'chat', infoMs: 1000, infoError: PHONE_NOT_FOUND })
+    contactRecord({ kind: 'chat', infoMs: 1000, infoError: PHONE_NOT_FOUND }),
+    contactRecord({ kind: 'chat', infoMs: 1100, infoError: MORE_THAN_ONE_NUMBER })
   ]);
   assert.deepEqual(contactInfoAttempts(orch.run.results), [
     [{ ms: 5012, error: DRAWER_NOT_OPENED }],
     [{ ms: 900, error: PHONE_NOT_FOUND }],
     [{ ms: 800, error: unknownTitle }],
     [{ ms: 7100, error: null, warning: 'o painel não fechou' }],
-    [{ ms: 1000, error: PHONE_NOT_FOUND }]
+    [{ ms: 1000, error: PHONE_NOT_FOUND }],
+    [{ ms: 1100, error: MORE_THAN_ONE_NUMBER }]
   ]);
   // A mensagem da conversa não muda: o aviso fica no relatório, e o popup não recebe aviso nenhum
   assert.equal(orch.run.results[0].message, '"Ana" salvo (1.5 KB).');
@@ -3504,14 +3510,15 @@ test('painel "Dados do contato" que falha ou não mostra o número: a conversa �
 
   const { report, executionLog } = archive.calls[0];
   assert.deepEqual(report.split('\n').slice(6), [
-    'Conversas na fila: 5 | no ZIP: 5 (vazias: 0) | na pasta Downloads: 0 | não exportáveis: 0 | falhas: 0',
-    missingContactsHeader(4),
+    'Conversas na fila: 6 | no ZIP: 6 (vazias: 0) | na pasta Downloads: 0 | não exportáveis: 0 | falhas: 0',
+    missingContactsHeader(5),
     '',
     `[OK] 1. "Ana" salvo (1.5 KB).${contactNote(DRAWER_NOT_OPENED)}`,
     `[OK] 2. "Bia" salvo (1.5 KB).${contactNote(PHONE_NOT_FOUND)}`,
     `[OK] 3. "Caio" salvo (1.5 KB).${contactNote(unknownTitle)}`,
     '[OK] 4. "Davi" salvo (1.5 KB).',
     `[OK] 5. "Eva" salvo (1.5 KB).${contactNote(PHONE_NOT_FOUND)}`,
+    `[OK] 6. "Fabi" salvo (1.5 KB).${contactNote(MORE_THAN_ONE_NUMBER)}`,
     ''
   ]);
   assert.deepEqual(executionLog.split('\n').slice(6, -1).map(withoutClockAndDuration), [
@@ -3519,7 +3526,8 @@ test('painel "Dados do contato" que falha ou não mostra o número: a conversa �
     `nº 2 "Bia" | tentativa 1 | <duração> | abertura: lista visível | OK | dados do contato: falhou em 0.9 s (${PHONE_NOT_FOUND})`,
     `nº 3 "Caio" | tentativa 1 | <duração> | abertura: lista visível | OK | dados do contato: falhou em 0.8 s (${unknownTitle})`,
     'nº 4 "Davi" | tentativa 1 | <duração> | abertura: lista visível | OK | dados do contato: 7.1 s (aviso: o painel não fechou)',
-    `nº 5 "Eva" | tentativa 1 | <duração> | abertura: lista visível | OK | dados do contato: falhou em 1 s (${PHONE_NOT_FOUND})`
+    `nº 5 "Eva" | tentativa 1 | <duração> | abertura: lista visível | OK | dados do contato: falhou em 1 s (${PHONE_NOT_FOUND})`,
+    `nº 6 "Fabi" | tentativa 1 | <duração> | abertura: lista visível | OK | dados do contato: falhou em 1.1 s (${MORE_THAN_ONE_NUMBER})`
   ]);
 });
 

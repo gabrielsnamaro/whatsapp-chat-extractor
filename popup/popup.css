@@ -251,6 +251,14 @@ body {
   gap: 6px;
 }
 
+.read-receipt-notice {
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--status-warn);
+  border-left: 2px solid var(--status-warn);
+  padding-left: 8px;
+}
+
 .btn {
   width: 100%;
   padding: 9px 12px;

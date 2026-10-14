@@ -4,9 +4,10 @@ import { phoneFromTitle } from '../utils/phone.js';
 // como os rótulos de botão que a automação procura
 const OMITTED_MEDIA_PATTERN = /<[^<>]*(omitid|ocultad)[ao]>|<Mensagem de [aá]lbum>/gi;
 
-// Uma linha abre uma entrada pela forma "[data] ...", sem exigir que a data seja interpretável, para a
-// contagem não depender do formato regional dela. O que vem depois de "[data] " é "- evento",
-// "Nome: texto", ou "Nome:" sozinho quando o texto começa na linha seguinte
+// Uma linha abre uma entrada pela forma "[data] ...". O que vem depois de "[data] " é "- evento", "Nome: texto", ou
+// "Nome:" sozinho quando o texto começa na linha seguinte. Com alguma data no formato esperado no arquivo, só o colchete
+// com data abre entrada (parseChatText); sem nenhuma, vale qualquer colchete, para a contagem não depender do formato
+// regional da data
 const MESSAGE_PATTERN = /^([^:\n]+):( |$)/;
 const SYSTEM_EVENT_PREFIX = '- ';
 
@@ -82,7 +83,7 @@ const UNSUPPORTED_EVENT_PATTERN = /não é compatível com sua versão do WhatsA
 /**
  * @param {string} line Linha sem a quebra de linha
  * @returns {{ kind: 'message'|'event', timestampRaw: string, senderName: string|null, firstLine: string }|null}
- *   null para continuação da entrada anterior
+ *   null quando a linha não tem a forma de cabeçalho, e continua a entrada anterior
  */
 function readEntryHeader(line) {
   if (!line.startsWith('[')) return null;
@@ -278,17 +279,24 @@ export function parseChatText(text) {
   }
 
   const lines = text.split('\n').map((line) => (line.endsWith('\r') ? line.slice(0, -1) : line));
+  const headers = lines.map((line) => {
+    const header = readEntryHeader(line);
+    return header && { ...header, date: readDateParts(header.timestampRaw) };
+  });
+  // O texto exportado não escapa nada: uma linha digitada no meio de uma mensagem com a forma "[lembrete] Ana: …" abriria
+  // uma entrada falsa. Com alguma data no arquivo, só o colchete com data abre entrada
+  const datedOnly = headers.some((header) => header?.date);
 
   // As linhas antes da primeira entrada (o aviso de criptografia, sem data) não são mensagem e ficam de fora
   const drafts = [];
-  for (const line of lines) {
-    const header = readEntryHeader(line);
-    if (header) {
+  lines.forEach((line, index) => {
+    const header = headers[index];
+    if (header && (header.date || !datedOnly)) {
       drafts.push({ ...header, lines: header.firstLine === '' ? [] : [header.firstLine] });
     } else if (drafts.length > 0) {
       drafts.at(-1).lines.push(line);
     }
-  }
+  });
 
   if (drafts.length === 0) {
     return {
@@ -304,10 +312,9 @@ export function parseChatText(text) {
     };
   }
 
-  const dates = drafts.map((draft) => readDateParts(draft.timestampRaw));
-  const dateOrder = decideDateOrder(dates.filter(Boolean));
+  const dateOrder = decideDateOrder(drafts.map((draft) => draft.date).filter(Boolean));
   const entries = drafts.map((draft, index) => {
-    const timestamp = dates[index] ? toUtcTimestamp(dates[index], dateOrder) : null;
+    const timestamp = draft.date ? toUtcTimestamp(draft.date, dateOrder) : null;
     return draft.kind === 'event' ? buildEvent(index + 1, draft, timestamp) : buildMessage(index + 1, draft, timestamp);
   });
   const messageCount = entries.filter((entry) => entry.kind === 'message').length;

@@ -810,6 +810,55 @@ test('JSON no ZIP: sem nenhuma mensagem, o _mensagens.jsonl existe e fica vazio;
   );
 });
 
+// Título e texto com U+2028, U+2029 e U+0085: o JSON os aceita sem escape dentro de um texto, e o splitlines() do Python
+// os trata como quebra de linha
+const LINE_BREAKS_TITLE = 'Loja\u2028Fictícia';
+const LINE_BREAKS_TEXT = 'primeira linha\u2028mesma mensagem\u2029parágrafo\u0085fim';
+
+/** Grava no staging trocado uma conversa com as quebras de linha do Unicode no título e no texto e devolve a linha do índice dela */
+async function stageUnicodeLineBreaksChat(key, order) {
+  const text = `[8/4/26, 9:00:00 AM] Ana: ${LINE_BREAKS_TEXT}\n[8/4/26, 9:01:00 AM] Você: ok\n`;
+  await stage(key, LINE_BREAKS_TITLE, await storedExportZip([['_chat.txt', text], ['chat.md', chatMarkdown(LINE_BREAKS_TITLE)]]), 'conversa.zip');
+  return indexRow({
+    chatId: key, order, title: LINE_BREAKS_TITLE, kind: 'chat', contactPhone: '5511977777777', contactPhoneSource: 'contact_info'
+  });
+}
+
+/** Linhas pelas quebras que o str.splitlines() do Python reconhece, sem a vazia depois da última quebra */
+function splitUnicodeLines(text) {
+  const lines = text.split(/\r\n|[\n\r\v\f\x1C-\x1E\x85\u2028\u2029]/);
+  return lines.at(-1) === '' ? lines.slice(0, -1) : lines;
+}
+
+test('JSON no ZIP: U+2028, U+2029 e U+0085 de um texto saem escapados nos dois arquivos, uma linha por registro, e o valor lido de volta é o mesmo', async () => {
+  staging = stubStaging();
+  const row = await stageUnicodeLineBreaksChat('000000', 1);
+
+  const { blob } = await ArchivePackager.build({ report: REPORT, expectedKeys: ['000000'], indexRows: [row], runMeta: RUN_META });
+
+  const files = await readZip(blob);
+  const chatsText = decoder.decode(files.get(CHATS_JSON_FILENAME));
+  const messagesText = decoder.decode(files.get(MESSAGES_JSON_FILENAME));
+  for (const text of [chatsText, messagesText]) {
+    assert.equal(/[\u2028\u2029\u0085]/.test(text), false, text);
+  }
+  assert.ok(chatsText.includes('"name":"Loja\\u2028Fictícia"'), chatsText);
+  assert.ok(chatsText.includes('"folder":"Loja\\u2028Fictícia"'), chatsText);
+  assert.ok(
+    messagesText.includes('"text":"primeira linha\\u2028mesma mensagem\\u2029parágrafo\\u0085fim"'),
+    messagesText
+  );
+  assert.equal(splitUnicodeLines(chatsText).length, 1);
+  assert.equal(splitUnicodeLines(messagesText).length, 2);
+
+  // Lido de volta, o valor é o original; o message_id é o da receita, calculado sobre o texto sem o escape
+  const [chat] = readJsonLines(files.get(CHATS_JSON_FILENAME));
+  assert.deepEqual([chat.chat_id, chat.name, chat.folder], [`${LINE_PHONE}_5511977777777`, LINE_BREAKS_TITLE, LINE_BREAKS_TITLE]);
+  const messages = readJsonLines(files.get(MESSAGES_JSON_FILENAME));
+  assert.deepEqual(messages.map(({ text }) => text), [LINE_BREAKS_TEXT, 'ok']);
+  assert.equal(messages[0].message_id, expectedMessageId(chat.chat_id, '8/4/26, 9:00:00 AM', 'Ana', LINE_BREAKS_TEXT, 0));
+});
+
 test('JSON no ZIP: sem os dados da execução ou sem as linhas do índice, o ZIP sai sem o JSON; com os dados sem o id da execução, o empacotamento falha', async () => {
   staging = stubStaging();
   const indexRows = await stageSampleRun();
@@ -834,7 +883,8 @@ function hasPython() {
 
 /**
  * Confere o JSON do ZIP com leitores independentes (zipfile e json do Python): o ZIP íntegro, UTF-8 sem BOM, cada linha
- * um objeto JSON (sem linha em branco e sem NaN/Infinity), LF no fim, ids únicos e toda mensagem ligada a uma conversa
+ * um objeto JSON (sem linha em branco e sem NaN/Infinity), LF no fim, ids únicos, toda mensagem ligada a uma conversa e
+ * uma linha por registro também para o splitlines(), que quebra a linha em mais caracteres que o LF
  */
 async function inspectJsonWithPython(blob) {
   const dir = mkdtempSync(join(tmpdir(), 'zip-json-test-'));
@@ -859,7 +909,12 @@ def read_objects(z, name):
         if not isinstance(value, dict):
             raise ValueError(name + ": linha que não é um objeto JSON")
         objects.append(value)
-    return {"bom": data.startswith(b"\xef\xbb\xbf"), "crlf": b"\r" in data, "objects": objects}
+    return {
+        "bom": data.startswith(b"\xef\xbb\xbf"),
+        "crlf": b"\r" in data,
+        "objects": objects,
+        "split_lines_match": len(text.splitlines()) == len(objects)
+    }
 
 with zipfile.ZipFile(sys.argv[1]) as z:
     bad = z.testzip()
@@ -875,7 +930,8 @@ with zipfile.ZipFile(sys.argv[1]) as z:
         "unique_message_ids": len(set(message_ids)) == len(message_ids),
         "orphan_messages": [message["message_id"] for message in messages["objects"] if message["chat_id"] not in set(chat_ids)],
         "bom": chats["bom"] or messages["bom"],
-        "crlf": chats["crlf"] or messages["crlf"]
+        "crlf": chats["crlf"] or messages["crlf"],
+        "split_lines_match": chats["split_lines_match"] and messages["split_lines_match"]
     }))
 `;
     return JSON.parse(execFileSync('python3', ['-I', '-c', script, file]).toString());
@@ -884,20 +940,21 @@ with zipfile.ZipFile(sys.argv[1]) as z:
   }
 }
 
-test('JSON no ZIP: validação externa (Python zipfile e json), cada item é um objeto JSON válido e os ids são únicos', { skip: !hasPython() }, async () => {
+test('JSON no ZIP: validação externa (Python zipfile e json), cada item é um objeto JSON válido, os ids são únicos e o splitlines() dá uma linha por registro, mesmo com U+2028, U+2029 e U+0085 no texto', { skip: !hasPython() }, async () => {
   staging = stubStaging();
-  const indexRows = await stageSampleRun();
+  const indexRows = [...await stageSampleRun(), await stageUnicodeLineBreaksChat('000008', 9)];
 
-  const { blob } = await ArchivePackager.build({ report: REPORT, expectedKeys: SAMPLE_KEYS, indexRows, runMeta: RUN_META });
+  const { blob } = await ArchivePackager.build({ report: REPORT, expectedKeys: [...SAMPLE_KEYS, '000008'], indexRows, runMeta: RUN_META });
 
   assert.deepEqual(await inspectJsonWithPython(blob), {
     bad: null,
-    chats: 8,
-    messages: 11,
+    chats: 9,
+    messages: 13,
     unique_chat_ids: true,
     unique_message_ids: true,
     orphan_messages: [],
     bom: false,
-    crlf: false
+    crlf: false,
+    split_lines_match: true
   });
 });

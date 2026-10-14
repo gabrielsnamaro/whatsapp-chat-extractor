@@ -86,12 +86,13 @@ function chatWithText(text, { row = {}, runMeta = RUN_META, chatMarkdown = null 
 test('conversa individual com telefone: chat_id e wa_chat_id pelo telefone do contato, campos na ordem do contrato e datas em UTC sem milissegundos', async () => {
   const text = chatText(
     'As mensagens e as ligações são protegidas com a criptografia de ponta a ponta.',
-    // Entradas sem data no começo e no fim: a 1ª e a última data são as das outras
-    '[lembrete] Maria Silva: entrada sem data no começo',
+    // Entradas com data impossível (31 de fevereiro), sem timestamp, no começo e no fim: a 1ª e a última data são as das
+    // outras
+    '[2/31/26, 9:00:00 AM] Maria Silva: entrada sem timestamp no começo',
     '[8/1/26, 9:00:05 AM] Maria Silva: Bom dia',
     '[8/1/26, 9:01:00 AM] Você: <imagem ocultada>',
     '[10/1/26, 3:50:12 PM] Maria Silva: Até logo',
-    '[sem data] Maria Silva: entrada sem data no fim'
+    '[2/31/26, 9:00:00 AM] Maria Silva: entrada sem timestamp no fim'
   );
 
   const chat = await chatWithText(text, { row: { order: 12 } });

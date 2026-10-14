@@ -29,6 +29,10 @@ const UNRECOGNIZED_FORMAT_ERROR = 'Formato do texto não reconhecido: nenhuma li
 // Seguido da mensagem do erro inesperado na montagem do JSON de uma conversa
 const INTERNAL_JSON_ERROR_PREFIX = 'erro interno ao montar o JSON: ';
 
+// U+2028, U+2029 e U+0085: o JSON.stringify os deixa sem escape dentro de um texto, e quem divide o arquivo pelas quebras
+// de linha do Unicode (como o splitlines() do Python) partiria o registro em dois
+const UNICODE_LINE_BREAKS_PATTERN = /[\u2028\u2029\u0085]/g;
+
 const INDEX_COLUMNS = [
   'Ordem', 'Título', 'Pasta', 'Status', 'Código', 'Tentativas', 'Bytes', 'Mensagens', 'Eventos de sistema',
   'Anexos omitidos', 'Primeira data', 'Última data', 'Duração (s)', 'Abertura'
@@ -233,12 +237,21 @@ function buildIndexCsv(rows, folderByKey) {
 }
 
 /**
- * JSON Lines: um objeto por linha, cada linha terminada em \n, inclusive a última
+ * @param {string} json Saída do JSON.stringify
+ * @returns {string} O mesmo JSON, com as quebras de linha do Unicode que ele deixa sem escape escritas como escape: o valor
+ *   lido de volta é o mesmo
+ */
+function escapeUnicodeLineBreaks(json) {
+  return json.replace(UNICODE_LINE_BREAKS_PATTERN, (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, '0')}`);
+}
+
+/**
+ * JSON Lines: um objeto por linha, cada linha terminada em \n, inclusive a última, e nenhuma outra quebra de linha
  * @param {Object[]} records
  * @returns {string}
  */
 function toJsonLines(records) {
-  return records.map((record) => `${JSON.stringify(record)}\n`).join('');
+  return records.map((record) => `${escapeUnicodeLineBreaks(JSON.stringify(record))}\n`).join('');
 }
 
 /**
