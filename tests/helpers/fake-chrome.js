@@ -55,15 +55,22 @@ function urlPatternToRegExp(pattern) {
  * resposta (ex: para avisar o andamento, como o content real faz durante a rolagem), e `scanStats`, se
  * definido, vai na resposta como as estatísticas da varredura; sem ele, a resposta não as traz. `line` é a
  * linha da conta logada que o CHECK_PAGE_READY devolve (accountLine); null simula a aba que não a detecta, e
- * trocá-la no meio do teste simula a aba entrando em outra conta.
+ * trocá-la no meio do teste simula a aba entrando em outra conta. `visible` é a visibilidade da aba no CHECK_PAGE_READY;
+ * como o content real, a varredura e a exportação durante as quais a aba esteve oculta respondem com `tabHidden: true`
+ * (changeTabVisibility muda a visibilidade e avisa o orquestrador).
  */
-function createFakeContent({ chats, ready, line }) {
+function createFakeContent({ chats, ready, line, visible }) {
   const content = {
     present: true,
     injected: false,
     ready,
     /** @type {{ phone: string, source: string }|null} */
     line,
+    visible,
+    /** Uma varredura ou exportação está em andamento na aba */
+    operationInProgress: false,
+    /** A aba esteve oculta durante a varredura ou exportação em andamento (ou a última) */
+    operationSawHiddenTab: false,
     chats,
     readyChecks: 0,
     received: [],
@@ -80,27 +87,50 @@ function createFakeContent({ chats, ready, line }) {
     /** @type {null|function(Object): (Object|Promise<Object>)} */
     onResetSidebar: null,
 
+    beginOperation() {
+      content.operationInProgress = true;
+      content.operationSawHiddenTab = !content.visible;
+    },
+
+    /** Como o content real: a resposta, de sucesso ou de falha, diz se a aba esteve oculta durante a operação */
+    endOperation(response) {
+      content.operationInProgress = false;
+      return content.operationSawHiddenTab ? { ...response, tabHidden: true } : response;
+    },
+
     async handle(message) {
       switch (message.action) {
         case ACTIONS.CHECK_PAGE_READY:
           content.readyChecks++;
-          return { success: true, ready: content.ready, url: WHATSAPP_URL, line: content.line ? structuredClone(content.line) : null };
+          return {
+            success: true,
+            ready: content.ready,
+            url: WHATSAPP_URL,
+            line: content.line ? structuredClone(content.line) : null,
+            visible: content.visible
+          };
 
         case ACTIONS.SCAN_CHATS_REQUEST: {
+          content.beginOperation();
           if (content.onScan) await content.onScan(message);
           const found = structuredClone(content.chats);
           const chats = message.maxLimit ? found.slice(0, message.maxLimit) : found;
-          return content.scanStats ? { success: true, chats, stats: structuredClone(content.scanStats) } : { success: true, chats };
+          return content.endOperation(
+            content.scanStats ? { success: true, chats, stats: structuredClone(content.scanStats) } : { success: true, chats }
+          );
         }
 
         case ACTIONS.EXPORT_CHAT_REQUEST:
           content.exportRequests.push({ ...message, receivedAt: performance.now() });
-          if (!content.onExport) return { success: true, triggered: true };
+          content.beginOperation();
+          if (!content.onExport) return content.endOperation({ success: true, triggered: true });
           // Como o content real: um erro na página vira resposta de falha, com o código dele, não exceção
           try {
-            return await content.onExport(message);
+            return content.endOperation(await content.onExport(message));
           } catch (err) {
-            return { success: false, cancelled: false, error: err.message, code: typeof err.code === 'string' ? err.code : null };
+            return content.endOperation({
+              success: false, cancelled: false, error: err.message, code: typeof err.code === 'string' ? err.code : null
+            });
           }
 
         case ACTIONS.FETCH_BLOB_REQUEST:
@@ -143,15 +173,20 @@ function createFakeContent({ chats, ready, line }) {
  * @param {boolean} [options.ready=true] Resposta do CHECK_PAGE_READY
  * @param {{ phone: string, source: string }|null} [options.line] Linha da conta no CHECK_PAGE_READY (padrão: a de
  *   FAKE_LINE_PHONE); null simula a aba que não a detecta
+ * @param {boolean} [options.visible=true] A aba do WhatsApp Web está visível (CHECK_PAGE_READY)
  * @param {Object} [options.storage] Conteúdo inicial do chrome.storage.local (clonado)
  */
-export function createFakeChrome({ chats = [], ready = true, line = accountLine(FAKE_LINE_PHONE), storage = {} } = {}) {
+export function createFakeChrome({ chats = [], ready = true, line = accountLine(FAKE_LINE_PHONE), visible = true, storage = {} } = {}) {
   const store = new Map(Object.entries(structuredClone(storage)));
   const tabs = [{ id: WHATSAPP_TAB_ID, url: WHATSAPP_URL, active: true, lastAccessed: 1 }];
-  const content = createFakeContent({ chats, ready, line });
+  const content = createFakeContent({ chats, ready, line, visible });
   const runtimeMessages = [];
   const injections = [];
   const downloadCalls = [];
+  /** Indicação no ícone da extensão (chrome.action), como está agora */
+  const badge = { text: '', color: null };
+  /** @type {Array<{ method: string, text?: string, color?: string }>} Chamadas a chrome.action, na ordem */
+  const actionCalls = [];
   /** @type {Array<{ method: 'set', items: Object }|{ method: 'remove', keys: string[] }>} */
   const storageOps = [];
 
@@ -216,6 +251,17 @@ export function createFakeChrome({ chats = [], ready = true, line = accountLine(
       }
     },
 
+    action: {
+      setBadgeText: async ({ text }) => {
+        actionCalls.push({ method: 'setBadgeText', text });
+        badge.text = text;
+      },
+      setBadgeBackgroundColor: async ({ color }) => {
+        actionCalls.push({ method: 'setBadgeBackgroundColor', color });
+        badge.color = color;
+      }
+    },
+
     scripting: {
       executeScript: async ({ target, files }) => {
         injections.push(structuredClone({ target, files }));
@@ -245,6 +291,10 @@ export function createFakeChrome({ chats = [], ready = true, line = accountLine(
     runtimeMessages,
     injections,
     downloadCalls,
+    badge,
+    actionCalls,
+    /** Os textos que a indicação no ícone da extensão mostrou, na ordem, sem os de quando ela foi tirada */
+    badgeTextsShown: () => actionCalls.filter((call) => call.method === 'setBadgeText' && call.text).map((call) => call.text),
     /** Cópia do chrome.storage.local, para simular o que sobrevive a um reinício do service worker */
     snapshotStorage: () => structuredClone(Object.fromEntries(store)),
     /** Valor gravado numa chave, clonado */
@@ -294,6 +344,23 @@ export function armCapture(orch, captureId, { tabId = WHATSAPP_TAB_ID } = {}) {
     throw new Error(response?.error || `O background recusou ${ACTIONS.EXPORT_CAPTURE_ARMED}.`);
   }
   return response;
+}
+
+/**
+ * Simula a aba do WhatsApp Web ficando oculta ou visível: como o content real, marca a varredura ou a exportação em
+ * andamento quando a aba fica oculta e avisa o background (TAB_VISIBILITY_CHANGED), pelo mesmo método do orquestrador que o
+ * service worker chama, com o id da aba que enviou
+ * @param {ReturnType<typeof createFakeChrome>} fake
+ * @param {import('../../background/extraction-orchestrator.js').ExtractionOrchestrator} orch
+ * @param {boolean} visible
+ * @param {Object} [options]
+ * @param {number} [options.tabId]
+ * @returns {Object} Resposta do orquestrador
+ */
+export function changeTabVisibility(fake, orch, visible, { tabId = WHATSAPP_TAB_ID } = {}) {
+  fake.content.visible = visible;
+  if (!visible && fake.content.operationInProgress) fake.content.operationSawHiddenTab = true;
+  return orch.recordTabVisibility({ visible, tabId });
 }
 
 /**

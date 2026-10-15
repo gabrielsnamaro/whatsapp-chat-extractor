@@ -251,7 +251,8 @@ body {
   gap: 6px;
 }
 
-.read-receipt-notice {
+.read-receipt-notice,
+.tab-visibility-notice {
   font-size: 11px;
   line-height: 1.4;
   color: var(--status-warn);

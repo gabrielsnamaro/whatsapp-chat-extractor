@@ -38,14 +38,16 @@
   }
 
   /**
-   * A leitura do painel não muda mais: é de grupo, o telefone veio do subtítulo, ou veio da conta comercial e é o mesmo
-   * da leitura anterior. Os números fora do subtítulo podem aparecer aos poucos, e um que chegue depois muda a escolha
+   * A leitura do painel não muda mais: é de grupo, o telefone veio do subtítulo ou de logo abaixo dele, ou veio da conta
+   * comercial e é o mesmo da leitura anterior. Os números da conta comercial podem aparecer aos poucos, e um que chegue
+   * depois muda a escolha; os do topo do painel, não, porque nenhum outro texto vem antes deles na escolha
    * @param {DrawerInspection} current
    * @param {DrawerInspection|null} previous
    * @returns {boolean}
    */
   function isSettledInspection(current, previous) {
-    if (current.kind === CHAT_KINDS.GROUP || current.source === DRAWER_PHONE_SOURCES.SUBTITLE) return true;
+    if (current.kind === CHAT_KINDS.GROUP) return true;
+    if (current.source === DRAWER_PHONE_SOURCES.SUBTITLE || current.source === DRAWER_PHONE_SOURCES.BELOW_SUBTITLE) return true;
     return current.source === DRAWER_PHONE_SOURCES.BUSINESS_CARD &&
       previous?.source === DRAWER_PHONE_SOURCES.BUSINESS_CARD &&
       previous.phone === current.phone;
@@ -85,9 +87,10 @@
 
     /**
      * Lê o tipo e o telefone de um painel já aberto, sem clique nem espera. O número sai da escolha do
-     * DomUtils.chooseDrawerPhone: o subtítulo, quando ele é só um telefone (contato não salvo), ou, no painel de uma
-     * conta comercial, o número que todos os textos do painel que são só um telefone dão. Atributos não são lidos: o
-     * "Bloquear +55 …" e o "Denunciar +55 …" ficam no aria-label dos botões.
+     * DomUtils.chooseDrawerPhone: o subtítulo, quando ele é só um telefone (contato não salvo); o texto logo abaixo do
+     * subtítulo, quando ele é só um telefone (contato salvo); ou, no painel de uma conta comercial, o número que todos os
+     * textos do painel que são só um telefone dão. Atributos não são lidos: o "Bloquear +55 …" e o "Denunciar +55 …"
+     * ficam no aria-label dos botões.
      * @param {HTMLElement} drawer `[data-testid="chat-info-drawer"]`
      * @returns {ContactInfo}
      */
@@ -112,12 +115,37 @@
         };
       }
 
+      const subtitle = drawer.querySelector(SELECTORS.CONTACT_INFO_SUBTITLE);
       const choice = chooseDrawerPhone({
-        subtitleText: drawer.querySelector(SELECTORS.CONTACT_INFO_SUBTITLE)?.textContent ?? null,
+        subtitleText: subtitle?.textContent ?? null,
+        belowSubtitleText: subtitle ? this._findTextBelowSubtitle(drawer, subtitle) : null,
         phoneTexts: this._findPhoneTexts(drawer),
         businessCardPresent: Boolean(drawer.querySelector(SELECTORS.CONTACT_INFO_BUSINESS_CARD))
       });
       return { kind: CHAT_KINDS.CHAT, ...choice };
+    }
+
+    /**
+     * Texto do primeiro `[data-testid="selectable-text"]` depois do subtítulo, na ordem do documento: o número do contato
+     * salvo, cujo subtítulo é o nome (snapshot payload3.html), ou o "~nome de perfil" do não salvo. Só o primeiro: os
+     * seguintes, como o "Recado", são escritos pelo próprio contato. A seção do subtítulo só impede sair do painel (nos
+     * snapshots, ela é o painel inteiro). Um contato salvo sem o número abaixo do nome e com um "Recado" que seja só um
+     * telefone ficaria com esse número (layout não visto)
+     * @private
+     * @param {HTMLElement} drawer
+     * @param {Element} subtitle
+     * @returns {string|null} null quando o subtítulo não está numa seção do painel ou nada vem depois dele nela
+     */
+    _findTextBelowSubtitle(drawer, subtitle) {
+      const section = subtitle.closest('section');
+      if (!section || !drawer.contains(section)) return null;
+      for (const candidate of section.querySelectorAll(SELECTORS.CONTACT_INFO_SELECTABLE_TEXT)) {
+        const position = subtitle.compareDocumentPosition(candidate);
+        if (position & Node.DOCUMENT_POSITION_FOLLOWING && !(position & Node.DOCUMENT_POSITION_CONTAINED_BY)) {
+          return candidate.textContent;
+        }
+      }
+      return null;
     }
 
     /**
@@ -179,8 +207,8 @@
 
     /**
      * Relê o painel até `contentMs` e fica com a última leitura. Para antes quando ela não muda mais
-     * (isSettledInspection): o tipo de grupo, o telefone do subtítulo, ou o da conta comercial em duas leituras seguidas
-     * iguais
+     * (isSettledInspection): o tipo de grupo, o telefone do subtítulo ou de logo abaixo dele, ou o da conta comercial em
+     * duas leituras seguidas iguais
      * @private
      * @param {HTMLElement} drawer
      * @param {AbortSignal} [signal]

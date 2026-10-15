@@ -31,6 +31,9 @@ export const ACTIONS = Object.freeze({
   // Andamento da varredura da lista lateral (Content Script -> Background)
   SCAN_PROGRESS: 'SCAN_PROGRESS',
 
+  // A aba do WhatsApp Web ficou oculta ou voltou a ficar visível (Content Script -> Background)
+  TAB_VISIBILITY_CHANGED: 'TAB_VISIBILITY_CHANGED',
+
   // Controle de fluxo de lote (Popup -> Background)
   START_BATCH_EXTRACTION: 'START_BATCH_EXTRACTION',
   PAUSE_BATCH_EXTRACTION: 'PAUSE_BATCH_EXTRACTION',

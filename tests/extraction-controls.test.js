@@ -1,5 +1,6 @@
 import { test, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { ExtractionControls, normalizeSafeDelaySeconds } from '../popup/ui/extraction-controls.js';
 import { WORKFLOW_STATES } from '../shared/constants/workflow-states.js';
 import { createFakeChrome, installFakeChrome, uninstallFakeChrome } from './helpers/fake-chrome.js';
@@ -220,4 +221,24 @@ test('o campo do número da linha fica desabilitado durante a execução e na pa
     controls.updateUiState(state);
     assert.equal(input.disabled, false, state);
   }
+});
+
+// Avisos fixos do popup, à vista antes de iniciar
+
+test('o popup mostra, antes do botão de iniciar, o aviso de manter a aba do WhatsApp Web visível, ao lado do de leitura', () => {
+  const html = readFileSync(new URL('../popup/popup.html', import.meta.url), 'utf8');
+  const startButtonAt = html.indexOf('id="btn-start-batch"');
+  const visibilityNotice = '<p class="tab-visibility-notice">Mantenha a aba do WhatsApp Web visível durante a extração ' +
+    '(pode ser numa janela separada, sem minimizar). Se ela ficar oculta, a extração pausa e continua quando a aba voltar.</p>';
+  const visibilityNoticeAt = html.indexOf(visibilityNotice);
+  const readReceiptNoticeAt = html.indexOf('<p class="read-receipt-notice">');
+
+  assert.ok(startButtonAt > 0, 'botão de iniciar não encontrado no popup');
+  assert.ok(visibilityNoticeAt > 0, 'aviso da aba visível não encontrado no popup');
+  assert.ok(readReceiptNoticeAt > 0 && readReceiptNoticeAt < visibilityNoticeAt && visibilityNoticeAt < startButtonAt);
+  // Sem classe que o esconda: o aviso fica à vista em qualquer estado da extração
+  assert.equal(/<p class="tab-visibility-notice[^"]*hidden/.test(html), false);
+  // O mesmo estilo do aviso de leitura
+  const css = readFileSync(new URL('../popup/popup.css', import.meta.url), 'utf8');
+  assert.match(css, /\.read-receipt-notice,\s*\.tab-visibility-notice\s*\{/);
 });

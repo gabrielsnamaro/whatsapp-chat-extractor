@@ -249,6 +249,54 @@ test('chooseDrawerPhone: dois números diferentes no painel da conta comercial n
   );
 });
 
+// Contato salvo (snapshot payload3.html): o subtítulo é o nome salvo, e o número é o primeiro texto logo abaixo dele
+const SAVED_NAME = 'Maria Silva';
+
+test('chooseDrawerPhone: com o nome no subtítulo, o texto logo abaixo dele que é só um telefone é o número, mesmo com outro número no painel', () => {
+  assert.deepEqual(
+    choose({ subtitleText: SAVED_NAME, belowSubtitleText: CONTACT_PHONE, phoneTexts: [CONTACT_PHONE], businessCardPresent: false }),
+    { phone: '5511900000001', source: 'below-subtitle' }
+  );
+  // Com as marcas de direção em volta do número, e um "Recado" com outro: o número do topo é o WhatsApp que escreve
+  assert.deepEqual(
+    choose({ subtitleText: SAVED_NAME, belowSubtitleText: '\u202A+55 11 3000-0002\u202C', phoneTexts: [BUSINESS_PHONE, OTHER_PHONE] }),
+    { phone: '551130000002', source: 'below-subtitle' }
+  );
+  // Um nome com dígitos no subtítulo continua sendo um nome
+  assert.deepEqual(
+    choose({ subtitleText: 'Loja 24 horas', belowSubtitleText: CONTACT_PHONE }),
+    { phone: '5511900000001', source: 'below-subtitle' }
+  );
+});
+
+test('chooseDrawerPhone: o texto logo abaixo do subtítulo não muda os outros casos', () => {
+  // Contato não salvo: o subtítulo é o número, e logo abaixo dele vem o "~nome de perfil"; um número diferente logo abaixo
+  // também não vale mais que o subtítulo
+  for (const belowSubtitleText of ['~Maria', OTHER_PHONE]) {
+    assert.deepEqual(
+      choose({ subtitleText: CONTACT_PHONE, belowSubtitleText, phoneTexts: [CONTACT_PHONE] }),
+      { phone: '5511900000001', source: 'subtitle' },
+      belowSubtitleText
+    );
+  }
+  // Logo abaixo, um texto que não é só um telefone: vale a regra da conta comercial, como antes
+  assert.deepEqual(
+    choose({ subtitleText: SAVED_NAME, belowSubtitleText: '~Maria', phoneTexts: [BUSINESS_PHONE], businessCardPresent: true }),
+    { phone: '551130000002', source: 'business-card' }
+  );
+  assert.deepEqual(
+    choose({ subtitleText: SAVED_NAME, belowSubtitleText: 'Ligue +55 11 90000-0003', phoneTexts: [BUSINESS_PHONE, OTHER_PHONE], businessCardPresent: true }),
+    { phone: null, reason: 'mais de um número no painel' }
+  );
+  for (const belowSubtitleText of [null, '', '~Maria', 'Bloquear +55 11 90000-0001', '90000-0001']) {
+    assert.deepEqual(
+      choose({ subtitleText: SAVED_NAME, belowSubtitleText, phoneTexts: [OTHER_PHONE], businessCardPresent: false }),
+      { phone: null, reason: NO_SUBTITLE_NOR_BUSINESS_CARD },
+      JSON.stringify(belowSubtitleText)
+    );
+  }
+});
+
 test('chooseDrawerPhone: sem telefone no subtítulo e sem o cartão da conta comercial, nenhum número, com o motivo, mesmo com um número no painel', () => {
   for (const subtitleText of [null, '', '~Maria', 'Bloquear +55 11 90000-0001']) {
     assert.deepEqual(

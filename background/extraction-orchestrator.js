@@ -3,7 +3,7 @@ import { ACTIONS } from '../shared/constants/actions.js';
 import { StagingRepository } from '../shared/storage/staging-repository.js';
 import { StorageClient } from '../shared/clients/storage-client.js';
 import { inspectChatExport } from '../shared/archive/chat-export-inspector.js';
-import { REPORT_FILENAME, MESSAGES_JSON_FILENAME } from '../shared/archive/archive-packager.js';
+import { REPORT_FILENAME, EXECUTION_LOG_FILENAME, MESSAGES_JSON_FILENAME } from '../shared/archive/archive-packager.js';
 import { findWhatsAppTab } from '../shared/utils/whatsapp-tab.js';
 import { normalizePhoneDigits, phoneFromTitle } from '../shared/utils/phone.js';
 import { Logger } from '../shared/utils/logger.js';
@@ -35,6 +35,27 @@ const ACTIVE_STATES = [
   WORKFLOW_STATES.WAITING_DOWNLOAD,
   WORKFLOW_STATES.PACKAGING
 ];
+
+// Fases em que a execução usa a aba e pode pausar, pelo usuário ou pela aba oculta: o empacotamento não usa a aba
+const PAUSABLE_STATES = [WORKFLOW_STATES.SCANNING, WORKFLOW_STATES.EXPORTING, WORKFLOW_STATES.WAITING_DOWNLOAD];
+
+// Com a aba do WhatsApp Web oculta (outra aba na frente ou janela minimizada), o Chrome roda os temporizadores dela no
+// máximo uma vez por minuto e não redesenha a página: as esperas da automação estouram, e as conversas falhavam por isso
+const TAB_HIDDEN_PAUSE_MESSAGE = 'A aba do WhatsApp Web ficou em segundo plano. O Chrome deixa abas ocultas lentas, ' +
+  'então a extração pausou e continua sozinha quando a aba voltar a ficar visível.';
+// Depois de um reinício do service worker, a pausa da aba oculta não continua sozinha: a execução volta pausada, como as outras
+const TAB_HIDDEN_PAUSE_RESTORED_MESSAGE = 'A extração estava pausada com a aba do WhatsApp Web oculta e foi interrompida ' +
+  'pelo navegador. Deixe a aba visível e clique em "Retomar" para continuar de onde parou.';
+const TAB_HIDDEN_PAUSE_LOG_TEXT = 'Pausa: a aba do WhatsApp Web ficou oculta (outra aba na frente ou janela minimizada), ' +
+  'e a extração parou até ela voltar a ficar visível.';
+
+// Quem encerrou uma pausa da aba oculta: a volta da aba ou o "Retomar" do usuário (também numa execução restaurada)
+const TAB_HIDDEN_PAUSE_ENDINGS = Object.freeze({ TAB_VISIBLE: 'tab_visible', USER: 'user' });
+
+// Indicação no ícone da extensão enquanto a execução está pausada pela aba oculta, que se vê com o popup fechado. Âmbar,
+// como os avisos do popup
+const PAUSE_BADGE_TEXT = '||';
+const PAUSE_BADGE_COLOR = '#e9a935';
 
 const RESULT_STATUS = Object.freeze({
   SAVED: 'saved',
@@ -174,6 +195,43 @@ function formatSize(bytes) {
 /** Milissegundos em segundos, com uma casa decimal só quando ela não é zero (ex: "2 s", "4.2 s") */
 function formatSeconds(ms) {
   return `${Number((ms / 1000).toFixed(1))} s`;
+}
+
+/** Duração de uma pausa, em minutos e segundos inteiros (ex: "45 s", "3 min", "3 min 20 s") */
+function formatPauseDuration(ms) {
+  const totalSeconds = Math.max(0, Math.round(ms / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (!minutes) return `${seconds} s`;
+  return seconds ? `${minutes} min ${seconds} s` : `${minutes} min`;
+}
+
+/**
+ * @typedef {Object} TabHiddenPause Pausa automática da execução com a aba do WhatsApp Web oculta, em `run.tabHiddenPauses`
+ * @property {string} pausedAt Início, em ISO
+ * @property {string|null} resumedAt Fim, em ISO; null enquanto ela dura
+ * @property {'tab_visible'|'user'|null} resumedBy Quem a encerrou (TAB_HIDDEN_PAUSE_ENDINGS); null enquanto ela dura
+ */
+
+/**
+ * Duração de uma pausa da aba oculta; a que ainda dura conta até agora
+ * @param {TabHiddenPause} pause
+ * @returns {number} ms
+ */
+function pauseDurationOf({ pausedAt, resumedAt }) {
+  return (resumedAt ? Date.parse(resumedAt) : Date.now()) - Date.parse(pausedAt);
+}
+
+/**
+ * Linha do fim de uma pausa da aba oculta no log da execução
+ * @param {TabHiddenPause} pause Já encerrada
+ * @returns {string}
+ */
+function describeTabHiddenPauseEnd(pause) {
+  const duration = formatPauseDuration(pauseDurationOf(pause));
+  return pause.resumedBy === TAB_HIDDEN_PAUSE_ENDINGS.USER
+    ? `Retomada pelo usuário ("Retomar"), depois de ${duration} de pausa com a aba oculta.`
+    : `Retomada: a aba voltou a ficar visível, depois de ${duration} de pausa.`;
 }
 
 /**
@@ -623,14 +681,27 @@ export class ExtractionOrchestrator {
      * informada no popup (`manual`): null até a aba ser conferida no início, e ausente numa execução iniciada
      * por uma versão anterior da extensão. `retry` é a repescagem: null até a fila terminar; `indices` são as
      * posições na fila que entraram nela, `cursor` a próxima a exportar e `startsAt` quando a rodada pode
-     * começar. `scan` são as estatísticas da varredura (null até ela terminar).
-     * @type {{ runId: string, tabId: number|null, line: { phone: string, source: 'auto'|'manual' }|null, options: Object, queue: Array, nextIndex: number, results: Array, unexpectedFiles: Array, retry: { indices: number[], cursor: number, startsAt: string }|null, scan: { found: number, steps: number, durationMs: number, stopReason: string, lastChatTimestamp: string|null }|null, startedAt: string }|null}
+     * começar. `scan` são as estatísticas da varredura (null até ela terminar). `tabHiddenPauses` são as pausas
+     * automáticas com a aba oculta, para o relatório e o log (ausente numa execução iniciada por uma versão anterior).
+     * @type {{ runId: string, tabId: number|null, line: { phone: string, source: 'auto'|'manual' }|null, options: Object, queue: Array, nextIndex: number, results: Array, unexpectedFiles: Array, retry: { indices: number[], cursor: number, startsAt: string }|null, scan: { found: number, steps: number, durationMs: number, stopReason: string, lastChatTimestamp: string|null }|null, tabHiddenPauses: TabHiddenPause[], startedAt: string }|null}
      */
     this.run = null;
     /** A fila ainda não foi para o storage; vai na próxima gravação do estado (_persistRun) */
     this._queueUnsaved = false;
     /** @type {Set<number>} Posições na fila cujo resultado ainda não foi para o storage; vão na próxima gravação do estado */
     this._unsavedResults = new Set();
+
+    /** A aba da execução está oculta, pelo último aviso dela (TAB_VISIBILITY_CHANGED) ou pela última resposta ao CHECK_PAGE_READY */
+    this._tabHidden = false;
+    /** Avisos de aba oculta até agora: uma tentativa compara o do início com o do fim para saber se a aba ficou oculta nela */
+    this._tabHiddenNotices = 0;
+    /** A pausa atual é a automática, da aba oculta: só ela é retomada sozinha quando a aba volta a ficar visível */
+    this._pausedForHiddenTab = false;
+    /**
+     * @type {Map<string, number>} Tentativas descartadas pela aba oculta, por "<posição na fila>:<tentativa>": a repetição
+     *   de cada uma usa uma captura nova
+     */
+    this._hiddenTabDiscards = new Map();
 
     this.captures = new ExportCaptureRegistry();
     this.interceptor = new DownloadInterceptor({
@@ -700,9 +771,12 @@ export class ExtractionOrchestrator {
     this._activeState = run.nextIndex >= run.queue.length && !this._hasPendingRetry()
       ? WORKFLOW_STATES.PACKAGING
       : WORKFLOW_STATES.EXPORTING;
-    this.statusMessage = state === WORKFLOW_STATES.PAUSED
-      ? (statusMessage || 'Extração pausada.')
-      : 'A extração foi interrompida pelo navegador. Clique em "Retomar" para continuar de onde parou.';
+    const pausedForHiddenTab = run.tabHiddenPauses?.at(-1)?.resumedAt === null;
+    if (state !== WORKFLOW_STATES.PAUSED) {
+      this.statusMessage = 'A extração foi interrompida pelo navegador. Clique em "Retomar" para continuar de onde parou.';
+    } else {
+      this.statusMessage = pausedForHiddenTab ? TAB_HIDDEN_PAUSE_RESTORED_MESSAGE : (statusMessage || 'Extração pausada.');
+    }
     log.info(`Execução ${run.runId} restaurada como pausada (${run.nextIndex}/${run.queue.length}).`);
   }
 
@@ -896,8 +970,7 @@ export class ExtractionOrchestrator {
    * @returns {boolean}
    */
   pause() {
-    const pausable = [WORKFLOW_STATES.SCANNING, WORKFLOW_STATES.EXPORTING, WORKFLOW_STATES.WAITING_DOWNLOAD];
-    if (!this.isBusy() || this.isPaused || !pausable.includes(this._activeState)) return false;
+    if (!this.isBusy() || this.isPaused || !PAUSABLE_STATES.includes(this._activeState)) return false;
 
     this.isPaused = true;
     this.state = WORKFLOW_STATES.PAUSED;
@@ -915,10 +988,23 @@ export class ExtractionOrchestrator {
   resume() {
     if (!this.isPaused) return false;
 
+    // Também a pausa da aba oculta, quando o usuário não espera a aba voltar, e a de uma execução restaurada
+    this._endTabHiddenPause(TAB_HIDDEN_PAUSE_ENDINGS.USER);
+    log.info('Orquestrador retomado pelo usuário.');
+    this._continueAfterPause();
+    this._notifyProgress();
+    return true;
+  }
+
+  /**
+   * Sai da pausa: o laço que a esperava continua, ou, numa execução restaurada depois de um reinício, um laço novo começa
+   * @private
+   */
+  _continueAfterPause() {
     this.isPaused = false;
     this.state = this._activeState;
     this.statusMessage = null;
-    log.info('Orquestrador retomado pelo usuário.');
+    this._clearPauseBadge();
 
     if (this._resumeResolver) {
       this._resumeResolver();
@@ -935,9 +1021,110 @@ export class ExtractionOrchestrator {
         await this._processQueue(signal);
       });
     }
+  }
 
-    this._notifyProgress();
-    return true;
+  /**
+   * Registra a visibilidade da aba da execução, avisada pelo content script (TAB_VISIBILITY_CHANGED). Com a aba oculta numa
+   * fase que usa a aba, a execução pausa sozinha (_pauseForHiddenTab); com ela visível de novo, retoma sozinha, mas só da
+   * pausa automática: a pausa pedida pelo usuário continua até ele clicar em "Retomar". Um aviso de outra aba, ou fora de
+   * uma execução em andamento (inclusive a restaurada depois de um reinício, que espera o "Retomar"), é ignorado.
+   * @param {{ visible: boolean, tabId: number }} params
+   * @returns {{ success: boolean, recorded?: boolean, error?: string }}
+   */
+  recordTabVisibility({ visible, tabId }) {
+    if (typeof visible !== 'boolean') {
+      return { success: false, error: `Visibilidade da aba inválida: ${String(visible)}.` };
+    }
+    if (!this.isBusy() || !this.run || this.run.tabId !== tabId) return { success: true, recorded: false };
+
+    this._noteTabVisibility(visible);
+    if (!visible) {
+      if (!this.isPaused && PAUSABLE_STATES.includes(this._activeState)) this._pauseForHiddenTab();
+    } else if (this._pausedForHiddenTab) {
+      this._resumeAfterHiddenTab();
+    }
+    return { success: true, recorded: true };
+  }
+
+  /**
+   * @private
+   * @param {boolean} visible
+   */
+  _noteTabVisibility(visible) {
+    this._tabHidden = !visible;
+    if (!visible) this._tabHiddenNotices++;
+  }
+
+  /**
+   * Visibilidade da aba pela resposta ao CHECK_PAGE_READY; sem resposta, fica a que se sabia
+   * @private
+   * @param {Object|null} status
+   */
+  _noteTabVisibilityOf(status) {
+    if (typeof status?.visible === 'boolean') this._noteTabVisibility(status.visible);
+  }
+
+  /**
+   * Pausa automática com a aba oculta: como a do usuário, vale ao fim da etapa em andamento na aba. Fica registrada na
+   * execução para o relatório e o log, e é avisada no popup e no ícone da extensão
+   * @private
+   */
+  _pauseForHiddenTab() {
+    this.isPaused = true;
+    this._pausedForHiddenTab = true;
+    this.state = WORKFLOW_STATES.PAUSED;
+    this.statusMessage = TAB_HIDDEN_PAUSE_MESSAGE;
+    // Uma execução iniciada por uma versão anterior da extensão não tem a lista
+    (this.run.tabHiddenPauses ??= []).push({ pausedAt: new Date().toISOString(), resumedAt: null, resumedBy: null });
+    log.warn('Extração pausada: a aba do WhatsApp Web ficou oculta.');
+    this._showPauseBadge();
+    this._notifyProgress({ warningMessage: `⚠️ ${TAB_HIDDEN_PAUSE_MESSAGE}` });
+  }
+
+  /** @private */
+  _resumeAfterHiddenTab() {
+    const pausedMs = this._endTabHiddenPause(TAB_HIDDEN_PAUSE_ENDINGS.TAB_VISIBLE);
+    log.info('Extração retomada: a aba do WhatsApp Web voltou a ficar visível.');
+    this._continueAfterPause();
+    this._notifyProgress({
+      infoMessage: `A aba do WhatsApp Web voltou a ficar visível: a extração continua, depois de ${formatPauseDuration(pausedMs)} de pausa.`
+    });
+  }
+
+  /**
+   * Encerra a pausa da aba oculta que estiver em aberto, a última da lista
+   * @private
+   * @param {string} resumedBy Um dos TAB_HIDDEN_PAUSE_ENDINGS
+   * @returns {number} Duração da pausa, em ms; 0 sem pausa em aberto
+   */
+  _endTabHiddenPause(resumedBy) {
+    this._pausedForHiddenTab = false;
+    const pause = this.run?.tabHiddenPauses?.at(-1);
+    if (!pause || pause.resumedAt) return 0;
+    pause.resumedAt = new Date().toISOString();
+    pause.resumedBy = resumedBy;
+    return pauseDurationOf(pause);
+  }
+
+  /** @private */
+  _showPauseBadge() {
+    chrome.action.setBadgeBackgroundColor({ color: PAUSE_BADGE_COLOR }).catch((err) => {
+      log.warn('Falha ao colorir a indicação de pausa no ícone da extensão:', err);
+    });
+    chrome.action.setBadgeText({ text: PAUSE_BADGE_TEXT }).catch((err) => {
+      log.warn('Falha ao mostrar a indicação de pausa no ícone da extensão:', err);
+    });
+  }
+
+  /**
+   * Tira a indicação de pausa do ícone. Sem conferir se ela está lá: o Chrome a mantém quando o service worker reinicia, e
+   * uma instância nova não sabe se a anterior a deixou
+   * @private
+   */
+  _clearPauseBadge() {
+    chrome.action.setBadgeText({ text: '' }).catch((err) => {
+      log.warn('Falha ao tirar a indicação de pausa do ícone da extensão:', err);
+    });
   }
 
   /**
@@ -984,6 +1171,8 @@ export class ExtractionOrchestrator {
    */
   async cancel() {
     this.isPaused = false;
+    this._pausedForHiddenTab = false;
+    this._clearPauseBadge();
     if (this._resumeResolver) {
       this._resumeResolver();
       this._resumeResolver = null;
@@ -1102,6 +1291,11 @@ export class ExtractionOrchestrator {
 
     // Uma execução pausada ou interrompida anterior é descartada ao iniciar outra
     this.isPaused = false;
+    this._pausedForHiddenTab = false;
+    this._tabHidden = false;
+    this._tabHiddenNotices = 0;
+    this._hiddenTabDiscards = new Map();
+    this._clearPauseBadge();
     this.errorMessage = null;
     this.errorCode = null;
     this.statusMessage = null;
@@ -1119,6 +1313,7 @@ export class ExtractionOrchestrator {
       unexpectedFiles: [],
       retry: null,
       scan: null,
+      tabHiddenPauses: [],
       startedAt: new Date().toISOString()
     };
     this._queueUnsaved = false;
@@ -1162,8 +1357,11 @@ export class ExtractionOrchestrator {
         }
         this._activeState = this.state;
         this.isPaused = false;
+        this._pausedForHiddenTab = false;
         this._notifyProgress();
       } finally {
+        // Concluída, falha, cancelada ou parada numa pausa sem o laço (outra conta na aba, download do ZIP não concluído)
+        this._clearPauseBadge();
         this.interceptor.stopListening();
         this._stopKeepAlive();
         this._abortController = null;
@@ -1191,15 +1389,21 @@ export class ExtractionOrchestrator {
   /**
    * @private
    * @param {AbortSignal} signal
+   * @param {Object} [options]
+   * @param {boolean} [options.checkTabLine=true] Confere a linha da aba na retomada; o empacotamento, que não usa a aba,
+   *   não confere
+   * @returns {Promise<boolean>} A execução estava pausada e foi retomada
    */
-  async _waitResumeIfPaused(signal) {
+  async _waitResumeIfPaused(signal, { checkTabLine = true } = {}) {
+    const wasPaused = this.isPaused;
     while (this.isPaused && !signal.aborted) {
       await new Promise((resolve) => {
         this._resumeResolver = resolve;
       });
-      if (!this.isPaused && !signal.aborted) await this._checkTabLineOnResume(signal);
+      if (checkTabLine && !this.isPaused && !signal.aborted) await this._checkTabLineOnResume(signal);
     }
     if (signal.aborted) throw new RunCancelledError();
+    return wasPaused;
   }
 
   /**
@@ -1214,7 +1418,48 @@ export class ExtractionOrchestrator {
     const status = await this._pingTab(this.run.tabId);
     // Cancelada durante a consulta: a pausa da conferência não pode sobrescrever o cancelamento
     if (signal.aborted) return;
+    this._noteTabVisibilityOf(status);
     this._confirmTabLine(tabLinePhoneOf(status));
+  }
+
+  /**
+   * Espera a execução poder mexer na aba: sem pausa e com a aba visível. Com a aba oculta, pausa sozinha
+   * (_pauseForHiddenTab) antes de pedir qualquer coisa a ela, e espera a aba voltar ou o usuário retomar. Uma retomada com
+   * a aba ainda tida como oculta (pelo "Retomar", ou com o aviso da volta perdido) pergunta à aba antes de pausar de novo
+   * @private
+   * @param {AbortSignal} signal
+   */
+  async _waitUntilTabVisible(signal) {
+    let resumed = await this._waitResumeIfPaused(signal);
+    while (this._tabHidden) {
+      if (resumed) {
+        await this._refreshTabVisibility(signal);
+        if (!this._tabHidden) return;
+      }
+      this._pauseForHiddenTab();
+      resumed = await this._waitResumeIfPaused(signal);
+    }
+  }
+
+  /**
+   * Pergunta à aba se ela está visível (CHECK_PAGE_READY); sem resposta, fica a visibilidade que se sabia
+   * @private
+   * @param {AbortSignal} signal
+   */
+  async _refreshTabVisibility(signal) {
+    const status = await this._pingTab(this.run.tabId);
+    if (signal.aborted) throw new RunCancelledError();
+    this._noteTabVisibilityOf(status);
+  }
+
+  /**
+   * Depois de uma tentativa ou varredura descartada pela aba oculta, com a aba tida como visível: o aviso de que ela
+   * ficou oculta pode não ter chegado, e repetir com ela oculta falharia de novo
+   * @private
+   * @param {AbortSignal} signal
+   */
+  async _recheckTabAfterDiscard(signal) {
+    if (!this._tabHidden) await this._refreshTabVisibility(signal);
   }
 
   /**
@@ -1291,6 +1536,7 @@ export class ExtractionOrchestrator {
     if (!status.ready) {
       throw new Error('O WhatsApp Web ainda não está pronto (carregando ou aguardando a leitura do QR Code).');
     }
+    this._noteTabVisibilityOf(status);
     return { tab, linePhone: tabLinePhoneOf(status) };
   }
 
@@ -1303,10 +1549,20 @@ export class ExtractionOrchestrator {
     const { tabId, options } = this.run;
     this._setPhase(WORKFLOW_STATES.SCANNING);
     this._notifyProgress();
-    log.info(`Iniciando escaneamento de chats na aba ${tabId}...`);
 
     const limit = !options.downloadAll && options.maxChats > 0 ? options.maxChats : null;
-    const response = await this._sendToTab(tabId, { action: ACTIONS.SCAN_CHATS_REQUEST, maxLimit: limit }, signal);
+    let response;
+    while (true) {
+      await this._waitUntilTabVisible(signal);
+      log.info(`Iniciando escaneamento de chats na aba ${tabId}...`);
+      const hiddenNoticesAtStart = this._tabHiddenNotices;
+      response = await this._sendToTab(tabId, { action: ACTIONS.SCAN_CHATS_REQUEST, maxLimit: limit }, signal);
+      if (response?.tabHidden !== true && this._tabHiddenNotices === hiddenNoticesAtStart) break;
+      // Com a aba oculta, a rolagem anda devagar e a varredura pode parar no teto de tempo: a fila sairia incompleta
+      log.warn('Varredura descartada: a aba ficou oculta durante ela, e ela recomeça quando a aba voltar a ficar visível.');
+      this.scanFound = 0;
+      await this._recheckTabAfterDiscard(signal);
+    }
     if (!response?.success || !Array.isArray(response.chats)) {
       if (response?.cancelled && signal.aborted) throw new RunCancelledError();
       throw new Error(response?.error || 'Falha ao escanear conversas no WhatsApp Web.');
@@ -1346,7 +1602,7 @@ export class ExtractionOrchestrator {
     this.interceptor.startListening();
 
     while (this.run.nextIndex < queue.length) {
-      await this._waitResumeIfPaused(signal);
+      await this._waitUntilTabVisible(signal);
 
       const index = this.run.nextIndex;
       const chat = queue[index];
@@ -1357,6 +1613,11 @@ export class ExtractionOrchestrator {
       log.info(`[${index + 1}/${queue.length}] Exportando conversa "${chat.title}"...`);
 
       const result = await this._exportChat(chat, index, signal);
+      if (!result) {
+        // Descartada pela aba oculta: a mesma conversa é exportada de novo quando a aba voltar
+        await this._recheckTabAfterDiscard(signal);
+        continue;
+      }
       this._setResult(index, { ...result, attempts: 1 });
       this.run.nextIndex = index + 1;
       this._notifyResult(`[${index + 1}/${queue.length}]`, this.run.results[index]);
@@ -1364,9 +1625,14 @@ export class ExtractionOrchestrator {
       if (this.run.nextIndex < queue.length) await this._waitBetweenChats(signal);
     }
 
+    // A pausa da última conversa da fila (do usuário ou da aba oculta) vale antes de a repescagem começar
+    if (this._hasPendingRetry()) await this._waitResumeIfPaused(signal);
     // Antes do stopListening: a repescagem usa as mesmas duas fontes de captura da fila
     await this._retryFailures(signal);
     this.interceptor.stopListening();
+    // Nunca empacota pausada: a pausa da última conversa da fila ou da repescagem vale antes do ZIP, que terminaria a
+    // execução ainda pausada. O ZIP não usa a aba, e a linha dela não é conferida
+    await this._waitResumeIfPaused(signal, { checkTabLine: false });
     await this._packageAndDownload(signal);
   }
 
@@ -1412,11 +1678,11 @@ export class ExtractionOrchestrator {
       // Uma pausa pedida durante a espera trocou a mensagem, e a dela continua valendo
       if (!this.isPaused) this.statusMessage = null;
     }
-    await this._waitResumeIfPaused(signal);
+    await this._waitUntilTabVisible(signal);
     await this._resetSidebar(signal);
 
     while (retry.cursor < total) {
-      await this._waitResumeIfPaused(signal);
+      await this._waitUntilTabVisible(signal);
 
       const index = retry.indices[retry.cursor];
       const chat = queue[index];
@@ -1430,6 +1696,11 @@ export class ExtractionOrchestrator {
       const previous = this.run.results[index];
       const firstAttemptCode = previous?.code ?? null;
       const result = await this._exportChat(chat, index, signal, { attempt: 2 });
+      if (!result) {
+        // Descartada pela aba oculta: o cursor não anda, e a conversa é repescada de novo quando a aba voltar
+        await this._recheckTabAfterDiscard(signal);
+        continue;
+      }
       const contact = mergeRetriedContact(previous?.contact, result.contact);
       // Fica o resultado da repescagem, sucesso ou falha: a 1ª tentativa falhou sem deixar arquivo no
       // staging. O código dela fica para o relatório reconstituir a ordem real das tentativas, e o
@@ -1514,18 +1785,34 @@ export class ExtractionOrchestrator {
    * status, quando se sabe algum deles (pelo título, pelo menu ou pelo painel "Dados do contato"). `history` traz
    * só esta tentativa, com o início, a duração, se ela passou pela quarentena e, quando a aba os mandou, o
    * diagnóstico da busca e da rolagem da abertura e a leitura do painel; a repescagem a junta à da fila.
+   * Uma tentativa que falhou com a aba oculta em algum momento dela (pela resposta da aba ou por um aviso de aba oculta
+   * durante a tentativa, inclusive na espera do arquivo) é descartada: não vira falha nem tentativa, e a conversa é
+   * exportada de novo quando a aba voltar, com outra captura. Uma tentativa que recebeu o arquivo vale mesmo assim.
    * @private
    * @param {{ title: string, duplicateTitle: boolean }} chat
    * @param {number} index Posição na fila
    * @param {AbortSignal} signal
    * @param {Object} [options]
    * @param {number} [options.attempt=1] 1 na fila, 2 na repescagem
-   * @returns {Promise<{ title: string, status: string, code: string|null, via: string|null, warnings: string[], staged: boolean, late: boolean, message: string, size?: number, contact?: ContactRecord, history: AttemptRecord[] }>}
+   * @returns {Promise<{ title: string, status: string, code: string|null, via: string|null, warnings: string[], staged: boolean, late: boolean, message: string, size?: number, contact?: ContactRecord, history: AttemptRecord[] }|null>}
+   *   null quando a tentativa foi descartada pela aba oculta
    */
   async _exportChat(chat, index, signal, { attempt = 1 } = {}) {
     const { runId, tabId } = this.run;
-    // Uma captura por tentativa: um bloco atrasado da transferência da 1ª é recusado na repescagem
-    const captureId = attempt === 1 ? `${runId}-${index}` : `${runId}-${index}-r${attempt - 1}`;
+    const discardKey = `${index}:${attempt}`;
+    const discards = this._hiddenTabDiscards.get(discardKey) ?? 0;
+    // Uma captura por tentativa: um bloco atrasado da transferência da 1ª é recusado na repescagem, e o de uma tentativa
+    // descartada pela aba oculta, na repetição dela
+    const attemptCaptureId = attempt === 1 ? `${runId}-${index}` : `${runId}-${index}-r${attempt - 1}`;
+    const captureId = discards ? `${attemptCaptureId}-h${discards}` : attemptCaptureId;
+    const hiddenNoticesAtStart = this._tabHiddenNotices;
+    let tabReportedHidden = false;
+    const tabHiddenDuringAttempt = () => tabReportedHidden || this._tabHiddenNotices !== hiddenNoticesAtStart;
+    const discarded = (reason) => {
+      this._hiddenTabDiscards.set(discardKey, discards + 1);
+      log.warn(`"${chat.title}": tentativa descartada porque a aba ficou oculta durante ela (${reason}); a conversa é exportada de novo quando a aba voltar.`);
+      return null;
+    };
     const startedAt = new Date();
     // O título de um contato não salvo é o próprio telefone: só sem ele a aba abre o painel "Dados do contato"
     const titlePhone = phoneFromTitle(chat.title);
@@ -1583,9 +1870,12 @@ export class ExtractionOrchestrator {
       const infoRead = contactInfoReadOf(trigger);
       contact = buildContact({ titlePhone, chatKind: trigger?.chatKind, infoRead });
       contactInfoAttempt = infoRead ? contactInfoAttemptOf(infoRead, contact) : null;
+      tabReportedHidden = trigger?.tabHidden === true;
       if (!trigger?.success) {
         if (trigger?.cancelled && signal.aborted) throw new RunCancelledError();
-        return failed(trigger?.error || 'erro desconhecido na página.', errorCodeOf(trigger));
+        const message = trigger?.error || 'erro desconhecido na página.';
+        if (tabHiddenDuringAttempt()) return discarded(message);
+        return failed(message, errorCodeOf(trigger));
       }
       via = trigger.via ?? null;
       warnings = Array.isArray(trigger.warnings) ? trigger.warnings : [];
@@ -1657,6 +1947,7 @@ export class ExtractionOrchestrator {
       });
     } catch (err) {
       if (err instanceof RunCancelledError || signal.aborted) throw new RunCancelledError();
+      if (tabHiddenDuringAttempt()) return discarded(err.message);
       log.warn(`Falha na conversa "${chat.title}":`, err);
       return failed(err.message, errorCodeOf(err));
     } finally {
@@ -1753,6 +2044,15 @@ export class ExtractionOrchestrator {
           'as demais tiveram uma tentativa só.'
       );
     }
+    // Uma execução iniciada por uma versão anterior da extensão não tem a lista
+    const tabHiddenPauses = this.run.tabHiddenPauses ?? [];
+    if (tabHiddenPauses.length) {
+      const pausedMs = tabHiddenPauses.reduce((total, pause) => total + pauseDurationOf(pause), 0);
+      lines.push(
+        `Pausas por aba oculta: ${tabHiddenPauses.length}, somando ${formatPauseDuration(pausedMs)}. A extração pausou ` +
+          `sozinha com a aba do WhatsApp Web em segundo plano; o horário de cada pausa está no ${EXECUTION_LOG_FILENAME}.`
+      );
+    }
     lines.push('');
 
     const checkNotes = this._notDeliveredCheckNotes();
@@ -1842,7 +2142,8 @@ export class ExtractionOrchestrator {
    * Log da execução gravado na raiz do ZIP (_execucao.log), para diagnosticar falhas sem o DevTools
    * aberto. É montado só com o que fica persistido no run, então sobrevive a um reinício do service worker
    * (o console do background, não): cabeçalho, linha da varredura e uma linha por evento, em ordem
-   * cronológica — cada tentativa de cada conversa, o início da repescagem e os arquivos recebidos fora de hora.
+   * cronológica — cada tentativa de cada conversa, o início da repescagem, os arquivos recebidos fora de hora e o início
+   * e o fim de cada pausa com a aba oculta.
    * @private
    * @returns {string}
    */
@@ -1858,9 +2159,16 @@ export class ExtractionOrchestrator {
         text: this._describeAttempt(index, chat.title, entry, entry === history.at(-1) && result.empty === true)
       }));
     });
+    // Uma execução iniciada por uma versão anterior da extensão não tem a lista
+    const tabHiddenPauses = this.run.tabHiddenPauses ?? [];
     // Montados na ordem em que acontecem (fila, início da repescagem, repescagem), para dois eventos no
-    // mesmo milissegundo não saírem invertidos da ordenação, que é estável
+    // mesmo milissegundo não saírem invertidos da ordenação, que é estável. No mesmo milissegundo, o fim de uma pausa vem
+    // antes da tentativa que ele libera, e o início de uma pausa, depois da tentativa em que a aba ficou oculta
     const events = [
+      ...tabHiddenPauses.filter((pause) => pause.resumedAt).map((pause) => ({
+        at: pause.resumedAt,
+        text: describeTabHiddenPauseEnd(pause)
+      })),
       ...attemptEvents((entry) => entry.attempt === 1),
       ...(retry?.indices.length
         ? [{ at: retry.startsAt, text: `Repescagem: rodada prevista para este horário (fim da espera; uma pausa a adia), com ${retry.indices.length} conversa(s) que falharam na fila.` }]
@@ -1870,7 +2178,8 @@ export class ExtractionOrchestrator {
       ...(this.run.unexpectedFiles ?? []).map((entry) => ({
         at: entry.at,
         text: `Arquivo recebido fora de hora (${this._describeUnexpectedFile(entry)}): não foi salvo no ZIP e seguiu para a pasta Downloads.`
-      }))
+      })),
+      ...tabHiddenPauses.map((pause) => ({ at: pause.pausedAt, text: TAB_HIDDEN_PAUSE_LOG_TEXT }))
     ].map((event) => ({ ...event, at: Date.parse(event.at) }));
     // Sem horário, só tentativas registradas antes da atualização da extensão: vêm antes de todas as outras
     const untimed = events.filter((event) => !Number.isFinite(event.at));

@@ -42,18 +42,59 @@
   let currentOperation = null;
   /** @type {string|null} Captura aguardando o arquivo gerado pela exportação atual */
   let armedCaptureId = null;
+  /**
+   * Operações durante as quais a aba esteve oculta. Com ela oculta, o Chrome roda os temporizadores da página no máximo
+   * uma vez por minuto, e as esperas da automação estouram: o background não conta como falha uma tentativa assim
+   * @type {WeakSet<AbortController>}
+   */
+  const operationsWithHiddenTab = new WeakSet();
 
   console.log('[WhatsApp Web Extractor] Mediador de Content Script inicializado.');
+
+  function isTabVisible() {
+    return document.visibilityState === 'visible';
+  }
 
   function beginOperation() {
     currentOperation?.abort();
     currentOperation = new AbortController();
+    if (!isTabVisible()) operationsWithHiddenTab.add(currentOperation);
     return currentOperation;
   }
 
   function endOperation(operation) {
     if (currentOperation === operation) currentOperation = null;
   }
+
+  /**
+   * Campo da resposta de uma operação que diz que a aba esteve oculta durante ela
+   * @param {AbortController} operation
+   * @returns {{ tabHidden?: true }}
+   */
+  function tabHiddenField(operation) {
+    return operationsWithHiddenTab.has(operation) ? { tabHidden: true } : {};
+  }
+
+  /**
+   * Avisa o background de que a aba ficou oculta ou voltou a ficar visível: a extração pausa e retoma sozinha por isso.
+   * Não espera a resposta; fora de uma extração, o background ignora o aviso
+   */
+  function reportTabVisibility() {
+    try {
+      chrome.runtime.sendMessage({ action: 'TAB_VISIBILITY_CHANGED', visible: isTabVisible() }).catch((err) => {
+        console.warn('[WhatsApp Web Extractor] Falha ao avisar o background da visibilidade da aba:', err);
+      });
+    } catch (err) {
+      // Extensão recarregada sem reinjetar este script: o contexto dele não fala mais com o background
+      console.warn('[WhatsApp Web Extractor] Visibilidade da aba não avisada ao background:', err);
+    }
+  }
+
+  document.addEventListener('visibilitychange', () => {
+    if (!isActiveInstance()) return;
+    if (!isTabVisible() && currentOperation) operationsWithHiddenTab.add(currentOperation);
+    reportTabVisibility();
+  });
 
   /** Sessão logada: o painel lateral só existe depois da leitura do QR Code */
   function isSessionReady() {
@@ -170,7 +211,13 @@
       try {
         switch (message.action) {
           case 'CHECK_PAGE_READY': {
-            sendResponse({ success: true, ready: isSessionReady(), url: window.location.href, line: readAccountLine() });
+            sendResponse({
+              success: true,
+              ready: isSessionReady(),
+              url: window.location.href,
+              line: readAccountLine(),
+              visible: isTabVisible()
+            });
             return;
           }
 
@@ -185,7 +232,10 @@
                 signal: operation.signal
               });
               console.log(`[WhatsApp Web Extractor] Escaneamento concluído: ${chats.length} conversas localizadas (parada: ${stats.stopReason}).`);
-              sendResponse({ success: true, chats, stats });
+              sendResponse({ success: true, chats, stats, ...tabHiddenField(operation) });
+            } catch (err) {
+              if (operationsWithHiddenTab.has(operation)) err.tabHidden = true;
+              throw err;
             } finally {
               endOperation(operation);
             }
@@ -243,7 +293,8 @@
                 chatKind,
                 ...(openDiagnostics ? { openDiagnostics } : {}),
                 ...(contactInfo ? { contactInfo } : {}),
-                ...(contactInfoError ? { contactInfoError } : {})
+                ...(contactInfoError ? { contactInfoError } : {}),
+                ...tabHiddenField(operation)
               });
             } catch (err) {
               if (armedCaptureId === captureId) armedCaptureId = null;
@@ -254,6 +305,7 @@
               if (chatKind !== undefined && err.chatKind === undefined) err.chatKind = chatKind;
               if (contactInfo) err.contactInfo = contactInfo;
               if (contactInfoError) err.contactInfoError = contactInfoError;
+              if (operationsWithHiddenTab.has(operation)) err.tabHidden = true;
               throw err;
             } finally {
               endOperation(operation);
@@ -305,7 +357,7 @@
         // DOMException traz um `code` numérico legado; só os códigos em texto são da extensão (DomUtils.ERROR_CODES)
         const code = typeof err.code === 'string' ? err.code : null;
         // Na exportação, vão junto do erro o diagnóstico da abertura (para o _execucao.log), o tipo da conversa e a
-        // leitura do painel "Dados do contato"
+        // leitura do painel "Dados do contato"; na exportação e na varredura, se a aba esteve oculta durante elas
         const openDiagnostics = err.openDiagnostics ?? null;
         const contactInfo = err.contactInfo ?? null;
         const contactInfoError = err.contactInfoError ?? null;
@@ -317,7 +369,8 @@
           ...(openDiagnostics ? { openDiagnostics } : {}),
           ...(err.chatKind !== undefined ? { chatKind: err.chatKind } : {}),
           ...(contactInfo ? { contactInfo } : {}),
-          ...(contactInfoError ? { contactInfoError } : {})
+          ...(contactInfoError ? { contactInfoError } : {}),
+          ...(err.tabHidden === true ? { tabHidden: true } : {})
         });
       }
     })();

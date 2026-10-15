@@ -55,9 +55,13 @@
     CONTACT_INFO_HEADER_TITLE: '[data-testid="contact-info-header"] h2',
     CONTACT_INFO_CHAT_TEXT: 'Dados do contato',
     CONTACT_INFO_GROUP_TEXT: 'Dados do grupo',
-    // O atributo é "contact-info-subtitle selectable-text"; o contato não salvo tem o número nele, e a conta
-    // comercial não tem o subtítulo
+    // O atributo é "contact-info-subtitle selectable-text"; o contato não salvo tem o número nele, o contato salvo tem o
+    // nome, e a conta comercial não tem o subtítulo
     CONTACT_INFO_SUBTITLE: '[data-testid^="contact-info-subtitle"]',
+    // Só o primeiro deles logo depois do subtítulo é lido: nos layouts vistos, é o número do contato salvo (snapshot
+    // payload3.html) ou o "~nome de perfil" do contato não salvo (payload.html). Os seguintes, como o "Recado", que também é
+    // um deles, são escritos pelo próprio contato. Atributo exato, para não pegar o subtítulo nem o campo de notas
+    CONTACT_INFO_SELECTABLE_TEXT: '[data-testid="selectable-text"]',
     // Nome da conta comercial no topo do painel (snapshot payload2.html): só com ele os números fora do subtítulo valem
     CONTACT_INFO_BUSINESS_CARD: '[data-testid="business-top-card-name-title"]',
     // Procurado dentro do painel: o cabeçalho dele tem só este botão
@@ -105,7 +109,11 @@
   const CHAT_KINDS = Object.freeze({ CHAT: 'chat', GROUP: 'group' });
 
   /** De onde saiu o telefone escolhido no painel "Dados do contato" (chooseDrawerPhone) */
-  const DRAWER_PHONE_SOURCES = Object.freeze({ SUBTITLE: 'subtitle', BUSINESS_CARD: 'business-card' });
+  const DRAWER_PHONE_SOURCES = Object.freeze({
+    SUBTITLE: 'subtitle',
+    BELOW_SUBTITLE: 'below-subtitle',
+    BUSINESS_CARD: 'business-card'
+  });
 
   // Por que o painel de uma conversa individual não deu o telefone: vão ao background, que os põe no aviso do relatório e
   // no _execucao.log
@@ -194,19 +202,25 @@
 
   /**
    * Escolhe o telefone do contato entre os textos do painel "Dados do contato". O subtítulo que é só um telefone é o
-   * número (contato não salvo). Sem ele, os outros textos só valem no painel de uma conta comercial, e só quando todos dão
-   * o mesmo número: o "Recado" e a descrição da conta são escritos pelo próprio contato e podem trazer outro número, que
-   * daria à conversa o chat_id de outra. Não toca no DOM, para ser testada no Node.
+   * número (contato não salvo). Sem ele, o texto logo abaixo do subtítulo que é só um telefone é o número (contato salvo,
+   * cujo subtítulo é o nome). Sem nenhum dos dois, os outros textos só valem no painel de uma conta comercial, e só quando
+   * todos dão o mesmo número: o "Recado" e a descrição da conta são escritos pelo próprio contato e podem trazer outro
+   * número, que daria à conversa o chat_id de outra. Não toca no DOM, para ser testada no Node.
    * @param {Object} params
    * @param {string|null} [params.subtitleText] Texto do subtítulo do painel; null sem subtítulo
+   * @param {string|null} [params.belowSubtitleText] Texto do primeiro `[data-testid="selectable-text"]` logo depois do
+   *   subtítulo; null sem subtítulo ou sem esse elemento
    * @param {string[]} [params.phoneTexts] Textos do painel que são só um telefone (os outros são ignorados)
    * @param {boolean} [params.businessCardPresent] O cartão da conta comercial está no painel
    * @returns {{ phone: string, source: string }|{ phone: null, reason: string }} `source` é um dos DRAWER_PHONE_SOURCES;
    *   `reason`, por que nenhum número foi escolhido
    */
-  function chooseDrawerPhone({ subtitleText = null, phoneTexts = [], businessCardPresent = false } = {}) {
+  function chooseDrawerPhone({ subtitleText = null, belowSubtitleText = null, phoneTexts = [], businessCardPresent = false } = {}) {
     const subtitlePhone = extractPhoneDigits(subtitleText);
     if (subtitlePhone) return { phone: subtitlePhone, source: DRAWER_PHONE_SOURCES.SUBTITLE };
+    // Como o subtítulo, o número logo abaixo dele é o WhatsApp que escreve, e outro número no painel não muda a escolha
+    const belowSubtitlePhone = extractPhoneDigits(belowSubtitleText);
+    if (belowSubtitlePhone) return { phone: belowSubtitlePhone, source: DRAWER_PHONE_SOURCES.BELOW_SUBTITLE };
     if (!businessCardPresent) return { phone: null, reason: DRAWER_PHONE_REASONS.NO_SUBTITLE_NOR_BUSINESS_CARD };
 
     const phones = new Set(phoneTexts.map((text) => extractPhoneDigits(text)).filter(Boolean));

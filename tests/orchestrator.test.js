@@ -13,6 +13,7 @@ import {
   uninstallFakeChrome,
   armCapture,
   deliverFile,
+  changeTabVisibility,
   whatsAppDownload,
   stubStaging,
   stubArchiveDownloader,
@@ -3836,4 +3837,611 @@ test('JSON no ZIP: conversa com o texto não interpretado no empacotamento vira 
   );
   // Só a de ZIP nativo ilegível: o aviso a conta uma vez
   assert.equal(await runWithCheck({ unreadable: ['000001'], jsonUnparsed: ['000001'] }), `⚠️ Conferência do ZIP: 1 ${unreadableIssue}. ${seeReport}`);
+});
+
+// Aba do WhatsApp Web oculta (outra aba na frente ou janela minimizada): o Chrome deixa a aba lenta, e a execução pausa
+// sozinha, avisa o popup e o ícone da extensão e retoma sozinha quando a aba volta. Uma tentativa que falhou com a aba
+// oculta não conta como falha nem como tentativa, e a varredura com a aba oculta é refeita
+
+const TAB_HIDDEN_PAUSE_MESSAGE = 'A aba do WhatsApp Web ficou em segundo plano. O Chrome deixa abas ocultas lentas, ' +
+  'então a extração pausou e continua sozinha quando a aba voltar a ficar visível.';
+const TAB_HIDDEN_PAUSE_WARNING = `⚠️ ${TAB_HIDDEN_PAUSE_MESSAGE}`;
+const TAB_HIDDEN_PAUSE_LOG = 'Pausa: a aba do WhatsApp Web ficou oculta (outra aba na frente ou janela minimizada), ' +
+  'e a extração parou até ela voltar a ficar visível.';
+const TAB_VISIBLE_RESUME_LOG = 'Retomada: a aba voltou a ficar visível, depois de <pausa> de pausa.';
+const USER_RESUME_LOG = 'Retomada pelo usuário ("Retomar"), depois de <pausa> de pausa com a aba oculta.';
+const PAUSE_BADGE = { text: '||', color: '#e9a935' };
+// Duração de uma pausa, como o relatório, o log e o popup a escrevem
+const PAUSE_DURATION = String.raw`(?:\d+ s|\d+ min(?: \d+ s)?)`;
+const TAB_VISIBLE_AGAIN_INFO = new RegExp(
+  `^A aba do WhatsApp Web voltou a ficar visível: a extração continua, depois de ${PAUSE_DURATION} de pausa\\.$`
+);
+
+/** Linha do cabeçalho do relatório com as pausas da aba oculta */
+function tabHiddenPausesHeader(count) {
+  return new RegExp(
+    `^Pausas por aba oculta: ${count}, somando ${PAUSE_DURATION}\\. A extração pausou sozinha com a aba do WhatsApp Web ` +
+      'em segundo plano; o horário de cada pausa está no _execucao\\.log\\.$'
+  );
+}
+
+/** Linhas de evento do _execucao.log sem o horário, com a duração das tentativas e a das pausas trocadas por marcadores */
+function logEventsOf(executionLog) {
+  return executionLog.split('\n').slice(6, -1).map((line) => (
+    withoutClockAndDuration(line).replace(new RegExp(`depois de ${PAUSE_DURATION} de pausa`), 'depois de <pausa> de pausa')
+  ));
+}
+
+function disarmed(fake, captureId) {
+  return fake.content.received.some((m) => m.action === ACTIONS.DISARM_EXPORT_CAPTURE && m.captureId === captureId);
+}
+
+/** Folga para o laço chegar à espera da retomada, se fosse continuar sem ela */
+function settle() {
+  return new Promise((resolve) => setTimeout(resolve, 50));
+}
+
+test('aba oculta durante uma conversa que falha: a execução pausa sozinha, com o aviso no popup e no ícone, a conversa não conta como falha nem tentativa, e a volta da aba retoma e a exporta de novo, com outra captura', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const { fake, archive } = setUp({ chats: sidebarChats(['Ana', 'Bia', 'Caio']) });
+  const orch = createOrchestrator();
+  const deliver = deliveringExport(orch);
+  let biaRequests = 0;
+  fake.content.onExport = (message) => {
+    // Na 1ª vez, a aba fica oculta durante a abertura de Bia, e as esperas da página estouram
+    if (message.chat.title === 'Bia' && ++biaRequests === 1) {
+      changeTabVisibility(fake, orch, false);
+      return { success: false, cancelled: false, ...notFound('Bia') };
+    }
+    return deliver(message);
+  };
+
+  const loop = orch.start({ safeDelayMs: 0, retryCooldownMs: 0 });
+  const { runId } = orch.run;
+  await waitUntil(
+    () => disarmed(fake, `${runId}-1`) && orch.getState().state === WORKFLOW_STATES.PAUSED,
+    { description: 'pausa depois da tentativa de "Bia" com a aba oculta' }
+  );
+  await settle();
+
+  const paused = orch.getState();
+  assert.deepEqual([paused.state, paused.statusMessage], [WORKFLOW_STATES.PAUSED, TAB_HIDDEN_PAUSE_MESSAGE]);
+  assert.deepEqual(fake.content.exportRequests.map((m) => m.chat.title), ['Ana', 'Bia']);
+  // A falha de Bia não ficou: nem resultado, nem fila andando, nem aviso de falha no popup
+  assert.equal(orch.run.nextIndex, 1);
+  assert.equal(orch.run.results[1], undefined);
+  assert.deepEqual(paused.summary, { saved: 1, empty: 0, savedToDisk: 0, notExportable: 0, failed: 0 });
+  assert.deepEqual(fake.progressUpdates().map((m) => m.warningMessage).filter(Boolean), [TAB_HIDDEN_PAUSE_WARNING]);
+  assert.deepEqual({ ...fake.badge }, PAUSE_BADGE);
+  // A pausa fica no estado gravado, sem o resultado de Bia
+  const saved = fake.readStorage('extractionRun');
+  assert.deepEqual([saved.state, saved.statusMessage], [WORKFLOW_STATES.PAUSED, TAB_HIDDEN_PAUSE_MESSAGE]);
+  assert.deepEqual(saved.tabHiddenPauses.map(({ resumedAt, resumedBy }) => [resumedAt, resumedBy]), [[null, null]]);
+  assert.match(saved.tabHiddenPauses[0].pausedAt, ISO_DATE);
+  assert.equal(fake.readStorage('extractionRun:result:000001'), undefined);
+
+  // A aba volta: a execução retoma sozinha e exporta Bia de novo, com outra captura
+  assert.deepEqual(changeTabVisibility(fake, orch, true), { success: true, recorded: true });
+  await loop;
+
+  const state = orch.getState();
+  assert.equal(state.state, WORKFLOW_STATES.COMPLETED);
+  assert.deepEqual(state.summary, { saved: 3, empty: 0, savedToDisk: 0, notExportable: 0, failed: 0 });
+  assert.deepEqual(
+    fake.content.exportRequests.map((m) => [m.chat.title, m.captureId]),
+    [['Ana', `${runId}-0`], ['Bia', `${runId}-1`], ['Bia', `${runId}-1-h1`], ['Caio', `${runId}-2`]]
+  );
+  // Um bloco atrasado da tentativa descartada é recusado
+  const lateBlock = { action: ACTIONS.EXPORT_TRANSFER_START, captureId: `${runId}-1`, totalChunks: 1, size: 1 };
+  assert.equal(orch.captures.handleTransferMessage(lateBlock).success, false);
+  // Bia teve uma tentativa só, e não houve repescagem
+  assert.equal(orch.run.results[1].attempts, 1);
+  assert.deepEqual(withoutAttemptTimes(orch.run.results[1]).history, [attemptRecord({ status: 'saved', via: 'visible' })]);
+  assert.deepEqual(orch.run.retry.indices, []);
+  // Popup: o aviso da pausa e o da retomada; o ícone volta ao normal
+  const infos = fake.progressUpdates().map((m) => m.infoMessage).filter(Boolean);
+  assert.equal(infos.filter((m) => TAB_VISIBLE_AGAIN_INFO.test(m)).length, 1);
+  assert.deepEqual(fake.progressUpdates().map((m) => m.warningMessage).filter(Boolean), [TAB_HIDDEN_PAUSE_WARNING]);
+  assert.deepEqual(fake.badgeTextsShown(), ['||']);
+  assert.equal(fake.badge.text, '');
+  // A pausa encerrada pela volta da aba fica no estado
+  const [pause] = orch.run.tabHiddenPauses;
+  assert.equal(pause.resumedBy, 'tab_visible');
+  assert.ok(Date.parse(pause.resumedAt) >= Date.parse(pause.pausedAt));
+  assert.deepEqual(fake.readStorage('extractionRun').tabHiddenPauses, orch.run.tabHiddenPauses);
+
+  // Relatório: a pausa no fim do cabeçalho; log: a pausa e a retomada entre as tentativas, sem a tentativa descartada
+  const { report, executionLog } = archive.calls[0];
+  const lines = report.split('\n');
+  assert.equal(lines[6], 'Conversas na fila: 3 | no ZIP: 3 (vazias: 0) | na pasta Downloads: 0 | não exportáveis: 0 | falhas: 0');
+  assert.match(lines[7], tabHiddenPausesHeader(1));
+  assert.deepEqual(lines.slice(8), ['', '[OK] 1. "Ana" salvo (1.5 KB).', '[OK] 2. "Bia" salvo (1.5 KB).', '[OK] 3. "Caio" salvo (1.5 KB).', '']);
+  assert.deepEqual(logEventsOf(executionLog), [
+    'nº 1 "Ana" | tentativa 1 | <duração> | abertura: lista visível | OK',
+    TAB_HIDDEN_PAUSE_LOG,
+    TAB_VISIBLE_RESUME_LOG,
+    'nº 2 "Bia" | tentativa 1 | <duração> | abertura: lista visível | OK',
+    'nº 3 "Caio" | tentativa 1 | <duração> | abertura: lista visível | OK'
+  ]);
+});
+
+test('aba oculta durante uma conversa que dá certo: o arquivo salvo vale, e a execução pausa antes da conversa seguinte', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const { fake, archive } = setUp({ chats: sidebarChats(['Ana', 'Bia', 'Caio']) });
+  const orch = createOrchestrator();
+  const deliver = deliveringExport(orch);
+  fake.content.onExport = (message) => {
+    if (message.chat.title === 'Bia') changeTabVisibility(fake, orch, false);
+    return deliver(message);
+  };
+
+  const loop = orch.start({ safeDelayMs: 0 });
+  await waitUntil(() => orch.run?.nextIndex === 2, { description: 'fim da exportação de "Bia"' });
+  await settle();
+
+  assert.deepEqual([orch.getState().state, orch.getState().statusMessage], [WORKFLOW_STATES.PAUSED, TAB_HIDDEN_PAUSE_MESSAGE]);
+  assert.deepEqual(fake.content.exportRequests.map((m) => m.chat.title), ['Ana', 'Bia']);
+  assert.deepEqual(
+    withoutAttemptTimes(orch.run.results[1]),
+    {
+      title: 'Bia', status: 'saved', code: null, via: 'visible', staged: true, late: false, warnings: [], size: 1536, empty: false,
+      inspectionError: null, messageCount: 1, systemEventCount: 0, omittedMediaCount: 0, firstTimestamp: '01/01/2026, 09:00:00',
+      lastTimestamp: '01/01/2026, 09:00:00', message: '"Bia" salvo (1.5 KB).', attempts: 1, history: [attemptRecord({ status: 'saved', via: 'visible' })]
+    }
+  );
+
+  changeTabVisibility(fake, orch, true);
+  await loop;
+
+  assert.equal(orch.getState().state, WORKFLOW_STATES.COMPLETED);
+  assert.deepEqual(orch.getState().summary, { saved: 3, empty: 0, savedToDisk: 0, notExportable: 0, failed: 0 });
+  // Bia não é exportada de novo
+  assert.deepEqual(fake.content.exportRequests.map((m) => m.chat.title), ['Ana', 'Bia', 'Caio']);
+  assert.match(archive.calls[0].report.split('\n')[7], tabHiddenPausesHeader(1));
+});
+
+test('pausa pedida pelo usuário: a aba oculta e visível de novo não a retoma nem a troca pela pausa da aba oculta', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const { fake, archive } = setUp({ chats: sidebarChats(['Ana', 'Bia']) });
+  const orch = createOrchestrator();
+  const deliver = deliveringExport(orch);
+  fake.content.onExport = (message) => {
+    if (message.chat.title === 'Ana') orch.pause();
+    return deliver(message);
+  };
+  const userPause = 'Pausa solicitada: a extração para ao concluir a conversa atual.';
+
+  const loop = orch.start({ safeDelayMs: 0 });
+  await waitUntil(() => orch.run?.nextIndex === 1, { description: 'fim da exportação de "Ana"' });
+  await settle();
+  assert.deepEqual([orch.getState().state, orch.getState().statusMessage], [WORKFLOW_STATES.PAUSED, userPause]);
+
+  assert.deepEqual(changeTabVisibility(fake, orch, false), { success: true, recorded: true });
+  assert.deepEqual(changeTabVisibility(fake, orch, true), { success: true, recorded: true });
+  await settle();
+
+  // Continua a pausa do usuário, sem aviso nem indicação no ícone
+  assert.deepEqual([orch.getState().state, orch.getState().statusMessage], [WORKFLOW_STATES.PAUSED, userPause]);
+  assert.deepEqual(fake.content.exportRequests.map((m) => m.chat.title), ['Ana']);
+  assert.deepEqual(orch.run.tabHiddenPauses, []);
+  assert.deepEqual(fake.badgeTextsShown(), []);
+  assert.deepEqual(fake.progressUpdates().map((m) => m.warningMessage).filter(Boolean), []);
+
+  assert.equal(orch.resume(), true);
+  await loop;
+
+  assert.equal(orch.getState().state, WORKFLOW_STATES.COMPLETED);
+  assert.deepEqual(fake.content.exportRequests.map((m) => m.chat.title), ['Ana', 'Bia']);
+  const { report, executionLog } = archive.calls[0];
+  assert.equal(report.includes('Pausas por aba oculta'), false);
+  assert.equal(executionLog.includes('Pausa:'), false);
+});
+
+test('aba oculta durante a varredura: a lista lida é descartada, e a varredura recomeça quando a aba volta, para a fila não sair incompleta', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const chats = sidebarChats(['Ana', 'Bia', 'Caio']);
+  // Com a aba oculta, a rolagem anda devagar, e a 1ª varredura só chega à 1ª conversa
+  const { fake, archive } = setUp({ chats: chats.slice(0, 1) });
+  const orch = createOrchestrator();
+  fake.content.onExport = deliveringExport(orch);
+  let scans = 0;
+  fake.content.onScan = () => {
+    if (++scans > 1) return;
+    orch.recordScanProgress({ found: 1, tabId: WHATSAPP_TAB_ID });
+    changeTabVisibility(fake, orch, false);
+  };
+
+  const loop = orch.start({ safeDelayMs: 0 });
+  await waitUntil(() => scans === 1 && orch.getState().state === WORKFLOW_STATES.PAUSED, { description: 'pausa na 1ª varredura' });
+  await settle();
+
+  assert.deepEqual(fake.receivedActions(), [ACTIONS.CHECK_PAGE_READY, ACTIONS.SCAN_CHATS_REQUEST]);
+  assert.deepEqual(orch.run.queue, []);
+  assert.equal(fake.readStorage('extractionRun:queue'), undefined);
+  assert.deepEqual([orch.getState().statusMessage, orch.getState().scanFound], [TAB_HIDDEN_PAUSE_MESSAGE, 0]);
+
+  fake.content.chats = chats;
+  changeTabVisibility(fake, orch, true);
+  await loop;
+
+  assert.equal(orch.getState().state, WORKFLOW_STATES.COMPLETED);
+  assert.equal(scans, 2);
+  assert.deepEqual(orch.run.queue.map((chat) => chat.title), ['Ana', 'Bia', 'Caio']);
+  assert.deepEqual(fake.content.exportRequests.map((m) => m.chat.title), ['Ana', 'Bia', 'Caio']);
+  // A retomada confere a linha da aba antes de varrer de novo
+  assert.deepEqual(fake.receivedActions().slice(0, 4), [
+    ACTIONS.CHECK_PAGE_READY, ACTIONS.SCAN_CHATS_REQUEST, ACTIONS.CHECK_PAGE_READY, ACTIONS.SCAN_CHATS_REQUEST
+  ]);
+  assert.match(archive.calls[0].report.split('\n')[7], tabHiddenPausesHeader(1));
+});
+
+test('aba já oculta ao iniciar: a execução pausa antes da varredura, sem pedir nada à aba além da conferência, e começa quando ela fica visível', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const { fake } = setUp({ chats: sidebarChats(['Ana', 'Bia']) });
+  fake.content.visible = false;
+  const orch = createOrchestrator();
+  fake.content.onExport = deliveringExport(orch);
+
+  const loop = orch.start({ safeDelayMs: 0 });
+  await waitUntil(() => orch.getState().state === WORKFLOW_STATES.PAUSED, { description: 'pausa antes da varredura' });
+  await settle();
+
+  assert.deepEqual(fake.receivedActions(), [ACTIONS.CHECK_PAGE_READY]);
+  assert.equal(orch.getState().statusMessage, TAB_HIDDEN_PAUSE_MESSAGE);
+  assert.deepEqual(fake.progressUpdates().map((m) => m.warningMessage).filter(Boolean), [TAB_HIDDEN_PAUSE_WARNING]);
+  assert.deepEqual({ ...fake.badge }, PAUSE_BADGE);
+
+  changeTabVisibility(fake, orch, true);
+  await loop;
+
+  assert.equal(orch.getState().state, WORKFLOW_STATES.COMPLETED);
+  assert.deepEqual(fake.content.exportRequests.map((m) => m.chat.title), ['Ana', 'Bia']);
+  assert.equal(fake.badge.text, '');
+});
+
+test('aviso de visibilidade de outra aba, inválido ou fora de uma execução em andamento é ignorado', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const { fake } = setUp({ chats: sidebarChats(['Ana', 'Bia']) });
+  const orch = createOrchestrator();
+  const deliver = deliveringExport(orch);
+  assert.deepEqual(orch.recordTabVisibility({ visible: false, tabId: WHATSAPP_TAB_ID }), { success: true, recorded: false });
+
+  const duringRun = {};
+  fake.content.onExport = (message) => {
+    if (message.chat.title === 'Ana') {
+      // Outra aba do WhatsApp Web, que não é a da execução, ficou oculta
+      duringRun.otherTab = orch.recordTabVisibility({ visible: false, tabId: WHATSAPP_TAB_ID + 1 });
+      duringRun.invalid = orch.recordTabVisibility({ visible: 'hidden', tabId: WHATSAPP_TAB_ID });
+      duringRun.state = orch.getState().state;
+    }
+    return deliver(message);
+  };
+
+  await orch.start({ safeDelayMs: 0 });
+
+  assert.deepEqual(duringRun, {
+    otherTab: { success: true, recorded: false },
+    invalid: { success: false, error: 'Visibilidade da aba inválida: hidden.' },
+    state: WORKFLOW_STATES.EXPORTING
+  });
+  assert.equal(orch.getState().state, WORKFLOW_STATES.COMPLETED);
+  assert.deepEqual(fake.content.exportRequests.map((m) => m.chat.title), ['Ana', 'Bia']);
+  assert.deepEqual(orch.run.tabHiddenPauses, []);
+  assert.deepEqual(fake.badgeTextsShown(), []);
+  // Terminada a execução, volta a ser ignorado
+  assert.deepEqual(orch.recordTabVisibility({ visible: false, tabId: WHATSAPP_TAB_ID }), { success: true, recorded: false });
+  assert.equal(orch.getState().state, WORKFLOW_STATES.COMPLETED);
+});
+
+test('aba oculta numa tentativa da repescagem que falha: o cursor da rodada não anda, e a conversa é repescada de novo quando a aba volta, com outra captura', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const { fake, archive } = setUp({ chats: sidebarChats(['Ana', 'Bia', 'Caio']) });
+  const orch = createOrchestrator();
+  const deliver = deliveringExport(orch);
+  const menuTimeout = 'Timeout de 15s aguardando o menu de opções da conversa.';
+  let biaRequests = 0;
+  fake.content.onExport = (message) => {
+    if (message.chat.title !== 'Bia') return deliver(message);
+    biaRequests++;
+    // Na fila, não encontrada; na 1ª tentativa da repescagem, a aba fica oculta e a espera do menu estoura
+    if (biaRequests === 1) return { success: false, cancelled: false, ...notFound('Bia') };
+    if (biaRequests === 2) {
+      changeTabVisibility(fake, orch, false);
+      return { success: false, cancelled: false, error: menuTimeout, code: 'TIMEOUT' };
+    }
+    return deliver(message);
+  };
+
+  const loop = orch.start({ safeDelayMs: 0, retryCooldownMs: 0 });
+  const { runId } = orch.run;
+  await waitUntil(
+    () => disarmed(fake, `${runId}-1-r1`) && orch.getState().state === WORKFLOW_STATES.PAUSED,
+    { description: 'pausa depois da tentativa da repescagem com a aba oculta' }
+  );
+  await settle();
+
+  assert.equal(orch.run.retry.cursor, 0);
+  assert.deepEqual(orch.getState().retry, { current: 1, total: 1 });
+  assert.deepEqual([orch.run.results[1].code, orch.run.results[1].attempts], ['CHAT_NOT_FOUND', 1]);
+  assert.deepEqual(
+    fake.progressUpdates().map((m) => m.warningMessage).filter(Boolean),
+    [`[2/3] ⚠️ "Bia": ${notFound('Bia').error}`, TAB_HIDDEN_PAUSE_WARNING]
+  );
+
+  changeTabVisibility(fake, orch, true);
+  await loop;
+
+  assert.equal(orch.getState().state, WORKFLOW_STATES.COMPLETED);
+  assert.deepEqual(orch.getState().summary, { saved: 3, empty: 0, savedToDisk: 0, notExportable: 0, failed: 0 });
+  assert.deepEqual(
+    fake.content.exportRequests.filter((m) => m.chat.title === 'Bia').map((m) => m.captureId),
+    [`${runId}-1`, `${runId}-1-r1`, `${runId}-1-r1-h1`]
+  );
+  // A tentativa descartada não entra no histórico: são duas, a da fila e a da repescagem
+  assert.deepEqual(withoutAttemptTimes(orch.run.results[1]).history, [
+    attemptRecord({ attempt: 1, status: 'failed', code: 'CHAT_NOT_FOUND', reason: notFound('Bia').error }),
+    attemptRecord({ attempt: 2, status: 'saved', via: 'visible' })
+  ]);
+  assert.deepEqual([orch.run.results[1].attempts, orch.run.results[1].firstAttemptCode], [2, 'CHAT_NOT_FOUND']);
+  assert.deepEqual(orch.run.retry, { indices: [1], cursor: 1, startsAt: orch.run.retry.startsAt });
+  const lines = archive.calls[0].report.split('\n');
+  assert.equal(lines[7], retryHeader(1, 1));
+  assert.match(lines[8], tabHiddenPausesHeader(1));
+  assert.deepEqual(lines.slice(9, 12), ['', '[OK] 1. "Ana" salvo (1.5 KB).', '[OK] 2. "Bia" salvo (1.5 KB). Tentativas: 2.']);
+});
+
+test('aba oculta na espera do arquivo, que não chega: a tentativa é descartada, a captura dela é desarmada, e a repetição usa outra captura', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const { fake, archive } = setUp({ chats: sidebarChats(['Ana', 'Bia', 'Caio']) });
+  const orch = createOrchestrator({ timings: { captureTimeoutMs: 30, quarantineMs: 30 } });
+  const deliver = deliveringExport(orch);
+  let biaRequests = 0;
+  fake.content.onExport = (message) => {
+    if (message.chat.title !== 'Bia' || ++biaRequests > 1) return deliver(message);
+    // A página confirma a exportação e responde sem a aba oculta; na espera do arquivo, ela fica oculta, e o arquivo não chega
+    armCapture(orch, message.captureId);
+    setTimeout(() => changeTabVisibility(fake, orch, false), 5);
+    return triggeredResponse();
+  };
+
+  const loop = orch.start({ safeDelayMs: 0, retryCooldownMs: 0 });
+  const { runId } = orch.run;
+  await waitUntil(
+    () => disarmed(fake, `${runId}-1`) && orch.getState().state === WORKFLOW_STATES.PAUSED,
+    { description: 'pausa depois da espera do arquivo de "Bia"' }
+  );
+  await settle();
+
+  // O aviso da aba oculta durante a espera basta para descartar a tentativa
+  assert.equal(orch.run.nextIndex, 1);
+  assert.equal(orch.run.results[1], undefined);
+  const lateBlock = { action: ACTIONS.EXPORT_TRANSFER_START, captureId: `${runId}-1`, totalChunks: 1, size: 1 };
+  assert.equal(orch.captures.handleTransferMessage(lateBlock).success, false);
+
+  changeTabVisibility(fake, orch, true);
+  await loop;
+
+  assert.equal(orch.getState().state, WORKFLOW_STATES.COMPLETED);
+  assert.deepEqual(orch.getState().summary, { saved: 3, empty: 0, savedToDisk: 0, notExportable: 0, failed: 0 });
+  assert.deepEqual(
+    fake.content.exportRequests.filter((m) => m.chat.title === 'Bia').map((m) => m.captureId),
+    [`${runId}-1`, `${runId}-1-h1`]
+  );
+  assert.deepEqual(withoutAttemptTimes(orch.run.results[1]).history, [attemptRecord({ status: 'saved', via: 'visible' })]);
+  // Sem o FILE_NOT_DELIVERED da tentativa descartada, Caio não é marcado para conferir
+  assert.deepEqual(archive.calls[0].report.split('\n').slice(9), [
+    '[OK] 1. "Ana" salvo (1.5 KB).',
+    '[OK] 2. "Bia" salvo (1.5 KB).',
+    '[OK] 3. "Caio" salvo (1.5 KB).',
+    ''
+  ]);
+});
+
+test('reinício do service worker durante a pausa da aba oculta: a execução volta pausada e não retoma sozinha; o "Retomar" encerra a pausa, que entra no relatório e no log', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const chats = sidebarChats(['Ana', 'Bia', 'Caio']);
+  const { fake: fakeA, archive } = setUp({ chats });
+  const orchA = createOrchestrator();
+  const deliverA = deliveringExport(orchA);
+  fakeA.content.onExport = (message) => {
+    if (message.chat.title === 'Bia') changeTabVisibility(fakeA, orchA, false);
+    return deliverA(message);
+  };
+  const loopA = orchA.start({ safeDelayMs: 0 });
+  await waitUntil(
+    () => orchA.run?.nextIndex === 2 && orchA.getState().state === WORKFLOW_STATES.PAUSED,
+    { description: 'pausa depois de "Bia"' }
+  );
+  await settle();
+  // O storage como estaria se o Chrome encerrasse o service worker durante a pausa
+  const snapshot = fakeA.snapshotStorage();
+  await orchA.cancel();
+  await loopA;
+  assert.equal(snapshot.extractionRun.state, WORKFLOW_STATES.PAUSED);
+  assert.deepEqual(snapshot.extractionRun.tabHiddenPauses.map((pause) => pause.resumedAt), [null]);
+
+  const fakeB = createFakeChrome({ chats, storage: snapshot });
+  installFakeChrome(fakeB);
+  const orchB = createOrchestrator();
+  fakeB.content.onExport = deliveringExport(orchB);
+  await orchB.restore();
+  const restoredMessage = 'A extração estava pausada com a aba do WhatsApp Web oculta e foi interrompida pelo navegador. ' +
+    'Deixe a aba visível e clique em "Retomar" para continuar de onde parou.';
+  assert.deepEqual([orchB.getState().state, orchB.getState().statusMessage], [WORKFLOW_STATES.PAUSED, restoredMessage]);
+  // Sem laço rodando, a volta da aba não retoma a execução: o "Retomar" é do usuário, como em outra execução restaurada
+  assert.deepEqual(changeTabVisibility(fakeB, orchB, true), { success: true, recorded: false });
+  assert.deepEqual([orchB.getState().state, orchB.isBusy()], [WORKFLOW_STATES.PAUSED, false]);
+
+  assert.equal(orchB.resume(), true);
+  await orchB._loopPromise;
+
+  assert.equal(orchB.getState().state, WORKFLOW_STATES.COMPLETED);
+  assert.deepEqual(fakeB.content.exportRequests.map((m) => m.chat.title), ['Caio']);
+  assert.deepEqual(orchB.run.tabHiddenPauses.map(({ resumedBy }) => resumedBy), ['user']);
+  // O "Retomar" tira a indicação que a instância anterior deixou no ícone
+  assert.equal(fakeB.badge.text, '');
+  const { report, executionLog } = archive.calls[0];
+  assert.match(report.split('\n')[7], tabHiddenPausesHeader(1));
+  assert.deepEqual(logEventsOf(executionLog), [
+    'nº 1 "Ana" | tentativa 1 | <duração> | abertura: lista visível | OK',
+    'nº 2 "Bia" | tentativa 1 | <duração> | abertura: lista visível | OK',
+    TAB_HIDDEN_PAUSE_LOG,
+    USER_RESUME_LOG,
+    'nº 3 "Caio" | tentativa 1 | <duração> | abertura: lista visível | OK'
+  ]);
+});
+
+test('"Retomar" com a aba ainda oculta: a aba é consultada, e a execução pausa de novo, com outra pausa no relatório e no log', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const { fake, archive } = setUp({ chats: sidebarChats(['Ana', 'Bia']) });
+  const orch = createOrchestrator();
+  const deliver = deliveringExport(orch);
+  fake.content.onExport = (message) => {
+    if (message.chat.title === 'Ana') changeTabVisibility(fake, orch, false);
+    return deliver(message);
+  };
+
+  const loop = orch.start({ safeDelayMs: 0 });
+  await waitUntil(
+    () => orch.run?.nextIndex === 1 && orch.getState().state === WORKFLOW_STATES.PAUSED,
+    { description: 'pausa depois de "Ana"' }
+  );
+  await settle();
+  assert.equal(countAction(fake, ACTIONS.CHECK_PAGE_READY), 1);
+
+  assert.equal(orch.resume(), true);
+  await waitUntil(
+    () => orch.run.tabHiddenPauses.length === 2 && orch.getState().state === WORKFLOW_STATES.PAUSED,
+    { description: 'nova pausa com a aba ainda oculta' }
+  );
+  await settle();
+
+  // A retomada conferiu a linha e, com a aba ainda tida como oculta, perguntou a visibilidade dela antes de pausar de novo
+  assert.equal(countAction(fake, ACTIONS.CHECK_PAGE_READY), 3);
+  assert.deepEqual(fake.content.exportRequests.map((m) => m.chat.title), ['Ana']);
+  assert.deepEqual(orch.run.tabHiddenPauses.map(({ resumedBy }) => resumedBy), ['user', null]);
+  assert.equal(orch.getState().statusMessage, TAB_HIDDEN_PAUSE_MESSAGE);
+  assert.deepEqual(
+    fake.progressUpdates().map((m) => m.warningMessage).filter(Boolean),
+    [TAB_HIDDEN_PAUSE_WARNING, TAB_HIDDEN_PAUSE_WARNING]
+  );
+  assert.deepEqual(fake.badgeTextsShown(), ['||', '||']);
+  assert.equal(fake.badge.text, '||');
+
+  changeTabVisibility(fake, orch, true);
+  await loop;
+
+  assert.equal(orch.getState().state, WORKFLOW_STATES.COMPLETED);
+  assert.deepEqual(fake.content.exportRequests.map((m) => m.chat.title), ['Ana', 'Bia']);
+  assert.deepEqual(orch.run.tabHiddenPauses.map(({ resumedBy }) => resumedBy), ['user', 'tab_visible']);
+  const { report, executionLog } = archive.calls[0];
+  assert.match(report.split('\n')[7], tabHiddenPausesHeader(2));
+  assert.deepEqual(logEventsOf(executionLog), [
+    'nº 1 "Ana" | tentativa 1 | <duração> | abertura: lista visível | OK',
+    TAB_HIDDEN_PAUSE_LOG,
+    USER_RESUME_LOG,
+    TAB_HIDDEN_PAUSE_LOG,
+    TAB_VISIBLE_RESUME_LOG,
+    'nº 2 "Bia" | tentativa 1 | <duração> | abertura: lista visível | OK'
+  ]);
+});
+
+for (const { where, firstAttemptFailures } of [
+  { where: 'fila', firstAttemptFailures: {} },
+  { where: 'repescagem', firstAttemptFailures: { Bia: notFound('Bia') } }
+]) {
+  test(`aba oculta na última conversa da ${where}, que dá certo: a execução fica pausada sem montar o ZIP, e a volta da aba retoma, monta o ZIP e encerra a pausa`, { timeout: TEST_TIMEOUT_MS }, async () => {
+    const { fake, archive } = setUp({ chats: sidebarChats(['Ana', 'Bia']) });
+    const orch = createOrchestrator();
+    const deliver = deliveringExport(orch, { firstAttemptFailures });
+    const lastAttempt = where === 'fila' ? (message) => !isRetryAttempt(message) : isRetryAttempt;
+    fake.content.onExport = (message) => {
+      if (message.chat.title === 'Bia' && lastAttempt(message)) changeTabVisibility(fake, orch, false);
+      return deliver(message);
+    };
+
+    const loop = orch.start({ safeDelayMs: 0, retryCooldownMs: 0 });
+    await waitUntil(
+      () => orch.run?.results[1]?.status === 'saved' && orch.getState().state === WORKFLOW_STATES.PAUSED,
+      { description: `"Bia" salva na ${where}, com a aba oculta` }
+    );
+    await settle();
+
+    assert.deepEqual([orch.getState().state, orch.getState().statusMessage], [WORKFLOW_STATES.PAUSED, TAB_HIDDEN_PAUSE_MESSAGE]);
+    assert.equal(archive.calls.length, 0);
+    assert.equal(orch.isBusy(), true);
+
+    changeTabVisibility(fake, orch, true);
+    await loop;
+
+    assert.equal(orch.getState().state, WORKFLOW_STATES.COMPLETED);
+    assert.equal(archive.calls.length, 1);
+    assert.deepEqual(orch.run.tabHiddenPauses.map(({ resumedBy }) => resumedBy), ['tab_visible']);
+    assert.equal(fake.badge.text, '');
+    // O ZIP não usa a aba: a retomada antes dele não confere a linha
+    assert.equal(countAction(fake, ACTIONS.CHECK_PAGE_READY), 1);
+    const events = logEventsOf(archive.calls[0].executionLog);
+    assert.deepEqual(events.slice(-2), [TAB_HIDDEN_PAUSE_LOG, TAB_VISIBLE_RESUME_LOG]);
+    assert.match(archive.calls[0].report.split('\n')[where === 'fila' ? 7 : 8], tabHiddenPausesHeader(1));
+  });
+}
+
+test('pausa do usuário na última conversa da fila: a execução fica pausada sem montar o ZIP, e o "Retomar" o monta', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const { fake, archive } = setUp({ chats: sidebarChats(['Ana', 'Bia']) });
+  const orch = createOrchestrator();
+  const deliver = deliveringExport(orch);
+  fake.content.onExport = (message) => {
+    if (message.chat.title === 'Bia') orch.pause();
+    return deliver(message);
+  };
+
+  const loop = orch.start({ safeDelayMs: 0 });
+  await waitUntil(() => orch.run?.nextIndex === 2, { description: 'fim da exportação de "Bia"' });
+  await settle();
+
+  assert.equal(orch.getState().state, WORKFLOW_STATES.PAUSED);
+  assert.equal(archive.calls.length, 0);
+
+  assert.equal(orch.resume(), true);
+  await loop;
+
+  assert.equal(orch.getState().state, WORKFLOW_STATES.COMPLETED);
+  assert.equal(archive.calls.length, 1);
+  assert.match(orch.getState().statusMessage, /^Backup salvo: /);
+});
+
+test('a indicação no ícone sai quando a execução é cancelada durante a pausa da aba oculta', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const { fake, archive } = setUp({ chats: sidebarChats(['Ana', 'Bia']) });
+  const orch = createOrchestrator();
+  const deliver = deliveringExport(orch);
+  fake.content.onExport = (message) => {
+    if (message.chat.title === 'Ana') changeTabVisibility(fake, orch, false);
+    return deliver(message);
+  };
+
+  const loop = orch.start({ safeDelayMs: 0 });
+  await waitUntil(() => orch.run?.nextIndex === 1 && orch.getState().state === WORKFLOW_STATES.PAUSED, { description: 'pausa depois de "Ana"' });
+  await settle();
+  assert.deepEqual({ ...fake.badge }, PAUSE_BADGE);
+
+  await orch.cancel();
+  await loop;
+
+  assert.equal(orch.getState().state, WORKFLOW_STATES.CANCELLED);
+  assert.equal(fake.badge.text, '');
+  assert.equal(archive.calls.length, 0);
+});
+
+test('a indicação no ícone sai quando a execução falha durante a pausa da aba oculta', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const { fake, archive } = setUp({ chats: sidebarChats(['Ana', 'Bia']) });
+  const orch = createOrchestrator();
+  fake.content.onExport = deliveringExport(orch);
+  // A aba fica oculta durante a varredura, e a página deixa de responder
+  fake.content.onScan = () => {
+    changeTabVisibility(fake, orch, false);
+    throw new Error('A aba do WhatsApp Web foi fechada.');
+  };
+
+  const silencedError = console.error;
+  console.error = () => {};
+  try {
+    await orch.start({ safeDelayMs: 0 });
+  } finally {
+    console.error = silencedError;
+  }
+
+  assert.deepEqual([orch.getState().state, orch.getState().errorMessage], [WORKFLOW_STATES.FAILED, 'A aba do WhatsApp Web foi fechada.']);
+  assert.deepEqual(fake.badgeTextsShown(), ['||']);
+  assert.equal(fake.badge.text, '');
+  assert.equal(archive.calls.length, 0);
 });
