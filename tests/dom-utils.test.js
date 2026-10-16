@@ -10,7 +10,8 @@ const context = vm.createContext({ window: {} });
 vm.runInContext(readFileSync(new URL('../content/dom/dom-utils.js', import.meta.url), 'utf8'), context);
 const {
   isTitleMatch, normalizeTitle, buildChatNotFoundMessage, estimateScrollStart, waitFor, extractPhoneDigits, chooseDrawerPhone,
-  ERROR_CODES, LOCATE_FAILURES, TIMEOUTS, DomAutomationError, OperationTimeoutError
+  classifyHistoryNotice, ERROR_CODES, LOCATE_FAILURES, TIMEOUTS, HISTORY_NOTICE_KINDS, HISTORY_LOAD_REASONS, DomAutomationError,
+  OperationTimeoutError
 } = context.window.DomUtils;
 // Os erros são criados no contexto do vm, com o Error de lá
 const ContextError = vm.runInContext('Error', context);
@@ -311,4 +312,69 @@ test('chooseDrawerPhone: sem telefone no subtítulo e sem o cartão da conta com
     choose({ phoneTexts: ['Loja 2'], businessCardPresent: true }),
     { phone: null, reason: 'nenhum número no painel da conta comercial' }
   );
+});
+
+// Aviso de mensagens mais antigas no topo do painel de mensagens (textos fixos do WhatsApp Web, como nos snapshots)
+
+const LOAD_NOTICE = 'Clique neste aviso para carregar mensagens mais antigas do seu celular.';
+const PHONE_ONLY_NOTICE = 'Use o WhatsApp no seu celular para ver mensagens enviadas e recebidas antes de 6/26/2026.';
+
+// O resultado vem do contexto do vm: comparado pelos campos, sem o protótipo de lá
+function plain(value) {
+  return value === null ? null : { ...value };
+}
+
+test('classifyHistoryNotice: o aviso que carrega as mensagens mais antigas do celular', () => {
+  assert.deepEqual(plain(classifyHistoryNotice(LOAD_NOTICE)), { kind: 'load' });
+  assert.equal(HISTORY_NOTICE_KINDS.LOAD, 'load');
+  // Espaços a mais, quebra de linha, maiúsculas e marcas invisíveis de direção do texto não mudam o reconhecimento
+  assert.deepEqual(plain(classifyHistoryNotice('  \u200EClique neste aviso para\n CARREGAR mensagens mais antigas do seu celular. ')), { kind: 'load' });
+});
+
+test('classifyHistoryNotice: o aviso de que as anteriores só estão no celular, com a data como o WhatsApp Web a escreve', () => {
+  assert.deepEqual(plain(classifyHistoryNotice(PHONE_ONLY_NOTICE)), { kind: 'phone-only', before: '6/26/2026' });
+  assert.equal(HISTORY_NOTICE_KINDS.PHONE_ONLY, 'phone-only');
+  assert.deepEqual(
+    plain(classifyHistoryNotice('Use o WhatsApp no seu celular para ver mensagens enviadas e recebidas antes de 12/1/25.')),
+    { kind: 'phone-only', before: '12/1/25' }
+  );
+  // A data cercada pelas marcas invisíveis de isolamento do texto é lida sem elas
+  assert.deepEqual(
+    plain(classifyHistoryNotice('Use o WhatsApp no seu celular para ver mensagens enviadas e recebidas antes de \u20686/26/2026\u2069.')),
+    { kind: 'phone-only', before: '6/26/2026' }
+  );
+  // Sem a data no texto, o aviso é reconhecido e a data fica null
+  assert.deepEqual(
+    plain(classifyHistoryNotice('Use o WhatsApp no seu celular para ver mensagens mais antigas.')),
+    { kind: 'phone-only', before: null }
+  );
+});
+
+test('classifyHistoryNotice: outros textos não são aviso, nem o de carregamento em andamento', () => {
+  for (const text of [
+    '',
+    '   ',
+    null,
+    undefined,
+    42,
+    'Carregando mensagens mais antigas do seu celular…',
+    'Mensagens mais antigas',
+    'HOJE',
+    'As mensagens e as ligações são protegidas com a criptografia de ponta a ponta.'
+  ]) {
+    assert.equal(classifyHistoryNotice(text), null, String(text));
+  }
+});
+
+test('carga das mensagens mais antigas: motivos que vão ao background e esperas padrão', () => {
+  assert.deepEqual({ ...HISTORY_LOAD_REASONS }, {
+    NO_NOTICE: 'no-notice',
+    PHONE_ONLY: 'phone-only',
+    TIME_LIMIT: 'time-limit',
+    STALLED: 'stalled'
+  });
+  assert.equal(TIMEOUTS.HISTORY_CLICK_WAIT_MS, 10000);
+  assert.equal(TIMEOUTS.HISTORY_SCROLL_WAIT_MS, 1500);
+  assert.equal(TIMEOUTS.HISTORY_SETTLE_MS, 3000);
+  assert.equal(TIMEOUTS.HISTORY_POLL_MS, 200);
 });

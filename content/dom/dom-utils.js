@@ -1,7 +1,8 @@
 /**
  * DomUtils
  * Responsabilidade Única: Utilitários compartilhados pelas classes de automação DOM
- * (seletores, códigos de erro, esperas com timeout/cancelamento, clique simulado e leitura de títulos e telefones).
+ * (seletores, códigos de erro, esperas com timeout/cancelamento, clique simulado e leitura de títulos, telefones e do aviso
+ * de mensagens mais antigas).
  *
  * Content scripts clássicos não importam módulos ES, por isso o compartilhamento é via window.
  * Deve ser o primeiro arquivo da lista de content scripts no manifest.
@@ -38,6 +39,16 @@
     BTN_MORE_OPTIONS: '#main header button[aria-label="Mais opções"], #main header [role="button"][aria-label="Mais opções"]',
     // O clique nele abre o painel "Dados do contato" (ou "Dados do grupo")
     CONVERSATION_INFO_HEADER: '#main header [data-testid="conversation-info-header"]',
+
+    // Painel de mensagens da conversa aberta. Nos snapshots, o topo dele, antes da lista de mensagens, tem o aviso de
+    // mensagens mais antigas: um <button> com "Clique neste aviso para carregar mensagens mais antigas do seu celular."
+    // (initial_page, chat_options_selected e contact_info_drawer) ou, sem botão, "Use o WhatsApp no seu celular para ver
+    // mensagens enviadas e recebidas antes de <data>." (chatopen_options e chat_export_modal). Nenhum dos dois tem
+    // data-testid próprio: são achados pelo texto (classifyHistoryNotice)
+    CONVERSATION_MESSAGES_PANEL: '#main [data-testid="conversation-panel-messages"]',
+    // Uma mensagem do painel ("conv-msg-<id da mensagem>")
+    CONVERSATION_MESSAGE: '[data-testid^="conv-msg-"]',
+    HISTORY_NOTICE_BUTTON: 'button, [role="button"]',
 
     // Menu suspenso ("Mais opções")
     MENU_CONTAINER: 'div[role="menu"]',
@@ -102,7 +113,15 @@
     CONTACT_INFO_OPEN_MS: 5000,
     CONTACT_INFO_CLOSE_MS: 3000,
     // O painel aparece antes do conteúdo: o cartão de uma conta comercial pode chegar depois do resto
-    CONTACT_INFO_CONTENT_MS: 1500
+    CONTACT_INFO_CONTENT_MS: 1500,
+    // Cada clique no aviso de mensagens mais antigas pede as mensagens ao celular, que precisa estar online
+    HISTORY_CLICK_WAIT_MS: 10000,
+    // Depois de levar o painel de mensagens ao topo: as mensagens que o navegador já tem aparecem logo
+    HISTORY_SCROLL_WAIT_MS: 1500,
+    // Teto da espera pelo painel de mensagens da conversa recém-aberta, antes de procurar o aviso
+    HISTORY_SETTLE_MS: 3000,
+    // Intervalo entre duas leituras do painel de mensagens durante a carga
+    HISTORY_POLL_MS: 200
   });
 
   /** Tipo da conversa, como vai ao background (`chatKind` do menu e `kind` do painel "Dados do contato") */
@@ -122,6 +141,25 @@
     NO_SUBTITLE_NOR_BUSINESS_CARD: 'painel sem telefone no subtítulo e sem o cartão de conta comercial',
     BUSINESS_CARD_WITHOUT_PHONE: 'nenhum número no painel da conta comercial'
   });
+
+  /** Aviso do topo do painel de mensagens (classifyHistoryNotice) */
+  const HISTORY_NOTICE_KINDS = Object.freeze({ LOAD: 'load', PHONE_ONLY: 'phone-only' });
+
+  // Como terminou a carga das mensagens mais antigas (HistoryLoader.load): sem o aviso no topo (não estava lá ou sumiu
+  // depois de mensagens novas), com o aviso de que as anteriores só estão no celular, no limite de tempo ou sem resposta do
+  // celular. Vão ao background, que marca no relatório as conversas que pararam nos dois últimos
+  const HISTORY_LOAD_REASONS = Object.freeze({
+    NO_NOTICE: 'no-notice',
+    PHONE_ONLY: 'phone-only',
+    TIME_LIMIT: 'time-limit',
+    STALLED: 'stalled'
+  });
+
+  // Textos dos avisos do topo do painel de mensagens. A data do "só no celular" vem como o WhatsApp Web a escreve, com o
+  // mês primeiro (ex: "6/26/2026"), como no texto exportado
+  const HISTORY_LOAD_NOTICE_PATTERN = /carregar mensagens mais antigas/i;
+  const HISTORY_PHONE_ONLY_NOTICE_PATTERN = /use o whatsapp no seu celular para ver mensagens/i;
+  const HISTORY_PHONE_ONLY_DATE_PATTERN = /antes de (\d{1,2}\/\d{1,2}\/\d{2,4})/i;
 
   // Espelho de phoneFromTitle (shared/utils/phone.js), que o content script não importa por ser módulo ES: as marcas
   // invisíveis de direção do texto, a forma de um número formatado e os limites de 10 a 15 dígitos
@@ -229,6 +267,24 @@
     return phone
       ? { phone, source: DRAWER_PHONE_SOURCES.BUSINESS_CARD }
       : { phone: null, reason: DRAWER_PHONE_REASONS.BUSINESS_CARD_WITHOUT_PHONE };
+  }
+
+  /**
+   * Reconhece o aviso de mensagens mais antigas pelo texto de um elemento do topo do painel de mensagens, sem as marcas
+   * invisíveis de direção do texto (inclusive as de isolamento, que podem cercar a data) e com a normalização dos títulos
+   * (normalizeTitle). Não toca no DOM, para ser testada no Node.
+   * @param {string|null|undefined} text
+   * @returns {{ kind: 'load' }|{ kind: 'phone-only', before: string|null }|null} `load`: o aviso que, a cada clique, pede
+   *   ao celular as mensagens anteriores às do painel; `phone-only`: o WhatsApp Web não carrega as anteriores a `before`
+   *   (a data como o aviso a escreve; null quando ele não traz uma); null: nenhum dos dois
+   */
+  function classifyHistoryNotice(text) {
+    if (typeof text !== 'string') return null;
+    const clean = normalizeTitle(text.replace(PHONE_DIRECTION_MARKS_PATTERN, ''));
+    if (HISTORY_PHONE_ONLY_NOTICE_PATTERN.test(clean)) {
+      return { kind: HISTORY_NOTICE_KINDS.PHONE_ONLY, before: HISTORY_PHONE_ONLY_DATE_PATTERN.exec(clean)?.[1] ?? null };
+    }
+    return HISTORY_LOAD_NOTICE_PATTERN.test(clean) ? { kind: HISTORY_NOTICE_KINDS.LOAD } : null;
   }
 
   /**
@@ -458,12 +514,15 @@
     LOCATE_FAILURES,
     CHAT_KINDS,
     DRAWER_PHONE_SOURCES,
+    HISTORY_NOTICE_KINDS,
+    HISTORY_LOAD_REASONS,
     OperationCancelledError,
     OperationTimeoutError,
     DomAutomationError,
     formatSeconds,
     extractPhoneDigits,
     chooseDrawerPhone,
+    classifyHistoryNotice,
     buildChatNotFoundMessage,
     estimateScrollStart,
     throwIfAborted,

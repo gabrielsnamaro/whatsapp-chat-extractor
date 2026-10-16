@@ -28,6 +28,11 @@ const QUARANTINE_MS = 60 * 1000;
 const RETRY_COOLDOWN_MS = 60 * 1000;
 // Chamadas a APIs da extensão reiniciam o contador de inatividade do service worker
 const KEEP_ALIVE_INTERVAL_MS = 20000;
+// Limite padrão, por conversa, da carga das mensagens mais antigas do celular antes da exportação; 0 desliga a carga
+const DEFAULT_HISTORY_LIMIT_MS = 60 * 1000;
+// A carga roda no EXPORT_CHAT_REQUEST, junto com a abertura (até ~1 min com a rolagem), o painel "Dados do contato", o
+// menu e o modal, e o Chrome encerra o service worker quando uma chamada à aba passa de 5 min
+const MAX_HISTORY_LIMIT_MS = 3 * 60 * 1000;
 
 const ACTIVE_STATES = [
   WORKFLOW_STATES.SCANNING,
@@ -171,6 +176,22 @@ const CONTACT_PHONE_SOURCES = Object.freeze({ TITLE: 'title', CONTACT_INFO: 'con
 
 // Motivo do aviso quando o painel de uma conversa individual foi lido e não mostrou o número
 const CONTACT_PHONE_NOT_FOUND = 'número não encontrado no painel';
+
+// Como terminou a carga das mensagens mais antigas, pelo `reason` que o content devolve (DomUtils.HISTORY_LOAD_REASONS em
+// content/dom/dom-utils.js; content script clássico não é importável aqui): sem o aviso no topo da conversa (não estava
+// lá ou sumiu depois de mensagens novas), com o aviso de que as anteriores só estão no celular, no limite de tempo ou sem
+// resposta do celular. Nos dois últimos, o aviso ainda estava no topo, e o histórico exportado pode estar incompleto
+const HISTORY_LOAD_REASONS = Object.freeze({
+  NO_NOTICE: 'no-notice',
+  PHONE_ONLY: 'phone-only',
+  TIME_LIMIT: 'time-limit',
+  STALLED: 'stalled'
+});
+const INCOMPLETE_HISTORY_REASONS = new Set([HISTORY_LOAD_REASONS.TIME_LIMIT, HISTORY_LOAD_REASONS.STALLED]);
+
+// Data do aviso "Use o WhatsApp no seu celular para ver mensagens enviadas e recebidas antes de <data>", como o content a
+// devolve (com o mês primeiro, ex: "6/26/2026"); outro texto não vai ao log
+const HISTORY_NOTICE_DATE_PATTERN = /^\d{1,2}\/\d{1,2}\/\d{2,4}$/;
 
 class RunCancelledError extends Error {
   constructor() {
@@ -439,6 +460,120 @@ function contactPhoneOf(value) {
 }
 
 /**
+ * @typedef {Object} HistoryLoadRecord Carga das mensagens mais antigas numa tentativa, como a aba a devolveu
+ * @property {number|null} ms Tempo da carga inteira
+ * @property {number} clicks Cliques no aviso, cada um um pedido ao celular das mensagens anteriores às do painel, atendido
+ *   ou não
+ * @property {string|null} reason Como a carga terminou (HISTORY_LOAD_REASONS); null na falha e num motivo desconhecido
+ * @property {boolean|null} complete false quando a carga parou com o aviso ainda no topo (INCOMPLETE_HISTORY_REASONS); null
+ *   na falha e num motivo desconhecido
+ * @property {string} [before] Com o reason 'phone-only': as mensagens anteriores a esta data só estão no celular
+ * @property {string} [error] Por que a carga falhou (ex: o painel de mensagens não foi encontrado)
+ */
+
+/**
+ * Carga das mensagens mais antigas que veio na resposta da aba, só com os campos conhecidos
+ * @param {Object|null|undefined} response Resposta ao EXPORT_CHAT_REQUEST, de sucesso ou de falha
+ * @returns {HistoryLoadRecord|null} null quando a aba não fez a carga (limite 0, ou a falha veio antes dela)
+ */
+function historyLoadOf(response) {
+  const load = response?.historyLoad;
+  if (load && typeof load === 'object') {
+    const reason = Object.values(HISTORY_LOAD_REASONS).includes(load.reason) ? load.reason : null;
+    const before = reason === HISTORY_LOAD_REASONS.PHONE_ONLY ? textOf(load.before) : null;
+    return {
+      ms: durationOf(load.ms),
+      clicks: Number.isSafeInteger(load.clicks) && load.clicks > 0 ? load.clicks : 0,
+      reason,
+      complete: reason ? !INCOMPLETE_HISTORY_REASONS.has(reason) : null,
+      ...(before && HISTORY_NOTICE_DATE_PATTERN.test(before) ? { before } : {})
+    };
+  }
+  const failure = response?.historyLoadError;
+  if (failure && typeof failure === 'object') {
+    return {
+      ms: durationOf(failure.ms),
+      clicks: 0,
+      reason: null,
+      complete: null,
+      error: textOf(failure.message) ?? 'falha sem mensagem na aba'
+    };
+  }
+  return null;
+}
+
+/**
+ * Carga das mensagens mais antigas da tentativa final da conversa: a que deu o arquivo, quando ela recebeu um
+ * @param {Object|undefined} result
+ * @returns {HistoryLoadRecord|null} null sem carga e numa execução gravada por uma versão anterior da extensão
+ */
+function finalHistoryLoadOf(result) {
+  return result ? (historyOf(result).at(-1)?.historyLoad ?? null) : null;
+}
+
+/**
+ * A conversa recebeu o arquivo com a carga das mensagens mais antigas interrompida, com o aviso ainda no topo
+ * @param {Object|undefined} result
+ * @returns {boolean}
+ */
+function hasIncompleteHistory(result) {
+  return gotFile(result) && finalHistoryLoadOf(result)?.complete === false;
+}
+
+/**
+ * Por que o histórico da conversa pode estar incompleto, para a nota do relatório
+ * @param {HistoryLoadRecord} historyLoad Com o reason num dos INCOMPLETE_HISTORY_REASONS
+ * @param {number|undefined} limitMs O limite da execução
+ * @returns {string}
+ */
+function describeIncompleteHistory({ reason, clicks }, limitMs) {
+  const requests = `${clicks} pedido(s) ao celular`;
+  if (reason === HISTORY_LOAD_REASONS.STALLED) {
+    return `o celular deixou de responder aos pedidos das mensagens mais antigas, depois de ${requests}`;
+  }
+  const limit = Number.isFinite(limitMs) ? ` de ${formatSeconds(limitMs)}` : '';
+  return `o carregamento das mensagens mais antigas parou no limite${limit}, depois de ${requests}`;
+}
+
+/**
+ * Trecho da linha de uma tentativa no log da execução com a carga das mensagens mais antigas: quantos pedidos ao celular
+ * (cliques no aviso), o tempo e como terminou ou, na falha, o tempo e o motivo
+ * @param {HistoryLoadRecord} historyLoad Do histórico da tentativa
+ * @returns {string}
+ */
+function describeHistoryLoadAttempt({ ms, clicks, reason, before, error }) {
+  const duration = ms == null ? null : formatSeconds(ms);
+  if (error) return `mensagens antigas: ${duration ? `falhou em ${duration}` : 'falhou'} (${error})`;
+  const requests = `${clicks} pedido(s) ao celular${duration ? ` em ${duration}` : ''}`;
+  switch (reason) {
+    case HISTORY_LOAD_REASONS.NO_NOTICE:
+      return clicks ? `mensagens antigas: ${requests}, até o aviso sumir` : 'mensagens antigas: sem o aviso no topo da conversa';
+    case HISTORY_LOAD_REASONS.PHONE_ONLY: {
+      const phoneOnly = `as anteriores a ${before ?? 'uma data não lida'} só estão no celular`;
+      return `mensagens antigas: ${clicks ? `${requests}; ${phoneOnly}` : phoneOnly}`;
+    }
+    case HISTORY_LOAD_REASONS.TIME_LIMIT:
+      return `mensagens antigas: interrompida no limite de tempo, com ${requests}`;
+    case HISTORY_LOAD_REASONS.STALLED:
+      return `mensagens antigas: o celular deixou de responder, com ${requests}`;
+    default:
+      return `mensagens antigas: ${requests}, fim por um motivo desconhecido`;
+  }
+}
+
+/**
+ * Limite da carga das mensagens mais antigas no cabeçalho do log
+ * @param {number|undefined} historyLimitMs
+ * @returns {string} Vazio numa execução gravada por uma versão anterior da extensão, sem o limite
+ */
+function describeHistoryLimit(historyLimitMs) {
+  if (!Number.isFinite(historyLimitMs)) return '';
+  return historyLimitMs > 0
+    ? ` | mensagens antigas do celular: até ${formatSeconds(historyLimitMs)} por conversa`
+    : ' | mensagens antigas do celular: não carregadas (limite 0)';
+}
+
+/**
  * @typedef {Object} ContactInfoRead Leitura do painel "Dados do contato" numa tentativa, como a aba a devolveu
  * @property {'chat'|'group'|null} kind Pelo título do painel
  * @property {string|null} phone Só os dígitos
@@ -600,6 +735,8 @@ function describeContactInfoAttempt({ ms, error, warning }) {
  * @property {boolean} late O arquivo chegou na quarentena
  * @property {Object} [openDiagnostics] Diagnóstico da busca e da rolagem da abertura (compactOpenDiagnostics),
  *   só quando a aba o mandou: ausente nas aberturas pela lista visível e nas tentativas de uma versão anterior
+ * @property {HistoryLoadRecord} [historyLoad] Carga das mensagens mais antigas (historyLoadOf), só quando a aba a fez
+ *   nesta tentativa
  * @property {{ ms: number|null, error: string|null, warning?: string }} [contactInfo] Leitura do painel "Dados do
  *   contato" (contactInfoAttemptOf), só quando a aba o leu nesta tentativa
  */
@@ -1276,16 +1413,34 @@ export class ExtractionOrchestrator {
    * @param {number} [options.safeDelayMs=2000] Intervalo base entre conversas, em ms (recebe variação aleatória de
    *   até +50%). Aceita qualquer número finito ≥ 0: o mínimo de 1 s para o usuário é aplicado no popup, e os testes usam 0
    * @param {number} [options.retryCooldownMs=60000] Espera entre o fim da fila e a repescagem
+   * @param {number} [options.historyLimitMs=60000] Limite, por conversa, da carga das mensagens mais antigas do celular
+   *   antes de exportar, de 0 a MAX_HISTORY_LIMIT_MS; 0 desliga a carga
    * @param {string|null} [options.linePhone=null] Número da linha informado no popup, que só o manda quando não
    *   detectou a linha na aba. Aceita o número formatado; vale só se a aba também não detectar a linha no início
    * @returns {Promise<void>}
    */
-  async start({ maxChats = null, downloadAll = true, safeDelayMs = 2000, retryCooldownMs = RETRY_COOLDOWN_MS, linePhone = null } = {}) {
+  async start({
+    maxChats = null,
+    downloadAll = true,
+    safeDelayMs = 2000,
+    retryCooldownMs = RETRY_COOLDOWN_MS,
+    historyLimitMs = DEFAULT_HISTORY_LIMIT_MS,
+    linePhone = null
+  } = {}) {
     if (this.isBusy()) {
       throw new Error('Já existe uma extração em andamento.');
     }
     if (typeof safeDelayMs !== 'number' || !Number.isFinite(safeDelayMs) || safeDelayMs < 0) {
       throw new Error(`Intervalo entre conversas inválido: ${String(safeDelayMs)} (esperado um número de milissegundos ≥ 0).`);
+    }
+    if (
+      typeof historyLimitMs !== 'number' || !Number.isFinite(historyLimitMs) || historyLimitMs < 0 ||
+      historyLimitMs > MAX_HISTORY_LIMIT_MS
+    ) {
+      throw new Error(
+        `Limite para carregar as mensagens antigas inválido: ${String(historyLimitMs)} ` +
+          `(esperado um número de milissegundos de 0 a ${MAX_HISTORY_LIMIT_MS}).`
+      );
     }
     const typedLinePhone = typedLinePhoneOf(linePhone);
 
@@ -1306,7 +1461,7 @@ export class ExtractionOrchestrator {
       runId: Date.now().toString(36),
       tabId: null,
       line: null,
-      options: { maxChats, downloadAll, safeDelayMs, retryCooldownMs },
+      options: { maxChats, downloadAll, safeDelayMs, retryCooldownMs, historyLimitMs },
       queue: [],
       nextIndex: 0,
       results: [],
@@ -1784,7 +1939,8 @@ export class ExtractionOrchestrator {
    * com o motivo em `inspectionError`). `contact` traz o tipo da conversa e o telefone do contato, em qualquer
    * status, quando se sabe algum deles (pelo título, pelo menu ou pelo painel "Dados do contato"). `history` traz
    * só esta tentativa, com o início, a duração, se ela passou pela quarentena e, quando a aba os mandou, o
-   * diagnóstico da busca e da rolagem da abertura e a leitura do painel; a repescagem a junta à da fila.
+   * diagnóstico da busca e da rolagem da abertura, a carga das mensagens mais antigas e a leitura do painel; a
+   * repescagem a junta à da fila.
    * Uma tentativa que falhou com a aba oculta em algum momento dela (pela resposta da aba ou por um aviso de aba oculta
    * durante a tentativa, inclusive na espera do arquivo) é descartada: não vira falha nem tentativa, e a conversa é
    * exportada de novo quando a aba voltar, com outra captura. Uma tentativa que recebeu o arquivo vale mesmo assim.
@@ -1821,6 +1977,7 @@ export class ExtractionOrchestrator {
     let late = false;
     let quarantined = false;
     let openDiagnostics = null;
+    let historyLoad = null;
     let contact = buildContact({ titlePhone, chatKind: null, infoRead: null });
     let contactInfoAttempt = null;
     const withHistory = (result, reason = null) => ({
@@ -1837,6 +1994,7 @@ export class ExtractionOrchestrator {
         quarantined,
         late: result.late,
         ...(openDiagnostics ? { openDiagnostics } : {}),
+        ...(historyLoad ? { historyLoad } : {}),
         ...(contactInfoAttempt ? { contactInfo: contactInfoAttempt } : {})
       }]
     });
@@ -1862,10 +2020,13 @@ export class ExtractionOrchestrator {
         chat,
         captureId,
         queueIndex: index,
-        readContactInfo: !titlePhone
+        readContactInfo: !titlePhone,
+        // Uma execução gravada por uma versão anterior da extensão não tem o limite, e continua sem a carga
+        historyLimitMs: this.run.options.historyLimitMs ?? 0
       }, signal);
       // Vem também na falha: uma conversa não encontrada diz no log como foram a busca e a rolagem
       openDiagnostics = compactOpenDiagnostics(trigger?.openDiagnostics);
+      historyLoad = historyLoadOf(trigger);
       // Também na falha: a conversa não exportável traz o tipo, e o painel é lido antes do menu de opções
       const infoRead = contactInfoReadOf(trigger);
       contact = buildContact({ titlePhone, chatKind: trigger?.chatKind, infoRead });
@@ -2008,6 +2169,7 @@ export class ExtractionOrchestrator {
     // uma versão anterior da extensão não tem `warnings` nos resultados
     const hasUnconfirmedRange = (result) => gotFile(result) && Boolean(result.warnings?.includes(DATE_RANGE_UNCONFIRMED_WARNING));
     const unconfirmedRange = results.filter(hasUnconfirmedRange).length;
+    const incompleteHistories = results.filter(hasIncompleteHistory).length;
     const missingContactPhones = results.filter(missingContactPhoneReason).length;
 
     const lines = [
@@ -2029,6 +2191,12 @@ export class ExtractionOrchestrator {
       lines.push(
         `Aviso: em ${unconfirmedRange} conversa(s) não foi possível confirmar a opção 'Todas as mensagens' no modal; ` +
           'confira se o histórico delas veio completo.'
+      );
+    }
+    if (incompleteHistories) {
+      lines.push(
+        `Aviso: em ${incompleteHistories} conversa(s) as mensagens mais antigas do celular não terminaram de carregar; ` +
+          'o histórico delas pode estar incompleto, e o motivo está na linha de cada uma.'
       );
     }
     if (missingContactPhones) {
@@ -2064,10 +2232,13 @@ export class ExtractionOrchestrator {
       }
       const attemptsNote = result.attempts > 1 ? ` Tentativas: ${result.attempts}.` : '';
       const rangeNote = hasUnconfirmedRange(result) ? DATE_RANGE_UNCONFIRMED_NOTE : '';
+      const historyNote = hasIncompleteHistory(result)
+        ? ` Aviso: histórico possivelmente incompleto (${describeIncompleteHistory(finalHistoryLoadOf(result), options.historyLimitMs)}).`
+        : '';
       const contactReason = missingContactPhoneReason(result);
       const contactNote = contactReason ? ` Aviso: telefone do contato não lido no painel (${contactReason}).` : '';
       lines.push(
-        `[${result.empty ? EMPTY_EXPORT_LABEL : RESULT_LABELS[result.status]}] ${i + 1}. ${result.message}${rangeNote}${contactNote}${attemptsNote}${checkNotes.get(i) ?? ''}`
+        `[${result.empty ? EMPTY_EXPORT_LABEL : RESULT_LABELS[result.status]}] ${i + 1}. ${result.message}${rangeNote}${historyNote}${contactNote}${attemptsNote}${checkNotes.get(i) ?? ''}`
       );
     });
 
@@ -2189,7 +2360,8 @@ export class ExtractionOrchestrator {
       'Log da execução - WhatsApp Web Extractor',
       `Execução: ${runId} | início: ${new Date(startedAt).toLocaleString('pt-BR')} | versão da extensão: ${chrome.runtime.getManifest().version}`,
       describeLine(line),
-      `Modo: ${describeMode(options)} | intervalo entre conversas: ${formatSeconds(options.safeDelayMs)}, com variação de até +50%`,
+      `Modo: ${describeMode(options)} | intervalo entre conversas: ${formatSeconds(options.safeDelayMs)}, com variação de até +50%` +
+        describeHistoryLimit(options.historyLimitMs),
       scan ? this._describeScan(scan) : 'Varredura: sem estatísticas registradas nesta execução.'
     ];
     if (untimed.length) {
@@ -2229,6 +2401,7 @@ export class ExtractionOrchestrator {
     if (entry.reason) parts.push(`motivo: ${entry.reason}`);
     // No fim da linha, para os campos de antes ficarem na mesma posição em todas as tentativas
     if (entry.openDiagnostics) parts.push(...describeOpenDiagnostics(entry.openDiagnostics));
+    if (entry.historyLoad) parts.push(describeHistoryLoadAttempt(entry.historyLoad));
     if (entry.contactInfo) parts.push(describeContactInfoAttempt(entry.contactInfo));
     return parts.join(' | ');
   }

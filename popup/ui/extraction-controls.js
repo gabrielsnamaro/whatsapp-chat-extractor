@@ -6,6 +6,12 @@ const DEFAULT_SAFE_DELAY_SECONDS = 2;
 // Abaixo disso o ritmo fica com cara de automação, e o WhatsApp pode restringir a conta
 const MIN_SAFE_DELAY_SECONDS = 1;
 
+// Limite, por conversa, da carga das mensagens mais antigas do celular antes de exportar; 0 desliga a carga. O teto é o do
+// orquestrador (MAX_HISTORY_LIMIT_MS): a carga roda na mesma chamada à aba que a exportação, e o Chrome encerra o service
+// worker quando uma chamada passa de 5 min
+const DEFAULT_HISTORY_LIMIT_SECONDS = 60;
+const MAX_HISTORY_LIMIT_SECONDS = 180;
+
 const LINE_PHONE_REQUIRED_MESSAGE = 'Informe o número da linha (a conta logada no WhatsApp Web) com o DDI, ' +
   'de 10 a 15 dígitos (ex.: 5511999999999), para iniciar.';
 
@@ -27,6 +33,24 @@ export function normalizeSafeDelaySeconds(rawValue, { badInput = false } = {}) {
 }
 
 /**
+ * Limite para carregar as mensagens mais antigas digitado no popup, em segundos inteiros. Vazio, inválido ou negativo
+ * volta ao padrão; acima do teto vai para o teto; só o 0 desliga a carga (um valor entre 0 e 1 vai para 1).
+ * @param {string} rawValue Valor do campo (`input.value`)
+ * @param {Object} [options]
+ * @param {boolean} [options.badInput=false] O navegador recusou o texto digitado (`validity.badInput`), caso em que
+ *   `rawValue` chega vazio
+ * @returns {number}
+ */
+export function normalizeHistoryLimitSeconds(rawValue, { badInput = false } = {}) {
+  const text = String(rawValue ?? '').trim();
+  if (badInput || !text) return DEFAULT_HISTORY_LIMIT_SECONDS;
+  const seconds = Number(text);
+  if (!Number.isFinite(seconds) || seconds < 0) return DEFAULT_HISTORY_LIMIT_SECONDS;
+  if (seconds === 0) return 0;
+  return Math.min(Math.max(1, Math.round(seconds)), MAX_HISTORY_LIMIT_SECONDS);
+}
+
+/**
  * ExtractionControls
  * Responsabilidade Única: Gerenciar as opções de extração (Todos vs Limite Numérico para testes),
  * persistir as preferências do usuário e tratar os eventos dos botões de ação do fluxo.
@@ -37,6 +61,7 @@ export class ExtractionControls {
     this.radioLimit = document.getElementById('mode-limit');
     this.inputMaxChats = document.getElementById('max-chats-input');
     this.inputSafeDelay = document.getElementById('safe-delay-input');
+    this.inputHistoryLimit = document.getElementById('history-limit-input');
     this.linePhoneRow = document.getElementById('line-phone-row');
     this.inputLinePhone = document.getElementById('line-phone-input');
     /** O campo "Número da linha" está à mostra: a linha da conta não foi detectada na aba */
@@ -79,6 +104,12 @@ export class ExtractionControls {
         this.savePreferences();
       });
     }
+    if (this.inputHistoryLimit) {
+      this.inputHistoryLimit.addEventListener('change', () => {
+        this.inputHistoryLimit.value = String(this._readHistoryLimitSeconds());
+        this.savePreferences();
+      });
+    }
     // Também só no change. O número não vai para o extractionConfig: vale só para a execução que vai iniciar
     if (this.inputLinePhone) {
       this.inputLinePhone.addEventListener('change', () => {
@@ -96,12 +127,19 @@ export class ExtractionControls {
       const saved = await StorageClient.get('extractionConfig', {
         downloadAll: false,
         maxChats: 3,
-        safeDelayMs: DEFAULT_SAFE_DELAY_SECONDS * 1000
+        safeDelayMs: DEFAULT_SAFE_DELAY_SECONDS * 1000,
+        historyLimitMs: DEFAULT_HISTORY_LIMIT_SECONDS * 1000
       });
 
       if (this.inputSafeDelay) {
         const savedSeconds = Number(saved.safeDelayMs) / 1000;
         this.inputSafeDelay.value = String(normalizeSafeDelaySeconds(Number.isFinite(savedSeconds) ? String(savedSeconds) : ''));
+      }
+
+      // Uma preferência gravada antes do campo existir não tem o limite, e o campo fica com o padrão
+      if (this.inputHistoryLimit) {
+        const savedSeconds = saved.historyLimitMs == null ? NaN : Number(saved.historyLimitMs) / 1000;
+        this.inputHistoryLimit.value = String(normalizeHistoryLimitSeconds(Number.isFinite(savedSeconds) ? String(savedSeconds) : ''));
       }
 
       if (saved.downloadAll) {
@@ -135,8 +173,18 @@ export class ExtractionControls {
   }
 
   /**
+   * @private
+   * @returns {number} Limite para carregar as mensagens mais antigas, em segundos, já validado
+   */
+  _readHistoryLimitSeconds() {
+    if (!this.inputHistoryLimit) return DEFAULT_HISTORY_LIMIT_SECONDS;
+    return normalizeHistoryLimitSeconds(this.inputHistoryLimit.value, { badInput: Boolean(this.inputHistoryLimit.validity?.badInput) });
+  }
+
+  /**
    * Retorna os parâmetros atuais configurados pelo usuário
-   * @returns {{ downloadAll: boolean, maxChats: number|null, safeDelayMs: number }} `safeDelayMs` em ms
+   * @returns {{ downloadAll: boolean, maxChats: number|null, safeDelayMs: number, historyLimitMs: number }}
+   *   `safeDelayMs` e `historyLimitMs` em ms
    */
   getOptions() {
     const downloadAll = Boolean(this.radioAll?.checked);
@@ -148,7 +196,8 @@ export class ExtractionControls {
     }
 
     const safeDelayMs = Math.round(this._readSafeDelaySeconds() * 1000);
-    return { downloadAll, maxChats, safeDelayMs };
+    const historyLimitMs = this._readHistoryLimitSeconds() * 1000;
+    return { downloadAll, maxChats, safeDelayMs, historyLimitMs };
   }
 
   /**
@@ -174,7 +223,7 @@ export class ExtractionControls {
    * Parâmetros do início da extração: os de getOptions e o número da linha, só com o campo dele à mostra. O
    * número vale só para esta execução e fica fora do extractionConfig (savePreferences grava getOptions), para
    * não sobrar a linha de uma conta quando outra logar.
-   * @returns {{ downloadAll: boolean, maxChats: number|null, safeDelayMs: number, linePhone: string|null }}
+   * @returns {{ downloadAll: boolean, maxChats: number|null, safeDelayMs: number, historyLimitMs: number, linePhone: string|null }}
    *   `linePhone`: os dígitos; null com o campo escondido ou com um número inválido
    */
   getStartOptions() {
@@ -200,6 +249,7 @@ export class ExtractionControls {
     if (this.radioLimit) this.radioLimit.disabled = isRunning || isPaused;
     if (this.inputMaxChats) this.inputMaxChats.disabled = (isRunning || isPaused) || this.radioAll?.checked;
     if (this.inputSafeDelay) this.inputSafeDelay.disabled = isRunning || isPaused;
+    if (this.inputHistoryLimit) this.inputHistoryLimit.disabled = isRunning || isPaused;
     if (this.inputLinePhone) this.inputLinePhone.disabled = isRunning || isPaused;
 
     // Controle de exibição dos botões de ação

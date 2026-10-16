@@ -178,6 +178,14 @@ body {
   cursor: not-allowed;
 }
 
+/* Explicação de um campo, logo abaixo da linha dele */
+.input-hint {
+  margin-top: 4px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-muted);
+}
+
 /* Cabe um número com DDI e formatação colada (ex: +55 11 99999-9999) */
 .line-phone-input {
   width: 130px;

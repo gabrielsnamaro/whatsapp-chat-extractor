@@ -54,6 +54,13 @@
           <label for="safe-delay-input" class="input-label">Intervalo entre conversas (s):</label>
           <input type="number" id="safe-delay-input" class="number-input" min="1" step="0.5" value="2">
         </div>
+
+        <!-- Limite por conversa para carregar as mensagens mais antigas do celular antes de exportar; 0 desliga -->
+        <div class="limit-input-row">
+          <label for="history-limit-input" class="input-label">Mensagens antigas do celular (s):</label>
+          <input type="number" id="history-limit-input" class="number-input" min="0" max="180" step="1" value="60">
+        </div>
+        <p class="input-hint">Tempo máximo por conversa, até 180 s, para carregar as mensagens mais antigas do celular, que precisa estar conectado. 0 desliga.</p>
       </div>
 
       <!-- Barra de Progresso e Métricas em Tempo Real -->

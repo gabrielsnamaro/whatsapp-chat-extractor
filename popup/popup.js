@@ -195,6 +195,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         maxChats: options.maxChats,
         downloadAll: options.downloadAll,
         safeDelayMs: options.safeDelayMs,
+        historyLimitMs: options.historyLimitMs,
         // Só com o campo à mostra (a linha não foi detectada na aba); vale só para esta execução
         linePhone: options.linePhone
       });

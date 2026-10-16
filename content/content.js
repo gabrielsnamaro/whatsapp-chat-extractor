@@ -1,8 +1,8 @@
 /**
  * Content Script (Injetado em https://web.whatsapp.com/*)
  * Atua estritamente como Mediador de Mensagens entre o Background/Popup da extensão
- * e os controladores especializados de DOM (ChatListScanner, ChatNavigator, ContactInfoReader, ChatOptionsMenu,
- * ExportModalHandler).
+ * e os controladores especializados de DOM (ChatListScanner, ChatNavigator, HistoryLoader, ContactInfoReader,
+ * ChatOptionsMenu, ExportModalHandler).
  */
 
 (function initWhatsAppContentMediator() {
@@ -15,6 +15,7 @@
   const { SELECTORS, OperationCancelledError } = window.DomUtils;
   const scanner = new window.ChatListScanner();
   const chatNavigator = new window.ChatNavigator();
+  const historyLoader = new window.HistoryLoader();
   const contactInfoReader = new window.ContactInfoReader();
   const optionsMenu = new window.ChatOptionsMenu();
   const modalHandler = new window.ExportModalHandler();
@@ -248,7 +249,7 @@
             // conversa anterior armada até o onBeforeConfirm desta, e um arquivo nesse intervalo seria
             // bloqueado na página e recusado pelo background, sem ir para o ZIP nem para a pasta Downloads
             armedCaptureId = null;
-            const { chat, captureId, queueIndex, readContactInfo } = message;
+            const { chat, captureId, queueIndex, readContactInfo, historyLimitMs } = message;
             if (!chat?.title || !captureId) {
               sendResponse({ success: false, error: 'Parâmetros inválidos para exportação.' });
               return;
@@ -259,12 +260,26 @@
             let openDiagnostics = null;
             /** Tipo da conversa, lido no menu de opções; undefined até o menu ser lido */
             let chatKind;
+            /** Carga das mensagens mais antigas, quando o background a pede (limite > 0): o resultado ou a falha, com o tempo */
+            let historyLoad = null;
+            let historyLoadError = null;
             /** Leitura do painel "Dados do contato", quando o background a pede: o resultado ou a falha, com o tempo */
             let contactInfo = null;
             let contactInfoError = null;
             try {
               const opened = await chatNavigator.openChat(chat, { signal: operation.signal, queueIndex });
               openDiagnostics = opened.diagnostics;
+              if (Number.isFinite(historyLimitMs) && historyLimitMs > 0) {
+                const startedAt = Date.now();
+                try {
+                  historyLoad = await historyLoader.load({ limitMs: historyLimitMs, signal: operation.signal });
+                } catch (err) {
+                  if (err instanceof OperationCancelledError) throw err;
+                  // Sem a carga a exportação segue com as mensagens que o navegador já tem; a falha fica no log da execução
+                  console.warn('[WhatsApp Web Extractor] Falha ao carregar as mensagens mais antigas:', err);
+                  historyLoadError = { message: err.message, ms: Date.now() - startedAt };
+                }
+              }
               if (readContactInfo) {
                 const startedAt = Date.now();
                 try {
@@ -292,6 +307,8 @@
                 warnings,
                 chatKind,
                 ...(openDiagnostics ? { openDiagnostics } : {}),
+                ...(historyLoad ? { historyLoad } : {}),
+                ...(historyLoadError ? { historyLoadError } : {}),
                 ...(contactInfo ? { contactInfo } : {}),
                 ...(contactInfoError ? { contactInfoError } : {}),
                 ...tabHiddenField(operation)
@@ -299,9 +316,11 @@
             } catch (err) {
               if (armedCaptureId === captureId) armedCaptureId = null;
               // Uma falha no menu ou no modal também leva à resposta o que já se sabia: o diagnóstico da abertura que a
-              // precedeu, o tipo da conversa e a leitura do painel. Uma falha na abertura já traz o diagnóstico
-              // (openChat), e a conversa não exportável, o tipo (triggerExportOption)
+              // precedeu, a carga das mensagens mais antigas, o tipo da conversa e a leitura do painel. Uma falha na
+              // abertura já traz o diagnóstico (openChat), e a conversa não exportável, o tipo (triggerExportOption)
               if (openDiagnostics && !err.openDiagnostics) err.openDiagnostics = openDiagnostics;
+              if (historyLoad) err.historyLoad = historyLoad;
+              if (historyLoadError) err.historyLoadError = historyLoadError;
               if (chatKind !== undefined && err.chatKind === undefined) err.chatKind = chatKind;
               if (contactInfo) err.contactInfo = contactInfo;
               if (contactInfoError) err.contactInfoError = contactInfoError;
@@ -356,9 +375,12 @@
         if (!cancelled) console.error('[WhatsApp Web Extractor] Erro no mediator do content script:', err);
         // DOMException traz um `code` numérico legado; só os códigos em texto são da extensão (DomUtils.ERROR_CODES)
         const code = typeof err.code === 'string' ? err.code : null;
-        // Na exportação, vão junto do erro o diagnóstico da abertura (para o _execucao.log), o tipo da conversa e a
-        // leitura do painel "Dados do contato"; na exportação e na varredura, se a aba esteve oculta durante elas
+        // Na exportação, vão junto do erro o diagnóstico da abertura e a carga das mensagens mais antigas (para o
+        // _execucao.log), o tipo da conversa e a leitura do painel "Dados do contato"; na exportação e na varredura, se a
+        // aba esteve oculta durante elas
         const openDiagnostics = err.openDiagnostics ?? null;
+        const historyLoad = err.historyLoad ?? null;
+        const historyLoadError = err.historyLoadError ?? null;
         const contactInfo = err.contactInfo ?? null;
         const contactInfoError = err.contactInfoError ?? null;
         sendResponse({
@@ -367,6 +389,8 @@
           error: err.message,
           code,
           ...(openDiagnostics ? { openDiagnostics } : {}),
+          ...(historyLoad ? { historyLoad } : {}),
+          ...(historyLoadError ? { historyLoadError } : {}),
           ...(err.chatKind !== undefined ? { chatKind: err.chatKind } : {}),
           ...(contactInfo ? { contactInfo } : {}),
           ...(contactInfoError ? { contactInfoError } : {}),

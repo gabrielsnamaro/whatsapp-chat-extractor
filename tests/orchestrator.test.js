@@ -86,12 +86,13 @@ function triggeredResponse(via = 'visible') {
  * `firstAttemptFailures`, só para a da fila, e a conversa é recuperada na repescagem. `files` troca os
  * bytes arbitrários de um título por um arquivo específico (ex: um ZIP nativo). `contacts` acrescenta à
  * resposta de um título, de sucesso ou de falha e nas duas tentativas, o que o content real manda do tipo da
- * conversa e do painel "Dados do contato" (`chatKind`, `contactInfo` ou `contactInfoError`).
+ * conversa e do painel "Dados do contato" (`chatKind`, `contactInfo` ou `contactInfoError`); `historyLoads`, do mesmo
+ * jeito, o que ele manda da carga das mensagens mais antigas (`historyLoad` ou `historyLoadError`).
  */
-function deliveringExport(orch, { sizes = {}, failures = {}, firstAttemptFailures = {}, files = {}, contacts = {} } = {}) {
+function deliveringExport(orch, { sizes = {}, failures = {}, firstAttemptFailures = {}, files = {}, contacts = {}, historyLoads = {} } = {}) {
   return (message) => {
     const { chat, captureId } = message;
-    const contactFields = contacts[chat.title] ?? {};
+    const contactFields = { ...contacts[chat.title], ...historyLoads[chat.title] };
     const failure = failures[chat.title] ?? (isRetryAttempt(message) ? undefined : firstAttemptFailures[chat.title]);
     if (failure) {
       const { error, code = null } = typeof failure === 'string' ? { error: failure } : failure;
@@ -2435,7 +2436,8 @@ test('_execucao.log: uma linha por tentativa, em ordem cronológica, com horári
   );
   assert.deepEqual(lines.slice(2, 6), [
     `Linha: ${FAKE_LINE_PHONE} (detectada na aba)`,
-    'Modo: lista principal (arquivadas não incluídas) | intervalo entre conversas: 0 s, com variação de até +50%',
+    'Modo: lista principal (arquivadas não incluídas) | intervalo entre conversas: 0 s, com variação de até +50% | ' +
+      'mensagens antigas do celular: até 60 s por conversa',
     'Varredura: 3 conversa(s) encontrada(s) em 3 s; parou no fim da lista; data/hora exibida na última conversa: 12/03/2021.',
     ''
   ]);
@@ -4444,4 +4446,274 @@ test('a indicação no ícone sai quando a execução falha durante a pausa da a
   assert.deepEqual(fake.badgeTextsShown(), ['||']);
   assert.equal(fake.badge.text, '');
   assert.equal(archive.calls.length, 0);
+});
+
+// Carga das mensagens mais antigas do celular antes de exportar (HistoryLoader no content)
+
+// Mensagem que o content (history-loader.js) devolve quando o painel de mensagens não está na página
+const MESSAGES_PANEL_NOT_FOUND = 'o painel de mensagens da conversa não foi encontrado';
+
+/** Carga que terminou, como o content real a devolve (HistoryLoader.load) */
+function historyLoad(reason, { clicks = 0, ms = 50, ...extra } = {}) {
+  return { historyLoad: { clicks, ms, reason, ...extra } };
+}
+
+/** Carga de cada tentativa no histórico da conversa; null na tentativa que não a fez */
+function historyLoadAttempts(results) {
+  return results.map((result) => result.history.map((entry) => entry.historyLoad ?? null));
+}
+
+/** Linha do cabeçalho do relatório com as conversas cujas mensagens mais antigas não terminaram de carregar */
+function incompleteHistoriesHeader(count) {
+  return `Aviso: em ${count} conversa(s) as mensagens mais antigas do celular não terminaram de carregar; ` +
+    'o histórico delas pode estar incompleto, e o motivo está na linha de cada uma.';
+}
+
+test('mensagens antigas: o limite vai no pedido de exportação (padrão 60 s, o escolhido até o teto de 3 min ou 0) e fica nas opções da execução', { timeout: TEST_TIMEOUT_MS }, async () => {
+  for (const [startOptions, expected] of [[{}, 60000], [{ historyLimitMs: 180000 }, 180000], [{ historyLimitMs: 0 }, 0]]) {
+    const { fake } = setUp({ chats: sidebarChats(['Ana', 'Bia']) });
+    const orch = createOrchestrator();
+    fake.content.onExport = deliveringExport(orch);
+
+    await orch.start({ safeDelayMs: 0, ...startOptions });
+
+    assert.equal(orch.getState().state, WORKFLOW_STATES.COMPLETED);
+    assert.deepEqual(fake.content.exportRequests.map((m) => m.historyLimitMs), [expected, expected]);
+    assert.equal(orch.run.options.historyLimitMs, expected);
+    assert.equal(persistedRun(fake.snapshotStorage()).options.historyLimitMs, expected);
+    harness.archive.restore();
+    harness.staging.restore();
+    uninstallFakeChrome();
+    harness = null;
+  }
+});
+
+test('mensagens antigas: limite negativo, não numérico, infinito ou acima de 3 min não inicia a execução', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const { fake } = setUp({ chats: sidebarChats(['Ana']) });
+  const orch = createOrchestrator();
+  // O teto de 3 min deixa a chamada à aba da exportação abaixo dos 5 min em que o Chrome encerra o service worker
+  for (const historyLimitMs of [-1, Number.NaN, Number.POSITIVE_INFINITY, '60000', null, 180001]) {
+    await assert.rejects(
+      orch.start({ safeDelayMs: 0, historyLimitMs }),
+      {
+        message: `Limite para carregar as mensagens antigas inválido: ${String(historyLimitMs)} ` +
+          '(esperado um número de milissegundos de 0 a 180000).'
+      }
+    );
+  }
+  assert.equal(orch.getState().state, WORKFLOW_STATES.IDLE);
+  assert.equal(fake.content.exportRequests.length, 0);
+});
+
+test('mensagens antigas: a carga fica no histórico da tentativa; a que parou no limite ou sem resposta do celular marca a conversa no relatório (linha e cabeçalho), e o log mostra a de cada tentativa', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const { fake, archive } = setUp({ chats: sidebarChats(['Ana', 'Bia', 'Caio', 'Davi', 'Eva', 'Fabi', 'Gil']) });
+  const orch = createOrchestrator();
+  const rangeNotAll = { error: 'O modal não ofereceu a opção "Todas as mensagens".', code: 'DATE_RANGE_NOT_ALL' };
+  fake.content.onExport = deliveringExport(orch, {
+    // Gil falha depois da carga, que vem junto da falha; o código não entra na repescagem
+    failures: { Gil: rangeNotAll },
+    historyLoads: {
+      Ana: historyLoad('no-notice', { ms: 5 }),
+      Bia: historyLoad('no-notice', { clicks: 3, ms: 12345 }),
+      Caio: historyLoad('phone-only', { clicks: 2, ms: 8000, before: '6/26/2026' }),
+      Davi: historyLoad('time-limit', { clicks: 7, ms: 60200 }),
+      Eva: historyLoad('stalled', { clicks: 2, ms: 20400 }),
+      Fabi: { historyLoadError: { message: MESSAGES_PANEL_NOT_FOUND, ms: 100 } },
+      Gil: historyLoad('time-limit', { clicks: 4, ms: 60000 })
+    }
+  });
+
+  await orch.start({ safeDelayMs: 0 });
+
+  const state = orch.getState();
+  assert.equal(state.state, WORKFLOW_STATES.COMPLETED);
+  // A carga não derruba a exportação: só Gil falhou, pelo modal, e ninguém entrou na repescagem
+  assert.deepEqual(state.summary, { saved: 6, empty: 0, savedToDisk: 0, notExportable: 0, failed: 1 });
+  assert.equal(fake.content.exportRequests.length, 7);
+  const loads = [
+    [{ ms: 5, clicks: 0, reason: 'no-notice', complete: true }],
+    [{ ms: 12345, clicks: 3, reason: 'no-notice', complete: true }],
+    [{ ms: 8000, clicks: 2, reason: 'phone-only', complete: true, before: '6/26/2026' }],
+    [{ ms: 60200, clicks: 7, reason: 'time-limit', complete: false }],
+    [{ ms: 20400, clicks: 2, reason: 'stalled', complete: false }],
+    [{ ms: 100, clicks: 0, reason: null, complete: null, error: MESSAGES_PANEL_NOT_FOUND }],
+    [{ ms: 60000, clicks: 4, reason: 'time-limit', complete: false }]
+  ];
+  assert.deepEqual(historyLoadAttempts(orch.run.results), loads);
+  assert.deepEqual(historyLoadAttempts(persistedRun(fake.snapshotStorage()).results), loads);
+  // A mensagem da conversa não muda: o aviso fica no relatório, e o popup não recebe aviso pela carga
+  assert.equal(orch.run.results[3].message, '"Davi" salvo (1.5 KB).');
+  assert.deepEqual(fake.progressUpdates().map((m) => m.warningMessage).filter(Boolean), [`[7/7] ⚠️ "Gil": ${rangeNotAll.error}`]);
+
+  const { report, executionLog } = archive.calls[0];
+  // A falha de Gil não entra na contagem: sem arquivo, não há histórico exportado para conferir
+  assert.deepEqual(report.split('\n').slice(6), [
+    'Conversas na fila: 7 | no ZIP: 6 (vazias: 0) | na pasta Downloads: 0 | não exportáveis: 0 | falhas: 1',
+    incompleteHistoriesHeader(2),
+    '',
+    '[OK] 1. "Ana" salvo (1.5 KB).',
+    '[OK] 2. "Bia" salvo (1.5 KB).',
+    '[OK] 3. "Caio" salvo (1.5 KB).',
+    '[OK] 4. "Davi" salvo (1.5 KB). Aviso: histórico possivelmente incompleto (o carregamento das mensagens mais ' +
+      'antigas parou no limite de 60 s, depois de 7 pedido(s) ao celular).',
+    '[OK] 5. "Eva" salvo (1.5 KB). Aviso: histórico possivelmente incompleto (o celular deixou de responder aos pedidos ' +
+      'das mensagens mais antigas, depois de 2 pedido(s) ao celular).',
+    '[OK] 6. "Fabi" salvo (1.5 KB).',
+    `[FALHA] 7. "Gil": ${rangeNotAll.error}`,
+    ''
+  ]);
+  assert.deepEqual(executionLog.split('\n').slice(6, -1).map(withoutClockAndDuration), [
+    'nº 1 "Ana" | tentativa 1 | <duração> | abertura: lista visível | OK | mensagens antigas: sem o aviso no topo da conversa',
+    'nº 2 "Bia" | tentativa 1 | <duração> | abertura: lista visível | OK | mensagens antigas: 3 pedido(s) ao celular em 12.3 s, até o aviso sumir',
+    'nº 3 "Caio" | tentativa 1 | <duração> | abertura: lista visível | OK | mensagens antigas: 2 pedido(s) ao celular em 8 s; ' +
+      'as anteriores a 6/26/2026 só estão no celular',
+    'nº 4 "Davi" | tentativa 1 | <duração> | abertura: lista visível | OK | mensagens antigas: interrompida no limite de tempo, ' +
+      'com 7 pedido(s) ao celular em 60.2 s',
+    'nº 5 "Eva" | tentativa 1 | <duração> | abertura: lista visível | OK | mensagens antigas: o celular deixou de responder, ' +
+      'com 2 pedido(s) ao celular em 20.4 s',
+    `nº 6 "Fabi" | tentativa 1 | <duração> | abertura: lista visível | OK | mensagens antigas: falhou em 0.1 s (${MESSAGES_PANEL_NOT_FOUND})`,
+    `nº 7 "Gil" | tentativa 1 | <duração> | abertura: não informada | FALHA (DATE_RANGE_NOT_ALL) | motivo: ${rangeNotAll.error} | ` +
+      'mensagens antigas: interrompida no limite de tempo, com 4 pedido(s) ao celular em 60 s'
+  ]);
+});
+
+test('mensagens antigas: só os campos conhecidos da carga são guardados; data fora do formato, motivo desconhecido e cliques inválidos não vão ao log como vieram', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const { fake, archive } = setUp({ chats: sidebarChats(['Ana', 'Bia', 'Caio', 'Davi']) });
+  const orch = createOrchestrator();
+  fake.content.onExport = deliveringExport(orch, {
+    historyLoads: {
+      // A data só vale com o motivo 'phone-only' e no formato do aviso; um campo desconhecido não é guardado
+      Ana: historyLoad('phone-only', { clicks: 1, ms: 3000, before: '<b>ontem</b>', extra: 'x' }),
+      Bia: historyLoad('no-notice', { clicks: -2, ms: -5, before: '6/26/2026' }),
+      Caio: historyLoad('outro-motivo', { clicks: 1.5, ms: 4000 }),
+      // Sem mensagem na falha
+      Davi: { historyLoadError: { ms: 70 } }
+    }
+  });
+
+  await orch.start({ safeDelayMs: 0 });
+
+  assert.equal(orch.getState().state, WORKFLOW_STATES.COMPLETED);
+  assert.deepEqual(historyLoadAttempts(orch.run.results), [
+    [{ ms: 3000, clicks: 1, reason: 'phone-only', complete: true }],
+    [{ ms: null, clicks: 0, reason: 'no-notice', complete: true }],
+    [{ ms: 4000, clicks: 0, reason: null, complete: null }],
+    [{ ms: 70, clicks: 0, reason: null, complete: null, error: 'falha sem mensagem na aba' }]
+  ]);
+  const { report, executionLog } = archive.calls[0];
+  // Motivo desconhecido não marca a conversa
+  assert.equal(report.includes('histórico possivelmente incompleto'), false);
+  assert.deepEqual(executionLog.split('\n').slice(6, -1).map(withoutClockAndDuration), [
+    'nº 1 "Ana" | tentativa 1 | <duração> | abertura: lista visível | OK | mensagens antigas: 1 pedido(s) ao celular em 3 s; ' +
+      'as anteriores a uma data não lida só estão no celular',
+    'nº 2 "Bia" | tentativa 1 | <duração> | abertura: lista visível | OK | mensagens antigas: sem o aviso no topo da conversa',
+    'nº 3 "Caio" | tentativa 1 | <duração> | abertura: lista visível | OK | mensagens antigas: 0 pedido(s) ao celular em 4 s, ' +
+      'fim por um motivo desconhecido',
+    'nº 4 "Davi" | tentativa 1 | <duração> | abertura: lista visível | OK | mensagens antigas: falhou em 0.1 s (falha sem mensagem na aba)'
+  ]);
+});
+
+test('mensagens antigas: na conversa repescada, vale a carga da tentativa que deu o arquivo, e o log mostra a das duas', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const { fake, archive } = setUp({ chats: sidebarChats(['Ana', 'Bia']) });
+  const orch = createOrchestrator();
+  const modalTimeout = 'Timeout de 30s aguardando o modal de exportação.';
+  const deliver = deliveringExport(orch, { firstAttemptFailures: { Ana: { error: modalTimeout, code: 'TIMEOUT' }, Bia: { error: modalTimeout, code: 'TIMEOUT' } } });
+  fake.content.onExport = (message) => {
+    const response = deliver(message);
+    // Ana: a 1ª parou no limite e a 2ª carregou tudo; Bia: o contrário
+    const retry = isRetryAttempt(message);
+    const incomplete = historyLoad('time-limit', { clicks: 5, ms: 30000 });
+    const complete = historyLoad('no-notice', { clicks: retry ? 0 : 6, ms: retry ? 10 : 25000 });
+    if (message.chat.title === 'Ana') return { ...response, ...(retry ? complete : incomplete) };
+    return { ...response, ...(retry ? incomplete : complete) };
+  };
+
+  await orch.start({ safeDelayMs: 0, retryCooldownMs: 0, historyLimitMs: 30000 });
+
+  assert.equal(orch.getState().state, WORKFLOW_STATES.COMPLETED);
+  assert.deepEqual(orch.getState().summary, { saved: 2, empty: 0, savedToDisk: 0, notExportable: 0, failed: 0 });
+  assert.deepEqual(historyLoadAttempts(orch.run.results), [
+    [{ ms: 30000, clicks: 5, reason: 'time-limit', complete: false }, { ms: 10, clicks: 0, reason: 'no-notice', complete: true }],
+    [{ ms: 25000, clicks: 6, reason: 'no-notice', complete: true }, { ms: 30000, clicks: 5, reason: 'time-limit', complete: false }]
+  ]);
+
+  const { report, executionLog } = archive.calls[0];
+  const lines = report.split('\n');
+  assert.ok(lines.includes(incompleteHistoriesHeader(1)));
+  assert.ok(lines.includes('[OK] 1. "Ana" salvo (1.5 KB). Tentativas: 2.'));
+  assert.ok(lines.includes(
+    '[OK] 2. "Bia" salvo (1.5 KB). Aviso: histórico possivelmente incompleto (o carregamento das mensagens mais antigas ' +
+      'parou no limite de 30 s, depois de 5 pedido(s) ao celular). Tentativas: 2.'
+  ));
+  const logLines = executionLog.split('\n');
+  assert.equal(
+    logLines[3],
+    'Modo: lista principal (arquivadas não incluídas) | intervalo entre conversas: 0 s, com variação de até +50% | ' +
+      'mensagens antigas do celular: até 30 s por conversa'
+  );
+  const attempts = logLines.slice(6, -1).map(withoutClockAndDuration).filter((line) => line.startsWith('nº '));
+  assert.deepEqual(attempts, [
+    `nº 1 "Ana" | tentativa 1 | <duração> | abertura: não informada | FALHA (TIMEOUT) | motivo: ${modalTimeout} | ` +
+      'mensagens antigas: interrompida no limite de tempo, com 5 pedido(s) ao celular em 30 s',
+    `nº 2 "Bia" | tentativa 1 | <duração> | abertura: não informada | FALHA (TIMEOUT) | motivo: ${modalTimeout} | ` +
+      'mensagens antigas: 6 pedido(s) ao celular em 25 s, até o aviso sumir',
+    'nº 1 "Ana" | tentativa 2 | <duração> | abertura: lista visível | OK | mensagens antigas: sem o aviso no topo da conversa',
+    'nº 2 "Bia" | tentativa 2 | <duração> | abertura: lista visível | OK | mensagens antigas: interrompida no limite de tempo, ' +
+      'com 5 pedido(s) ao celular em 30 s'
+  ]);
+});
+
+test('mensagens antigas: com o limite 0, o pedido vai com 0 e o log diz que elas não foram carregadas', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const { fake, archive } = setUp({ chats: sidebarChats(['Ana']) });
+  const orch = createOrchestrator();
+  fake.content.onExport = deliveringExport(orch);
+
+  await orch.start({ safeDelayMs: 0, historyLimitMs: 0 });
+
+  assert.deepEqual(fake.content.exportRequests.map((m) => m.historyLimitMs), [0]);
+  assert.equal(
+    archive.calls[0].executionLog.split('\n')[3],
+    'Modo: lista principal (arquivadas não incluídas) | intervalo entre conversas: 0 s, com variação de até +50% | ' +
+      'mensagens antigas do celular: não carregadas (limite 0)'
+  );
+  // Sem a carga, a linha da tentativa não tem o trecho
+  assert.equal(archive.calls[0].executionLog.includes('mensagens antigas:'), false);
+});
+
+test('mensagens antigas: a execução gravada antes do limite existir continua sem a carga na retomada, e o log sai sem o limite', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const chats = sidebarChats(['Ana', 'Bia', 'Caio']);
+  const { fake: fakeA, archive } = setUp({ chats });
+  const orchA = createOrchestrator();
+  const deliverA = deliveringExport(orchA);
+  const stalled = createDeferred();
+  let snapshot = null;
+  // Em Bia, o storage é copiado como estaria se o Chrome encerrasse o service worker ali
+  fakeA.content.onExport = (message) => {
+    if (message.chat.title !== 'Bia') return deliverA(message);
+    snapshot = fakeA.snapshotStorage();
+    stalled.resolve();
+    return { success: true, triggered: true };
+  };
+
+  const loopA = orchA.start({ safeDelayMs: 0 });
+  await stalled.promise;
+  await orchA.cancel();
+  await loopA;
+  assert.equal(snapshot.extractionRun.options.historyLimitMs, 60000);
+  delete snapshot.extractionRun.options.historyLimitMs;
+
+  const fake = createFakeChrome({ chats, storage: snapshot });
+  installFakeChrome(fake);
+  const orch = createOrchestrator();
+  fake.content.onExport = deliveringExport(orch);
+  await orch.restore();
+  assert.equal(orch.resume(), true);
+  await orch._loopPromise;
+
+  assert.equal(orch.getState().state, WORKFLOW_STATES.COMPLETED);
+  assert.deepEqual(fake.content.exportRequests.map((m) => [m.chat.title, m.historyLimitMs]), [['Bia', 0], ['Caio', 0]]);
+  assert.equal(
+    archive.calls.at(-1).executionLog.split('\n')[3],
+    'Modo: lista principal (arquivadas não incluídas) | intervalo entre conversas: 0 s, com variação de até +50%'
+  );
 });
