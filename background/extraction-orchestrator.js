@@ -140,6 +140,16 @@ const DATE_RANGE_UNCONFIRMED_NOTE = " Aviso: não foi possível confirmar a opç
 
 const UNEXPECTED_FILE_SOURCE_LABELS = Object.freeze({ page: 'página', download: 'chrome.downloads' });
 
+// Varredura da lista inteira (modo "lista principal") que chegou ao fim, por linha: { [linha]: { found, at } }. Fica
+// fora das chaves da execução e sobrevive a ela, para a varredura seguinte da mesma linha ser comparada com esta
+const SCAN_BASELINES_STORAGE_KEY = 'extractionScanBaselines';
+// Linhas guardadas; a mais antiga sai quando passa disso
+const MAX_SCAN_BASELINES = 20;
+// "Bem menos" conversas que a varredura anterior da mesma linha: 10% a menos, e pelo menos 5. Em 15/10/2026, uma
+// varredura com a aba oculta achou 190 de 530 conversas, e a extração seguiu com a lista incompleta sem aviso nenhum
+const SCAN_DROP_RATIO = 0.9;
+const SCAN_DROP_MIN = 5;
+
 // Por que a varredura da lista parou, pelos códigos que o content devolve nas estatísticas dela
 // (STOP_REASONS em content/dom/chat-list-scanner.js; content script clássico não é importável aqui)
 const SCAN_STOP_LABELS = Object.freeze({
@@ -148,6 +158,8 @@ const SCAN_STOP_LABELS = Object.freeze({
   'limit-reached': 'parou ao atingir o limite escolhido',
   'time-limit': 'parou no tempo máximo da varredura, e a lista pode ter ficado incompleta'
 });
+// A varredura que parou no fim da lista: só ela serve de referência para a seguinte da mesma linha (SCAN_BASELINES_STORAGE_KEY)
+const SCAN_END_OF_LIST = 'end-of-list';
 
 // Toda conversa exportada é de uma linha só: sem a linha da conta (a detectada na aba ou a informada no popup), a
 // extração não começa. O popup reconhece esta falha pelo código (popup/popup.js) e mostra o campo do número
@@ -256,6 +268,27 @@ function describeTabHiddenPauseEnd(pause) {
   return pause.resumedBy === TAB_HIDDEN_PAUSE_ENDINGS.USER
     ? `Retomada pelo usuário ("Retomar"), depois de ${duration} de pausa com a aba oculta.`
     : `Retomada: a aba voltou a ficar visível, depois de ${duration} de pausa.`;
+}
+
+/**
+ * A varredura achou bem menos conversas que a anterior da mesma linha (SCAN_DROP_RATIO e SCAN_DROP_MIN)
+ * @param {number} found
+ * @param {number} previousFound
+ * @returns {boolean}
+ */
+function isScanDrop(found, previousFound) {
+  return found < previousFound * SCAN_DROP_RATIO && previousFound - found >= SCAN_DROP_MIN;
+}
+
+/**
+ * Aviso da varredura que achou bem menos conversas que a anterior da mesma linha, no relatório e no log
+ * @param {{ found: number, previousFound: number, previousAt: string }} scanDrop
+ * @returns {string}
+ */
+function describeScanDrop({ found, previousFound, previousAt }) {
+  return `Aviso: a varredura achou ${found} conversa(s), bem menos que as ${previousFound} da varredura anterior desta ` +
+    `linha, em ${new Date(previousAt).toLocaleString('pt-BR')}; confira se a lista lateral estava completa (sem filtro ` +
+    'de conversas e com a aba visível).';
 }
 
 /**
@@ -870,9 +903,10 @@ export class ExtractionOrchestrator {
      * informada no popup (`manual`): null até a aba ser conferida no início, e ausente numa execução iniciada
      * por uma versão anterior da extensão. `retry` é a repescagem: null até a fila terminar; `indices` são as
      * posições na fila que entraram nela, `cursor` a próxima a exportar e `startsAt` quando a rodada pode
-     * começar. `scan` são as estatísticas da varredura (null até ela terminar). `tabHiddenPauses` são as pausas
+     * começar. `scan` são as estatísticas da varredura (null até ela terminar). `scanDrop` é o aviso da varredura que achou
+     * bem menos conversas que a anterior da mesma linha (só quando houve). `tabHiddenPauses` são as pausas
      * automáticas com a aba oculta, para o relatório e o log (ausente numa execução iniciada por uma versão anterior).
-     * @type {{ runId: string, tabId: number|null, line: { phone: string, source: 'auto'|'manual' }|null, options: Object, queue: Array, nextIndex: number, results: Array, unexpectedFiles: Array, retry: { indices: number[], cursor: number, startsAt: string }|null, scan: { found: number, steps: number, durationMs: number, stopReason: string, lastChatTimestamp: string|null }|null, tabHiddenPauses: TabHiddenPause[], startedAt: string }|null}
+     * @type {{ runId: string, tabId: number|null, line: { phone: string, source: 'auto'|'manual' }|null, options: Object, queue: Array, nextIndex: number, results: Array, unexpectedFiles: Array, retry: { indices: number[], cursor: number, startsAt: string }|null, scan: { found: number, steps: number, durationMs: number, stopReason: string, lastChatTimestamp: string|null }|null, scanDrop?: { found: number, previousFound: number, previousAt: string }, tabHiddenPauses: TabHiddenPause[], startedAt: string }|null}
      */
     this.run = null;
     /** A fila ainda não foi para o storage; vai na próxima gravação do estado (_persistRun) */
@@ -1788,7 +1822,43 @@ export class ExtractionOrchestrator {
       lastChatTimestamp: stats.lastChatTimestamp ?? null
     } : null;
     log.info(`Fila montada com ${this.run.queue.length} conversas para exportação (varredura: ${stats?.stopReason ?? 'sem estatísticas'}).`);
-    this._notifyProgress();
+    const scanDrop = await this._compareScanWithBaseline();
+    // Só avisa: a lista pode ter diminuído de verdade (conversas apagadas ou arquivadas), e o usuário decide se cancela
+    this._notifyProgress(scanDrop ? {
+      warningMessage: `⚠️ A varredura achou ${scanDrop.found} conversa(s), bem menos que as ${scanDrop.previousFound} da ` +
+        `varredura anterior desta linha (${new Date(scanDrop.previousAt).toLocaleString('pt-BR')}). Confira se a lista ` +
+        'lateral do WhatsApp Web está completa, sem filtro de conversas; a extração continua.'
+    } : {});
+  }
+
+  /**
+   * Compara a varredura da lista inteira (modo "lista principal") com a anterior da mesma linha que chegou ao fim da lista:
+   * com bem menos conversas, guarda o aviso em `run.scanDrop`, para o relatório e o log. Depois, se esta chegou ao fim da
+   * lista, ela passa a ser a referência da linha. Uma falha no storage só deixa a comparação de fora
+   * @private
+   * @returns {Promise<{ found: number, previousFound: number, previousAt: string }|null>} O aviso; null sem ele
+   */
+  async _compareScanWithBaseline() {
+    const { options, line, scan } = this.run;
+    if (!options.downloadAll || !line || !scan) return null;
+
+    const stored = await StorageClient.get(SCAN_BASELINES_STORAGE_KEY, {});
+    const baselines = stored && typeof stored === 'object' ? stored : {};
+    const previous = baselines[line.phone];
+    let scanDrop = null;
+    if (Number.isInteger(previous?.found) && isScanDrop(scan.found, previous.found)) {
+      scanDrop = { found: scan.found, previousFound: previous.found, previousAt: previous.at };
+      this.run.scanDrop = scanDrop;
+      log.warn(`Varredura com ${scan.found} conversa(s), contra ${previous.found} na anterior desta linha.`);
+    }
+
+    if (scan.stopReason === SCAN_END_OF_LIST) {
+      const updated = { ...baselines, [line.phone]: { found: scan.found, at: new Date().toISOString() } };
+      // As linhas mais antigas saem primeiro
+      const kept = Object.entries(updated).sort(([, a], [, b]) => Date.parse(b.at) - Date.parse(a.at)).slice(0, MAX_SCAN_BASELINES);
+      await StorageClient.set(SCAN_BASELINES_STORAGE_KEY, Object.fromEntries(kept));
+    }
+    return scanDrop;
   }
 
   /**
@@ -2234,6 +2304,7 @@ export class ExtractionOrchestrator {
     ];
     // Uma execução gravada por uma versão anterior da extensão não tem as estatísticas da varredura
     if (scan) lines.push(this._describeScan(scan));
+    if (this.run.scanDrop) lines.push(describeScanDrop(this.run.scanDrop));
     lines.push(
       'Conteúdo: somente texto; o WhatsApp Web exporta sem mídia, e os anexos aparecem como marcadores ' +
         `(${omittedMedia} anexo(s) omitido(s) nesta execução${partialNote}).`,
@@ -2421,7 +2492,8 @@ export class ExtractionOrchestrator {
       describeLine(line),
       `Modo: ${describeMode(options)} | intervalo entre conversas: ${formatSeconds(options.safeDelayMs)}, com variação de até +50%` +
         describeHistoryLimit(options.historyLimitMs),
-      scan ? this._describeScan(scan) : 'Varredura: sem estatísticas registradas nesta execução.'
+      scan ? this._describeScan(scan) : 'Varredura: sem estatísticas registradas nesta execução.',
+      ...(this.run.scanDrop ? [describeScanDrop(this.run.scanDrop)] : [])
     ];
     if (untimed.length) {
       lines.push(`As linhas com ${UNTIMED_CLOCK} foram registradas por uma versão anterior da extensão, sem horário nem duração, e vêm antes das demais.`);

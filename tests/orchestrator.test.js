@@ -2270,6 +2270,100 @@ test('andamento da varredura: o popup recebe o total encontrado a cada aviso da 
   assert.ok(storageWrites > 0, 'o estado da execução continua sendo persistido fora dos avisos da varredura');
 });
 
+// Referência da varredura por linha, fora das chaves da execução (a outra linha é a OTHER_LINE_PHONE, mais abaixo)
+const SCAN_BASELINES_KEY = 'extractionScanBaselines';
+
+/** Estatísticas da varredura como o content real as devolve */
+function scanStatsOf(stopReason = 'end-of-list') {
+  return { steps: 3, durationMs: 2000, stopReason, lastChatTimestamp: 'Ontem' };
+}
+
+/** Conversas fictícias da lista lateral */
+function numberedChats(count) {
+  return sidebarChats(Array.from({ length: count }, (_, i) => `Conversa ${i + 1}`));
+}
+
+/**
+ * Execução inteira com o storage dado (a referência da varredura de cada linha) e as estatísticas da varredura dadas;
+ * devolve a instância, o fake e a chamada do empacotamento
+ */
+async function runWithScanBaselines({ chats, baselines, stats = scanStatsOf(), startOptions = {} }) {
+  setUp({ chats });
+  const fake = createFakeChrome({ chats, storage: baselines ? { [SCAN_BASELINES_KEY]: baselines } : {} });
+  installFakeChrome(fake);
+  fake.content.scanStats = stats;
+  const orch = createOrchestrator();
+  fake.content.onExport = deliveringExport(orch);
+  await orch.start({ safeDelayMs: 0, ...startOptions });
+  return { orch, fake, packaged: harness.archive.calls[0] };
+}
+
+/** Desfaz o setUp no meio de um teste que roda várias execuções */
+function tearDownRun() {
+  harness.archive.restore();
+  harness.staging.restore();
+  uninstallFakeChrome();
+  harness = null;
+}
+
+test('varredura com bem menos conversas que a anterior da mesma linha: aviso no popup, no relatório e no log, a extração segue, e ela vira a referência da linha', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const previousAt = '2026-10-15T21:05:00.000Z';
+  const otherLine = { found: 3, at: '2026-10-14T12:00:00.000Z' };
+  const { orch, fake, packaged } = await runWithScanBaselines({
+    chats: numberedChats(12),
+    baselines: { [FAKE_LINE_PHONE]: { found: 20, at: previousAt }, [OTHER_LINE_PHONE]: otherLine }
+  });
+
+  assert.equal(orch.getState().state, WORKFLOW_STATES.COMPLETED);
+  assert.equal(fake.content.exportRequests.length, 12);
+  assert.deepEqual(orch.run.scanDrop, { found: 12, previousFound: 20, previousAt });
+  const previousLabel = new Date(previousAt).toLocaleString('pt-BR');
+  assert.deepEqual(fake.progressUpdates().map((m) => m.warningMessage).filter(Boolean), [
+    `⚠️ A varredura achou 12 conversa(s), bem menos que as 20 da varredura anterior desta linha (${previousLabel}). ` +
+      'Confira se a lista lateral do WhatsApp Web está completa, sem filtro de conversas; a extração continua.'
+  ]);
+  const dropLine = `Aviso: a varredura achou 12 conversa(s), bem menos que as 20 da varredura anterior desta linha, em ${previousLabel}; ` +
+    'confira se a lista lateral estava completa (sem filtro de conversas e com a aba visível).';
+  // Logo depois da linha da varredura, no relatório e no log
+  const reportLines = packaged.report.split('\n');
+  assert.ok(reportLines[5].startsWith('Varredura: 12 conversa(s) encontrada(s)'));
+  assert.equal(reportLines[6], dropLine);
+  const logLines = packaged.executionLog.split('\n');
+  assert.ok(logLines[4].startsWith('Varredura: 12 conversa(s) encontrada(s)'));
+  assert.equal(logLines[5], dropLine);
+
+  // A varredura nova, que chegou ao fim da lista, passa a ser a referência da linha; a da outra linha fica
+  const baselines = fake.readStorage(SCAN_BASELINES_KEY);
+  assert.deepEqual(Object.keys(baselines).sort(), [FAKE_LINE_PHONE, OTHER_LINE_PHONE].sort());
+  assert.equal(baselines[FAKE_LINE_PHONE].found, 12);
+  assert.match(baselines[FAKE_LINE_PHONE].at, ISO_DATE);
+  assert.deepEqual(baselines[OTHER_LINE_PHONE], otherLine);
+});
+
+test('varredura sem o aviso: queda pequena, só a outra linha com referência, limite de conversas e varredura que não chegou ao fim (que também não vira referência)', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const at = '2026-10-15T21:05:00.000Z';
+  const scenarios = [
+    // 12 de 13: menos de 10% a menos
+    { name: 'queda de menos de 10%', baselines: { [FAKE_LINE_PHONE]: { found: 13, at } }, chats: 12, recorded: 12 },
+    // 8 de 10: 20% a menos, mas só 2 conversas
+    { name: 'queda de menos de 5 conversas', baselines: { [FAKE_LINE_PHONE]: { found: 10, at } }, chats: 8, recorded: 8 },
+    { name: 'referência só de outra linha', baselines: { [OTHER_LINE_PHONE]: { found: 50, at } }, chats: 6, recorded: 6 },
+    { name: 'sem referência nenhuma', baselines: null, chats: 6, recorded: 6 },
+    // No modo com limite, a lista não é lida inteira: nem compara, nem vira referência
+    { name: 'limite de conversas', baselines: { [FAKE_LINE_PHONE]: { found: 50, at } }, chats: 6, startOptions: { downloadAll: false, maxChats: 3 }, recorded: 50 },
+    // A varredura que parou antes do fim da lista é comparada, mas não vira referência
+    { name: 'parou no tempo máximo', baselines: { [FAKE_LINE_PHONE]: { found: 7, at } }, chats: 6, stats: scanStatsOf('time-limit'), recorded: 7 }
+  ];
+  for (const { name, baselines, chats, stats, startOptions, recorded } of scenarios) {
+    const { orch, fake, packaged } = await runWithScanBaselines({ chats: numberedChats(chats), baselines, stats, startOptions });
+    assert.equal(orch.getState().state, WORKFLOW_STATES.COMPLETED, name);
+    assert.equal('scanDrop' in orch.run, false, name);
+    assert.equal(packaged.report.includes('bem menos que'), false, name);
+    assert.equal(fake.readStorage(SCAN_BASELINES_KEY)?.[FAKE_LINE_PHONE]?.found, recorded, name);
+    tearDownRun();
+  }
+});
+
 test('EXPORT_CHAT_REQUEST leva a posição da conversa na fila, também na repescagem', { timeout: TEST_TIMEOUT_MS }, async () => {
   const { fake } = setUp({ chats: sidebarChats(['Ana', 'Bia', 'Caio']) });
   const orch = createOrchestrator();
