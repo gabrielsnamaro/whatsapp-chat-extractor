@@ -129,7 +129,7 @@ test('service worker: os comandos do popup só valem de uma página da extensão
   }
 });
 
-test('offscreen document: só atende o service worker, e não um content script', async () => {
+test('offscreen document: atende o service worker, e não um content script nem outra extensão', async () => {
   await import('../offscreen/offscreen.js');
 
   const revoke = { target: OFFSCREEN_TARGET, action: OFFSCREEN_ACTIONS.REVOKE_ARCHIVE_URL, url: 'blob:nulo' };

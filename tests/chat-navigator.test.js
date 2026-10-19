@@ -219,6 +219,18 @@ test('conversa que subiu para o topo da lista: não está perto da posição est
   assert.equal(opened.diagnostics.searchExited, true);
 });
 
+test('homônimos lado a lado na posição estimada: a tentativa não falha por eles, e a abertura segue para a busca, como antes', async () => {
+  current = new FakeSidebar(titles(200));
+  current.titles.splice(111, 0, 'Conversa 110');
+  const navigator = createNavigator();
+
+  const opened = plain(await navigator.openChat({ title: 'Conversa 110' }, { queueIndex: 110 }));
+
+  assert.equal(opened.via, 'search');
+  assert.equal(opened.diagnostics.nearbyFound, false);
+  assert.deepEqual(current.typed, ['Conversa 110']);
+});
+
 test('sem a posição na fila, a tentativa perto da posição estimada não roda', async () => {
   current = new FakeSidebar(titles(200));
   const navigator = createNavigator();

@@ -44,9 +44,10 @@ const CSV_FORMULA_START_PATTERN = /^[+=\-@\t\r]/;
 
 // Marcas invisíveis de direção do texto: num nome de pasta, fazem o explorador de arquivos mostrar os caracteres em outra
 // ordem, e um nome pode se passar por outro
-const DIRECTION_MARKS_PATTERN = /[‎‏‪-‮⁦-⁩]/g;
-// Nomes de dispositivo do Windows, com ou sem extensão: uma pasta com um deles não é criada ao extrair o ZIP
-const WINDOWS_RESERVED_NAME_PATTERN = /^(con|prn|aux|nul|com[0-9¹²³]|lpt[0-9¹²³])(\..*)?$/i;
+const DIRECTION_MARKS_PATTERN = /[\u200E\u200F\u202A-\u202E\u2066-\u2069]/g;
+// Nome de dispositivo do Windows no começo do nome, sozinho ou antes de uma extensão ("NUL.txt", "Aux. Administrativo"):
+// o Windows trata o nome inteiro como o dispositivo, e a pasta não é criada ao extrair o ZIP. O "_" vai logo depois dele
+const WINDOWS_RESERVED_NAME_PATTERN = /^(con|prn|aux|nul|com[0-9\u00B9\u00B2\u00B3]|lpt[0-9\u00B9\u00B2\u00B3])(?=\s*(\.|$))/i;
 
 /**
  * Nome de pasta seguro e único (sem diferenciar maiúsculas) para uma conversa dentro do ZIP
@@ -60,7 +61,7 @@ export function buildUniqueFolderName(title, usedNames) {
     .replace(DIRECTION_MARKS_PATTERN, '')
     .replace(/[. ]+$/, '') // Windows não aceita pastas terminadas em ponto ou espaço
     .trim() || 'conversa';
-  const safeTitle = WINDOWS_RESERVED_NAME_PATTERN.test(cleanTitle) ? `${cleanTitle}_` : cleanTitle;
+  const safeTitle = cleanTitle.replace(WINDOWS_RESERVED_NAME_PATTERN, '$1_');
 
   let folderName = safeTitle;
   let counter = 1;

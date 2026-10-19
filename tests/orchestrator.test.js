@@ -3024,10 +3024,9 @@ test('execução com falha: a fila, os resultados e o staging saem do perfil, o 
   const { fake, staging } = setUp({ chats });
   const orch = createOrchestrator();
   fake.content.onExport = deliveringExport(orch);
-  // O offscreen document não monta o ZIP: a execução falha com as duas conversas no staging
-  const packagingStub = ArchiveDownloader.buildAndDownload;
-  ArchiveDownloader.buildAndDownload = async () => {
-    throw new Error('O offscreen document não conseguiu montar o ZIP.');
+  // Um erro inesperado no laço, depois da fila: a execução falha com as duas conversas no staging
+  orch._retryFailures = async () => {
+    throw new Error('erro inesperado no laço');
   };
   const silencedError = console.error;
   console.error = () => {};
@@ -3035,11 +3034,10 @@ test('execução com falha: a fila, os resultados e o staging saem do perfil, o 
     await orch.start({ safeDelayMs: 0 });
   } finally {
     console.error = silencedError;
-    ArchiveDownloader.buildAndDownload = packagingStub;
   }
 
   const failed = orch.getState();
-  assert.deepEqual([failed.state, failed.errorMessage], [WORKFLOW_STATES.FAILED, 'O offscreen document não conseguiu montar o ZIP.']);
+  assert.deepEqual([failed.state, failed.errorMessage], [WORKFLOW_STATES.FAILED, 'erro inesperado no laço']);
   assert.deepEqual(staging.saves.map((s) => s.chatId), ['000000', '000001']);
   assert.deepEqual([...staging.files.keys()], []);
   assert.deepEqual(fake.storageKeys(), ['extractionRun']);
@@ -3047,7 +3045,7 @@ test('execução com falha: a fila, os resultados e o staging saem do perfil, o 
   assert.deepEqual(record, {
     runId: orch.run.runId,
     state: WORKFLOW_STATES.FAILED,
-    errorMessage: 'O offscreen document não conseguiu montar o ZIP.',
+    errorMessage: 'erro inesperado no laço',
     errorCode: null,
     statusMessage: failed.statusMessage,
     queueLength: 2,
@@ -3072,7 +3070,7 @@ test('execução com falha: a fila, os resultados e o staging saem do perfil, o 
     retry: null,
     scanFound: 0,
     currentChatTitle: '',
-    errorMessage: 'O offscreen document não conseguiu montar o ZIP.',
+    errorMessage: 'erro inesperado no laço',
     errorCode: null,
     statusMessage: failed.statusMessage
   });
@@ -3084,6 +3082,102 @@ test('execução com falha: a fila, os resultados e o staging saem do perfil, o 
   assert.equal(orchB.getState().state, WORKFLOW_STATES.COMPLETED);
   assert.deepEqual(orchB.getState().summary, { saved: 1, empty: 0, savedToDisk: 0, notExportable: 0, failed: 0 });
   assert.deepEqual([...fakeB.storageOps[0].keys].sort(), ['extractionRun', 'extractionRun:queue', 'extractionRun:result:000000', 'extractionRun:result:000001']);
+});
+
+test('montagem do ZIP que falha: a execução fica pausada, com as conversas guardadas, e o "Retomar" monta o ZIP sem exportar de novo', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const chats = sidebarChats(['Ana', 'Bia']);
+  const { fake, staging, archive } = setUp({ chats });
+  const orch = createOrchestrator();
+  fake.content.onExport = deliveringExport(orch);
+  // O offscreen document não monta o ZIP na 1ª vez
+  const packagingStub = ArchiveDownloader.buildAndDownload;
+  ArchiveDownloader.buildAndDownload = async () => {
+    ArchiveDownloader.buildAndDownload = packagingStub;
+    throw new Error('O offscreen document não conseguiu montar o ZIP.');
+  };
+  const silencedError = console.error;
+  console.error = () => {};
+  try {
+    await orch.start({ safeDelayMs: 0 });
+  } finally {
+    console.error = silencedError;
+  }
+
+  const paused = orch.getState();
+  const message = 'A montagem do ZIP falhou (O offscreen document não conseguiu montar o ZIP.). As conversas exportadas ' +
+    'continuam guardadas: clique em "Retomar" para tentar de novo.';
+  assert.deepEqual([paused.state, paused.statusMessage, paused.errorMessage], [WORKFLOW_STATES.PAUSED, message, null]);
+  assert.equal(fake.progressUpdates().at(-1).warningMessage, message);
+  // Nada foi apagado: o staging e a execução inteira continuam no storage
+  assert.deepEqual([...staging.files.keys()], ['000000', '000001']);
+  assert.deepEqual(fake.storageKeys(), ['extractionRun', 'extractionRun:queue', 'extractionRun:result:000000', 'extractionRun:result:000001']);
+
+  assert.equal(orch.resume(), true);
+  await orch._loopPromise;
+
+  assert.equal(orch.getState().state, WORKFLOW_STATES.COMPLETED);
+  assert.equal(archive.calls.length, 1);
+  assert.deepEqual(archive.calls[0].stagedKeys, ['000000', '000001']);
+  assert.deepEqual(fake.content.exportRequests.map((m) => m.chat.title), ['Ana', 'Bia']);
+  assert.deepEqual(fake.storageKeys(), ['extractionRun']);
+});
+
+test('"Retomar" com a aba do WhatsApp Web fechada ou ainda carregando: a execução volta para a pausa, com tudo guardado, e o "Retomar" seguinte continua de onde parou', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const chats = sidebarChats(['Ana', 'Bia', 'Caio']);
+  const { fake: fakeA, staging, archive } = setUp({ chats });
+  const orchA = createOrchestrator();
+  const deliverA = deliveringExport(orchA);
+  const stalled = createDeferred();
+  let snapshot = null;
+  // Em Caio, o storage é copiado como estaria se o Chrome encerrasse o service worker ali
+  fakeA.content.onExport = (message) => {
+    if (message.chat.title !== 'Caio') return deliverA(message);
+    snapshot = fakeA.snapshotStorage();
+    stalled.resolve();
+    return { success: true, triggered: true };
+  };
+  const loopA = orchA.start({ safeDelayMs: 0 });
+  await stalled.promise;
+  await stopLikeRestart(orchA, loopA);
+
+  const fake = createFakeChrome({ chats, storage: snapshot });
+  installFakeChrome(fake);
+  const orch = createOrchestrator();
+  fake.content.onExport = deliveringExport(orch);
+  await orch.restore();
+  const keysBefore = fake.storageKeys();
+  const silencedWarn = console.warn;
+  console.warn = () => {};
+  try {
+    // A aba fechada, e depois aberta mas ainda carregando
+    const tab = fake.tabs.splice(0)[0];
+    for (const [setup, reason] of [
+      [() => {}, 'Nenhuma aba do WhatsApp Web aberta encontrada.'],
+      [() => { fake.tabs.push(tab); fake.content.ready = false; }, 'O WhatsApp Web ainda não está pronto (carregando ou aguardando a leitura do QR Code).']
+    ]) {
+      setup();
+      assert.equal(orch.resume(), true);
+      await orch._loopPromise;
+      const state = orch.getState();
+      assert.equal(state.state, WORKFLOW_STATES.PAUSED, reason);
+      assert.equal(
+        state.statusMessage,
+        `Não foi possível retomar: ${reason} As conversas exportadas continuam guardadas; deixe o WhatsApp Web aberto e pronto e clique em "Retomar" de novo.`
+      );
+      assert.equal(fake.readStorage('extractionRun').state, WORKFLOW_STATES.PAUSED);
+      assert.deepEqual(fake.storageKeys(), keysBefore);
+      assert.deepEqual([...staging.files.keys()], ['000000', '000001']);
+    }
+  } finally {
+    console.warn = silencedWarn;
+  }
+
+  fake.content.ready = true;
+  assert.equal(orch.resume(), true);
+  await orch._loopPromise;
+  assert.equal(orch.getState().state, WORKFLOW_STATES.COMPLETED);
+  assert.deepEqual(fake.content.exportRequests.map((m) => m.chat.title), ['Caio']);
+  assert.deepEqual(archive.calls.at(-1).stagedKeys, ['000000', '000001', '000002']);
 });
 
 test('execução encerrada por uma versão anterior, com a fila, os resultados e o staging guardados: a restauração os apaga e deixa só o resumo', { timeout: TEST_TIMEOUT_MS }, async () => {
@@ -3229,7 +3323,7 @@ test('execução gravada numa chave só, pela versão anterior: a retomada conti
   assert.equal(archive.calls[0].report.split('\n').filter((line) => line.startsWith('[OK] ')).length, 5);
 });
 
-test('fila de outra execução que sobrou no storage não é retomada: reinício durante a varredura nova termina em falha', { timeout: TEST_TIMEOUT_MS }, async () => {
+test('fila de outra execução que sobrou no storage não é retomada: reinício durante a varredura nova termina em falha, e o storage fica só com o resumo, sem as sobras da outra', { timeout: TEST_TIMEOUT_MS }, async () => {
   const fake = createFakeChrome({
     chats: sidebarChats(['Ana']),
     storage: {
@@ -3237,17 +3331,25 @@ test('fila de outra execução que sobrou no storage não é retomada: reinício
       extractionRun: {
         runId: 'nova',
         tabId: null,
+        line: { phone: FAKE_LINE_PHONE, source: 'auto' },
         options: { maxChats: null, downloadAll: true, safeDelayMs: 0 },
         nextIndex: 0,
         startedAt: '2026-10-06T12:00:00.000Z',
         state: WORKFLOW_STATES.SCANNING
       },
-      // Fila da execução anterior, que a limpeza não conseguiu apagar
-      'extractionRun:queue': [{ id: 'chat_Velha', title: 'Velha', duplicateTitle: false }]
+      // Fila e resultados da execução anterior, que a limpeza não conseguiu apagar
+      'extractionRun:queue': [
+        { id: 'chat_Velha', title: 'Velha', duplicateTitle: false },
+        { id: 'chat_Antiga', title: 'Antiga', duplicateTitle: false }
+      ],
+      'extractionRun:result:000000': { title: 'Velha', status: 'saved' },
+      'extractionRun:result:000001': { title: 'Antiga', status: 'saved' }
     }
   });
   installFakeChrome(fake);
-  harness = { staging: stubStaging(), archive: stubArchiveDownloader({ staging: stubStaging() }), orchestrators: [] };
+  const staging = stubStaging();
+  harness = { staging, archive: stubArchiveDownloader({ staging }), orchestrators: [] };
+  await staging.files.set('000000', { chatId: '000000', chatTitle: 'Velha', filename: 'conversa.zip', blob: new Blob(['x']) });
   const orch = createOrchestrator();
 
   await orch.restore();
@@ -3255,6 +3357,11 @@ test('fila de outra execução que sobrou no storage não é retomada: reinício
   assert.equal(orch.getState().state, WORKFLOW_STATES.FAILED);
   assert.deepEqual(orch.run.queue, []);
   assert.match(orch.getState().errorMessage, /durante a descoberta de conversas/);
+  // Como em qualquer fim: as sobras saem, pelo tamanho da fila gravada, e o estado fica só com o resumo, sem a linha
+  assert.deepEqual(fake.storageKeys(), ['extractionRun']);
+  assert.deepEqual([...staging.files.keys()], []);
+  const record = fake.readStorage('extractionRun');
+  assert.deepEqual([record.state, record.queueLength, 'line' in record], [WORKFLOW_STATES.FAILED, 0, false]);
 });
 
 // Linha da conta (o número da conta logada no WhatsApp Web): a detectada na aba ou, sem ela, a informada no

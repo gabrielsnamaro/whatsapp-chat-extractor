@@ -255,8 +255,9 @@
       // não veria mudança e não refaria a busca
       if (this._readSearchText(input)) this._setSearchText(input, '');
       const startedAt = Date.now();
-      const stopFrameCount = countAnimationFrames();
       this._setSearchText(input, targetTitle);
+      // Depois de digitar: se o texto não entrar na caixa, a contagem nem começa, e nenhum requestAnimationFrame fica pendente
+      const stopFrameCount = countAnimationFrames();
       const measure = () => ({ searchMs: Date.now() - startedAt, searchCellsSeen: this._countSideCells() });
       try {
         const cell = await waitFor(
@@ -322,18 +323,26 @@
       if (!(rowHeight > 0)) return null;
 
       const startedAt = Date.now();
+      const finish = (cell) => ({ cell, diagnostics: { nearbyMs: Date.now() - startedAt, nearbyFound: Boolean(cell) } });
       pane.scrollTop = estimateNearbyTop({ index: queueIndex, rowHeight, rowsAbove: NEARBY_ROWS_ABOVE });
       await sleep(this.jumpRenderMs, signal);
-      let cell = this.findVisibleCellByTitle(targetTitle);
-      for (let step = 0; !cell && step < NEARBY_EXTRA_STEPS; step++) {
-        const previousTop = pane.scrollTop;
-        pane.scrollTop += this._scrollStepOf(pane);
-        // No fim da lista não há mais o que descer
-        if (pane.scrollTop === previousTop) break;
-        await sleep(this.scrollDelayMs, signal);
-        cell = this.findVisibleCellByTitle(targetTitle);
+      try {
+        let cell = this.findVisibleCellByTitle(targetTitle);
+        for (let step = 0; !cell && step < NEARBY_EXTRA_STEPS; step++) {
+          const previousTop = pane.scrollTop;
+          pane.scrollTop += this._scrollStepOf(pane);
+          // No fim da lista não há mais o que descer
+          if (pane.scrollTop === previousTop) break;
+          await sleep(this.scrollDelayMs, signal);
+          cell = this.findVisibleCellByTitle(targetTitle);
+        }
+        return finish(cell);
+      } catch (err) {
+        // Homônimos lado a lado na posição estimada: a abertura segue para a busca, como antes desta tentativa existir, e
+        // não falha aqui só porque a lista foi levada até eles
+        if (err?.code === ERROR_CODES.AMBIGUOUS_TITLE) return finish(null);
+        throw err;
       }
-      return { cell, diagnostics: { nearbyMs: Date.now() - startedAt, nearbyFound: Boolean(cell) } };
     }
 
     /**

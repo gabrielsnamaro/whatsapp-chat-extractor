@@ -1010,6 +1010,9 @@ export class ExtractionOrchestrator {
     if (!run.queue?.length) {
       this.state = WORKFLOW_STATES.FAILED;
       this.errorMessage = 'A extração foi interrompida pelo navegador durante a descoberta de conversas. Inicie novamente.';
+      // Nenhuma conversa foi exportada, e o estado gravado (com a linha) fica só com o resumo, como em qualquer fim
+      await this._discardRunData();
+      this._persistFinalRecord();
       return;
     }
 
@@ -1222,7 +1225,9 @@ export class ExtractionOrchestrator {
    * @private
    */
   async _discardRunData() {
-    const queueLength = this.run?.queue?.length ?? 0;
+    // A fila gravada pode ser de outra execução (uma limpeza anterior que falhou), maior que a da memória
+    const storedQueue = await StorageClient.get(RUN_QUEUE_STORAGE_KEY, null);
+    const queueLength = Math.max(this.run?.queue?.length ?? 0, Array.isArray(storedQueue) ? storedQueue.length : 0);
     this._queueUnsaved = false;
     this._unsavedResults.clear();
     await StorageClient.remove([RUN_QUEUE_STORAGE_KEY, ...Array.from({ length: queueLength }, (_, index) => resultStorageKeyOf(index))]);
@@ -1314,7 +1319,15 @@ export class ExtractionOrchestrator {
     } else if (!this.isBusy() && this.run) {
       this._execute(async (signal) => {
         if (this.run.nextIndex < this.run.queue.length || this._hasPendingRetry()) {
-          const { tab, linePhone } = await this._prepareTab(this.run.tabId);
+          let prepared;
+          try {
+            prepared = await this._prepareTab(this.run.tabId);
+          } catch (err) {
+            if (signal.aborted) throw new RunCancelledError();
+            this._pauseAfterFailedResume(err);
+            return;
+          }
+          const { tab, linePhone } = prepared;
           // Cancelada enquanto a aba era preparada: a pausa da conferência não pode sobrescrever o cancelamento
           if (signal.aborted) throw new RunCancelledError();
           this.run.tabId = tab.id;
@@ -1323,6 +1336,22 @@ export class ExtractionOrchestrator {
         await this._processQueue(signal);
       });
     }
+  }
+
+  /**
+   * A retomada não achou a aba do WhatsApp Web pronta (fechada, carregando, no QR Code ou sem responder): a execução volta
+   * para a pausa, com as conversas exportadas guardadas, em vez de falhar. Uma falha encerraria a execução, e o fim dela
+   * apaga o staging (_discardRunData): um problema passageiro na aba perderia a extração inteira
+   * @private
+   * @param {Error} err
+   */
+  _pauseAfterFailedResume(err) {
+    this.isPaused = true;
+    this.state = WORKFLOW_STATES.PAUSED;
+    this.statusMessage = `Não foi possível retomar: ${err.message} As conversas exportadas continuam guardadas; ` +
+      'deixe o WhatsApp Web aberto e pronto e clique em "Retomar" de novo.';
+    log.warn('Retomada sem a aba do WhatsApp Web pronta; a execução continua pausada:', err);
+    this._notifyProgress({ warningMessage: `⚠️ ${this.statusMessage}` });
   }
 
   /**
@@ -2688,6 +2717,19 @@ export class ExtractionOrchestrator {
   }
 
   /**
+   * Para a execução antes do ZIP salvo, com o staging guardado: o "Retomar" monta e baixa o ZIP de novo, sem refazer as
+   * exportações nem a repescagem
+   * @private
+   * @param {string} message
+   */
+  _pauseBeforeArchive(message) {
+    this.isPaused = true;
+    this.state = WORKFLOW_STATES.PAUSED;
+    this.statusMessage = message;
+    this._notifyProgress({ warningMessage: this.statusMessage });
+  }
+
+  /**
    * FASE DE EMPACOTAMENTO (PACKAGING) e download único do ZIP master
    * @private
    * @param {AbortSignal} signal
@@ -2705,27 +2747,35 @@ export class ExtractionOrchestrator {
     const archiveFilename = `whatsapp_backup_${new Date().toISOString().slice(0, 10)}.zip`;
     // Toda conversa com arquivo gravado no staging deve estar no ZIP, inclusive as vazias e as atrasadas
     const expectedKeys = this.run.results.flatMap((result, index) => (result?.staged ? [stagingKeyOf(index)] : []));
-    const outcome = await ArchiveDownloader.buildAndDownload({
-      archiveFilename,
-      report: this._buildReport(),
-      executionLog: this._buildExecutionLog(),
-      indexRows: this._buildIndexRows(),
-      runMeta: {
-        runId: this.run.runId,
-        // Uma execução iniciada por uma versão anterior da extensão não tem a linha
-        linePhone: this.run.line?.phone ?? null,
-        extensionVersion: chrome.runtime.getManifest().version
-      },
-      expectedKeys,
-      signal
-    });
+    let outcome;
+    try {
+      outcome = await ArchiveDownloader.buildAndDownload({
+        archiveFilename,
+        report: this._buildReport(),
+        executionLog: this._buildExecutionLog(),
+        indexRows: this._buildIndexRows(),
+        runMeta: {
+          runId: this.run.runId,
+          // Uma execução iniciada por uma versão anterior da extensão não tem a linha
+          linePhone: this.run.line?.phone ?? null,
+          extensionVersion: chrome.runtime.getManifest().version
+        },
+        expectedKeys,
+        signal
+      });
+    } catch (err) {
+      if (err instanceof RunCancelledError || signal.aborted) throw new RunCancelledError();
+      // Como o download não concluído, e não uma falha: uma falha encerraria a execução, e o fim dela apaga o staging
+      log.error('Falha ao montar o ZIP; a execução fica pausada:', err);
+      this._pauseBeforeArchive(
+        `A montagem do ZIP falhou (${err.message}). As conversas exportadas continuam guardadas: clique em "Retomar" para tentar de novo.`
+      );
+      return;
+    }
 
     if (!outcome.completed) {
       // Mantém o staging: o usuário pode gerar o download de novo sem refazer as exportações
-      this.isPaused = true;
-      this.state = WORKFLOW_STATES.PAUSED;
-      this.statusMessage = `O download do ZIP não foi concluído (${outcome.error}). Clique em "Retomar" para gerar o download novamente.`;
-      this._notifyProgress({ warningMessage: this.statusMessage });
+      this._pauseBeforeArchive(`O download do ZIP não foi concluído (${outcome.error}). Clique em "Retomar" para gerar o download novamente.`);
       return;
     }
 
