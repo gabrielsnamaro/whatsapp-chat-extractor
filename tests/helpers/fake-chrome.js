@@ -457,7 +457,7 @@ export function stubStaging() {
  * @param {Object} [options]
  * @param {{ files: Map<string, Object> }} [options.staging]
  * @param {Object} [options.outcome] Resposta fixa, no lugar da padrão
- * @returns {{ calls: Array<{ archiveFilename: string, report: string, executionLog: string, indexRows: Array<Object>, runMeta: Object, expectedKeys: string[], stagedKeys: string[] }>, restore: function(): void }}
+ * @returns {{ calls: Array<{ archiveFilename: string, report: string, executionLog: string, indexRows: Array<Object>, runMeta: Object, expectedKeys: string[], stagedKeys: string[], storage: Object }>, restore: function(): void }}
  */
 export function stubArchiveDownloader({ staging, outcome } = {}) {
   const original = ArchiveDownloader.buildAndDownload;
@@ -465,6 +465,8 @@ export function stubArchiveDownloader({ staging, outcome } = {}) {
 
   ArchiveDownloader.buildAndDownload = async ({ archiveFilename, report, executionLog, indexRows, runMeta, expectedKeys }) => {
     const stagedKeys = staging ? [...staging.files.keys()].sort() : [];
+    // O storage como estava no empacotamento: no fim da execução, a fila e os resultados saem dele
+    const storage = await globalThis.chrome.storage.local.get(null);
     // Clonadas como no envio ao offscreen document (chrome.runtime.sendMessage)
     calls.push({
       archiveFilename,
@@ -473,7 +475,8 @@ export function stubArchiveDownloader({ staging, outcome } = {}) {
       indexRows: structuredClone(indexRows),
       runMeta: structuredClone(runMeta),
       expectedKeys: [...expectedKeys],
-      stagedKeys
+      stagedKeys,
+      storage
     });
     if (outcome) return outcome;
 

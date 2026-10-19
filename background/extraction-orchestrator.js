@@ -44,6 +44,10 @@ const ACTIVE_STATES = [
 // Fases em que a execução usa a aba e pode pausar, pelo usuário ou pela aba oculta: o empacotamento não usa a aba
 const PAUSABLE_STATES = [WORKFLOW_STATES.SCANNING, WORKFLOW_STATES.EXPORTING, WORKFLOW_STATES.WAITING_DOWNLOAD];
 
+// Fins de execução, que não se retomam: neles a fila, os resultados e o staging, com os títulos, os telefones e o texto das
+// conversas, saem do perfil do Chrome (_discardRunData), e o estado gravado fica só com o resumo (_persistFinalRecord)
+const FINAL_STATES = new Set([WORKFLOW_STATES.COMPLETED, WORKFLOW_STATES.CANCELLED, WORKFLOW_STATES.FAILED]);
+
 // Com a aba do WhatsApp Web oculta (outra aba na frente ou janela minimizada), o Chrome roda os temporizadores dela no
 // máximo uma vez por minuto e não redesenha a página: as esperas da automação estouram, e as conversas falhavam por isso
 const TAB_HIDDEN_PAUSE_MESSAGE = 'A aba do WhatsApp Web ficou em segundo plano. O Chrome deixa abas ocultas lentas, ' +
@@ -909,6 +913,12 @@ export class ExtractionOrchestrator {
      * @type {{ runId: string, tabId: number|null, line: { phone: string, source: 'auto'|'manual' }|null, options: Object, queue: Array, nextIndex: number, results: Array, unexpectedFiles: Array, retry: { indices: number[], cursor: number, startsAt: string }|null, scan: { found: number, steps: number, durationMs: number, stopReason: string, lastChatTimestamp: string|null }|null, scanDrop?: { found: number, previousFound: number, previousAt: string }, tabHiddenPauses: TabHiddenPause[], startedAt: string }|null}
      */
     this.run = null;
+    /**
+     * Resumo de uma execução encerrada, lido do storage depois de um reinício do service worker (_persistFinalRecord): a
+     * fila e os resultados já não estão lá, e o popup mostra este resumo. null fora desse caso
+     * @type {{ total: number, current: number, percentage: number, summary: Object }|null}
+     */
+    this._finalSummary = null;
     /** A fila ainda não foi para o storage; vai na próxima gravação do estado (_persistRun) */
     this._queueUnsaved = false;
     /** @type {Set<number>} Posições na fila cujo resultado ainda não foi para o storage; vão na próxima gravação do estado */
@@ -957,6 +967,16 @@ export class ExtractionOrchestrator {
     const saved = stored[RUN_STORAGE_KEY];
     if (!saved) return;
 
+    // Execução encerrada, gravada só com o resumo
+    if (saved.finalSummary) {
+      this.state = saved.state;
+      this.errorMessage = saved.errorMessage || null;
+      this.errorCode = saved.errorCode || null;
+      this.statusMessage = saved.statusMessage || null;
+      this._finalSummary = saved.finalSummary;
+      return;
+    }
+
     const { state, errorMessage, errorCode, statusMessage, currentIndex, currentChatTitle, ...run } = saved;
     if (Array.isArray(run.queue)) {
       // Gravada por uma versão anterior da extensão, com a fila e os resultados dentro do estado: a próxima
@@ -979,6 +999,11 @@ export class ExtractionOrchestrator {
       this.errorMessage = errorMessage || null;
       this.errorCode = errorCode || null;
       this.statusMessage = statusMessage || null;
+      // Encerrada por uma versão anterior da extensão, que deixava a fila, os resultados e o staging no storage
+      if (FINAL_STATES.has(state)) {
+        await this._discardRunData();
+        this._persistFinalRecord();
+      }
       return;
     }
 
@@ -1026,6 +1051,18 @@ export class ExtractionOrchestrator {
    * @returns {Object}
    */
   getState() {
+    if (!this.run && this._finalSummary) {
+      return {
+        state: this.state,
+        ...this._finalSummary,
+        retry: null,
+        scanFound: 0,
+        currentChatTitle: '',
+        errorMessage: this.errorMessage,
+        errorCode: this.errorCode,
+        statusMessage: this.statusMessage
+      };
+    }
     const total = this.run?.queue?.length || 0;
     const processed = this.run?.nextIndex || 0;
     const results = (this.run?.results || []).filter(Boolean);
@@ -1119,6 +1156,10 @@ export class ExtractionOrchestrator {
    * @private
    */
   _persistRun() {
+    if (FINAL_STATES.has(this.state)) {
+      this._persistFinalRecord();
+      return;
+    }
     const { run } = this;
     // Marca no estado de qual execução é a fila gravada: se a limpeza da anterior falhar, a fila velha
     // continua no storage, e um reinício durante a varredura nova não pode retomá-la
@@ -1152,6 +1193,43 @@ export class ExtractionOrchestrator {
   }
 
   /**
+   * Grava a execução encerrada (concluída, cancelada ou com falha) só com o resumo que o popup mostra depois de um reinício
+   * do service worker: a fase, as mensagens, o código da falha e as contagens, sem a linha, os títulos e os telefones
+   * @private
+   */
+  _persistFinalRecord() {
+    const { total, current, percentage, summary } = this.getState();
+    StorageClient.set({
+      [RUN_STORAGE_KEY]: {
+        runId: this.run.runId,
+        state: this.state,
+        errorMessage: this.errorMessage,
+        errorCode: this.errorCode,
+        statusMessage: this.statusMessage,
+        // As chaves dos resultados saem do tamanho da fila: com ele, a execução seguinte apaga as que uma limpeza com falha
+        // tenha deixado (_removePreviousRun)
+        queueLength: this.run.queue?.length ?? 0,
+        finalSummary: { total, current, percentage, summary }
+      }
+    });
+  }
+
+  /**
+   * Tira do perfil do Chrome o que a execução encerrada guardou das conversas: a fila e os resultados (títulos, telefones da
+   * linha e dos contatos, mensagens de falha) e o staging (o texto das conversas). Antes, ficavam lá até a próxima execução
+   * (achado da auditoria de 14/10/2026). O estado já foi gravado só com o resumo, na notificação do fim (_persistRun). Uma
+   * falha aqui só fica no log: a próxima execução apaga o que sobrou
+   * @private
+   */
+  async _discardRunData() {
+    const queueLength = this.run?.queue?.length ?? 0;
+    this._queueUnsaved = false;
+    this._unsavedResults.clear();
+    await StorageClient.remove([RUN_QUEUE_STORAGE_KEY, ...Array.from({ length: queueLength }, (_, index) => resultStorageKeyOf(index))]);
+    await StagingRepository.clear().catch((err) => log.warn('Falha ao limpar o staging no fim da execução:', err));
+  }
+
+  /**
    * Guarda o resultado de uma conversa. Ele vai para o storage na próxima gravação do estado, que é a do
    * aviso do resultado (_notifyResult), depois de avançar `nextIndex` ou `retry.cursor`.
    * @private
@@ -1173,9 +1251,10 @@ export class ExtractionOrchestrator {
   async _removePreviousRun() {
     const stored = await StorageClient.get([RUN_STORAGE_KEY, RUN_QUEUE_STORAGE_KEY], {});
     const previous = stored[RUN_STORAGE_KEY];
-    // Uma execução gravada por uma versão anterior da extensão tem a fila dentro do estado
+    // Uma execução gravada por uma versão anterior da extensão tem a fila dentro do estado; uma encerrada, só o tamanho dela
     const previousQueue = Array.isArray(previous?.queue) ? previous.queue : stored[RUN_QUEUE_STORAGE_KEY];
-    const resultKeys = Array.from({ length: previousQueue?.length ?? 0 }, (_, index) => resultStorageKeyOf(index));
+    const previousLength = Math.max(previousQueue?.length ?? 0, Number.isInteger(previous?.queueLength) ? previous.queueLength : 0);
+    const resultKeys = Array.from({ length: previousLength }, (_, index) => resultStorageKeyOf(index));
     await StorageClient.remove([RUN_STORAGE_KEY, RUN_QUEUE_STORAGE_KEY, ...resultKeys]);
   }
 
@@ -1412,6 +1491,9 @@ export class ExtractionOrchestrator {
     this.statusMessage = 'Extração cancelada.';
     log.info('Orquestrador cancelado pelo usuário.');
     this._notifyProgress();
+    // Com o laço rodando, a limpeza é no fim dele (_execute), depois da etapa em andamento; sem ele (execução restaurada e
+    // pausada, ou parada no download do ZIP), é aqui
+    if (!this.isBusy() && this.run) await this._discardRunData();
   }
 
   /**
@@ -1543,6 +1625,7 @@ export class ExtractionOrchestrator {
     this.currentIndex = 0;
     this.currentChatTitle = '';
     this.scanFound = 0;
+    this._finalSummary = null;
     this.run = {
       runId: Date.now().toString(36),
       tabId: null,
@@ -1605,6 +1688,8 @@ export class ExtractionOrchestrator {
         this._clearPauseBadge();
         this.interceptor.stopListening();
         this._stopKeepAlive();
+        // Só nos fins de execução: a pausa sem o laço continua com tudo, para o "Retomar"
+        if (FINAL_STATES.has(this.state)) await this._discardRunData();
         this._abortController = null;
         this._loopPromise = null;
       }

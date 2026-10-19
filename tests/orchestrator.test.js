@@ -1,6 +1,7 @@
 import { test, before, after, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { ExtractionOrchestrator } from '../background/extraction-orchestrator.js';
+import { ArchiveDownloader } from '../background/archive-downloader.js';
 import { ZipBuilder } from '../shared/archive/zip-builder.js';
 import { ACTIONS } from '../shared/constants/actions.js';
 import { WORKFLOW_STATES } from '../shared/constants/workflow-states.js';
@@ -71,6 +72,18 @@ function createDeferred() {
   let resolve;
   const promise = new Promise((res) => { resolve = res; });
   return { promise, resolve };
+}
+
+/**
+ * Para a instância como um reinício do service worker, que não é um cancelamento: o laço é interrompido sem a limpeza do
+ * fim da execução (_discardRunData), e o storage e o staging ficam como estavam para a instância seguinte
+ * @param {ExtractionOrchestrator} orch
+ * @param {Promise<void>} loop
+ */
+async function stopLikeRestart(orch, loop) {
+  orch._discardRunData = async () => {};
+  await orch.cancel();
+  await loop;
 }
 
 /** Resposta do content real quando a exportação foi disparada na página */
@@ -168,6 +181,14 @@ function persistedRun(storage) {
     if (match) results[Number(match[1])] = value;
   }
   return { ...storage.extractionRun, queue: storage['extractionRun:queue'] ?? [], results };
+}
+
+/**
+ * Storage como estava no empacotamento do último ZIP: depois dele, no fim da execução, a fila e os resultados saem do
+ * storage, e o estado fica só com o resumo
+ */
+function storageAtPackaging() {
+  return harness.archive.calls.at(-1).storage;
 }
 
 /**
@@ -303,8 +324,21 @@ test('três conversas salvas: staging por posição na fila, ZIP e mensagem fina
     `🎉 ${state.statusMessage}`
   ]);
 
-  const persisted = persistedRun(fake.snapshotStorage());
-  assert.equal(persisted.state, WORKFLOW_STATES.COMPLETED);
+  // No fim, a fila e os resultados saem do storage, e o estado fica só com o resumo, sem a linha, os títulos e os telefones
+  assert.deepEqual(fake.storageKeys(), ['extractionRun']);
+  assert.deepEqual(fake.readStorage('extractionRun'), {
+    runId,
+    state: WORKFLOW_STATES.COMPLETED,
+    errorMessage: null,
+    errorCode: null,
+    statusMessage: state.statusMessage,
+    queueLength: 3,
+    finalSummary: { total: 3, current: 3, percentage: 100, summary: state.summary }
+  });
+
+  // Durante a execução, o storage teve tudo o que a retomada depois de um reinício precisa
+  const persisted = persistedRun(storageAtPackaging());
+  assert.equal(persisted.state, WORKFLOW_STATES.PACKAGING);
   assert.equal(persisted.nextIndex, 3);
   assert.deepEqual(persisted.results.map((r) => r.status), ['saved', 'saved', 'saved']);
   // Sem erro não há código; o `via` vem da resposta da aba
@@ -420,8 +454,20 @@ test('cancelamento durante a espera do arquivo encerra sem empacotar', { timeout
   assert.equal(orch.run.results.length, 1);
   assert.deepEqual(state.summary, { saved: 1, empty: 0, savedToDisk: 0, notExportable: 0, failed: 0 });
 
-  // O staging não é limpo no cancelamento
-  assert.deepEqual([...staging.files.keys()], ['000000']);
+  // O cancelamento não se retoma: o staging (o texto de Ana) e a fila e os resultados saem do perfil do Chrome, e o estado
+  // fica só com o resumo
+  assert.deepEqual(staging.saves.map((s) => s.chatId), ['000000']);
+  assert.deepEqual([...staging.files.keys()], []);
+  assert.deepEqual(fake.storageKeys(), ['extractionRun']);
+  assert.deepEqual(fake.readStorage('extractionRun'), {
+    runId: orch.run.runId,
+    state: WORKFLOW_STATES.CANCELLED,
+    errorMessage: null,
+    errorCode: null,
+    statusMessage: 'Extração cancelada.',
+    queueLength: 3,
+    finalSummary: { total: 3, current: state.current, percentage: state.percentage, summary: state.summary }
+  });
 
   // Um arquivo que chegue depois do cancelamento é recusado
   const late = orch.captures.handleTransferMessage({
@@ -432,7 +478,6 @@ test('cancelamento durante a espera do arquivo encerra sem empacotar', { timeout
   });
   assert.equal(late.success, false);
 
-  assert.equal(fake.readStorage('extractionRun').state, WORKFLOW_STATES.CANCELLED);
   assert.equal(fake.api.downloads.onCreated.listeners.size, 0);
 });
 
@@ -589,7 +634,7 @@ test('arquivo não entregue no prazo nem na quarentena: falha FILE_NOT_DELIVERED
   ]);
   // A marcação é só do relatório; o resultado de Caio não muda
   assert.equal(orch.run.results[2].message, '"Caio" salvo (1.5 KB).');
-  assert.equal(persistedRun(fake.snapshotStorage()).results[1].code, 'FILE_NOT_DELIVERED');
+  assert.equal(persistedRun(storageAtPackaging()).results[1].code, 'FILE_NOT_DELIVERED');
 });
 
 test('arquivo atrasado chega na quarentena, pela página ou pelo chrome.downloads, e é salvo na conversa certa', { timeout: TEST_TIMEOUT_MS }, async () => {
@@ -672,7 +717,7 @@ test('arquivo atrasado chega na quarentena, pela página ou pelo chrome.download
     `[OK] 3. "Caio" salvo (3.0 KB).${LATE_NOTE}`,
     '[OK] 4. "Davi" salvo (1.5 KB).'
   ]);
-  assert.equal(persistedRun(fake.snapshotStorage()).results[1].late, true);
+  assert.equal(persistedRun(storageAtPackaging()).results[1].late, true);
 });
 
 test('outra falha na quarentena prevalece sobre o prazo esgotado: leitura falha na página ou tamanho divergente', { timeout: TEST_TIMEOUT_MS }, async () => {
@@ -900,7 +945,7 @@ test('código do erro gravado em cada resultado, venha da página ou da captura 
 
   // O código e o `via` sobrevivem ao checkpoint, para a retomada e o relatório
   assert.deepEqual(
-    persistedRun(fake.snapshotStorage()).results.map((r) => [r.code, r.via]),
+    persistedRun(storageAtPackaging()).results.map((r) => [r.code, r.via]),
     [['AMBIGUOUS_TITLE', null], ['TRANSFER_FAILED', 'visible'], ['SIZE_MISMATCH', 'visible'], [null, 'search'], [null, 'scroll']]
   );
   assert.match(state.statusMessage, /\. 1 conversa\(s\) no ZIP, 3 falha\(s\), 1 baixada\(s\) direto na pasta Downloads\.$/);
@@ -961,7 +1006,7 @@ test('exportação vazia: [OK – VAZIA] no relatório, contada no ZIP e gravada
   );
   assert.equal(updates.at(-1).summary.empty, 1);
   assert.match(state.statusMessage, /\. 3 conversa\(s\) no ZIP \(1 vazia\(s\)\), 0 falha\(s\)\.$/);
-  assert.equal(persistedRun(fake.snapshotStorage()).results[1].empty, true);
+  assert.equal(persistedRun(storageAtPackaging()).results[1].empty, true);
 });
 
 test('conteúdo não inspecionado: a conversa é salva mesmo assim, e o relatório e o log dizem o motivo', { timeout: TEST_TIMEOUT_MS }, async () => {
@@ -1012,7 +1057,7 @@ test('conteúdo não inspecionado: a conversa é salva mesmo assim, e o relatór
   assert.deepEqual(new Uint8Array(await staging.saves[1].blob.arrayBuffer()), truncatedZip);
   assert.deepEqual(archive.calls[0].stagedKeys, ['000000', '000001', '000002']);
   assert.equal(archive.calls[0].report.split('\n')[9], `[OK] 2. ${result.message}`);
-  assert.equal(persistedRun(fake.snapshotStorage()).results[1].inspectionError, result.inspectionError);
+  assert.equal(persistedRun(storageAtPackaging()).results[1].inspectionError, result.inspectionError);
 
   // A falha da inspeção vai para o log do background, com o erro original
   const inspectionWarnings = warnings.filter(([message]) => String(message).includes('Conteúdo de "Bia" não inspecionado'));
@@ -1051,7 +1096,7 @@ test('anexos omitidos: contagem na linha da conversa e total da execução no ca
 
   // Os campos da inspeção ficam no resultado persistido, junto do status
   assert.deepEqual(
-    persistedRun(fake.snapshotStorage()).results.map(({ messageCount, systemEventCount, omittedMediaCount, firstTimestamp, lastTimestamp }) => (
+    persistedRun(storageAtPackaging()).results.map(({ messageCount, systemEventCount, omittedMediaCount, firstTimestamp, lastTimestamp }) => (
       { messageCount, systemEventCount, omittedMediaCount, firstTimestamp, lastTimestamp }
     )),
     [
@@ -1111,8 +1156,7 @@ test('retomada no meio da fila: nova instância exporta só as conversas restant
 
   const loopA = orchA.start({ safeDelayMs: 0 });
   await stalled.promise;
-  await orchA.cancel();
-  await loopA;
+  await stopLikeRestart(orchA, loopA);
 
   assert.equal(snapshot.extractionRun.state, WORKFLOW_STATES.EXPORTING);
   assert.equal(snapshot.extractionRun.nextIndex, 2);
@@ -1364,7 +1408,7 @@ test('arquivos recebidos fora de hora, da página e do chrome.downloads, vão pa
     { filename: 'Conversa do WhatsApp com Ana.zip', source: 'page', duringChat: 'Bia' }
   ]);
   // Persistido com o run, para sobreviver a um reinício do service worker
-  assert.deepEqual(fake.readStorage('extractionRun').unexpectedFiles, orch.run.unexpectedFiles);
+  assert.deepEqual(storageAtPackaging().extractionRun.unexpectedFiles, orch.run.unexpectedFiles);
 
   const lines = archive.calls[0].report.split('\n');
   assert.deepEqual(lines.slice(8, 13), [
@@ -1421,8 +1465,7 @@ async function snapshotWithoutUnexpectedFiles(fakeA) {
 
   const loopA = orchA.start({ safeDelayMs: 0 });
   await stalled.promise;
-  await orchA.cancel();
-  await loopA;
+  await stopLikeRestart(orchA, loopA);
 
   assert.equal(snapshot.extractionRun.nextIndex, 2);
   assert.deepEqual(snapshot.extractionRun.unexpectedFiles, []);
@@ -1459,7 +1502,7 @@ test('execução gravada pela versão anterior, sem a lista de arquivos fora de 
   assert.deepEqual(orchB.run.unexpectedFiles.map(({ at, ...entry }) => entry), [
     { filename: 'Conversa do WhatsApp com Fulano.zip', source: 'download', duringChat: 'Davi' }
   ]);
-  assert.deepEqual(fakeB.readStorage('extractionRun').unexpectedFiles, orchB.run.unexpectedFiles);
+  assert.deepEqual(storageAtPackaging().extractionRun.unexpectedFiles, orchB.run.unexpectedFiles);
 
   const lines = archive.calls[0].report.split('\n');
   assert.deepEqual(lines.slice(8, 14), [
@@ -1565,7 +1608,7 @@ test('repescagem recupera falhas passageiras: lista lateral devolvida ao normal 
   ]);
   assert.deepEqual(orch.run.retry, { indices: [1, 3], cursor: 2, startsAt: orch.run.retry.startsAt });
   assert.match(orch.run.retry.startsAt, /^\d{4}-\d{2}-\d{2}T/);
-  assert.deepEqual(fake.readStorage('extractionRun').retry, orch.run.retry);
+  assert.deepEqual(storageAtPackaging().extractionRun.retry, orch.run.retry);
 
   // No staging, cada conversa recuperada fica com a chave da sua posição na fila
   assert.deepEqual(staging.saves.map((s) => [s.chatId, s.chatTitle]), [
@@ -1731,7 +1774,7 @@ test('modal sem "Todas as mensagens": aviso na linha e total no cabeçalho; com 
       ['failed', 'DATE_RANGE_NOT_ALL', 1, []]
     ]
   );
-  assert.deepEqual(persistedRun(fake.snapshotStorage()).results[0].warnings, ['DATE_RANGE_UNCONFIRMED']);
+  assert.deepEqual(persistedRun(storageAtPackaging()).results[0].warnings, ['DATE_RANGE_UNCONFIRMED']);
 
   const rangeNote = " Aviso: não foi possível confirmar a opção 'Todas as mensagens' no modal.";
   const lines = archive.calls[0].report.split('\n');
@@ -1877,7 +1920,10 @@ test('cancelamento na repescagem, esperando o arquivo: encerra sem empacotar e a
   // A tentativa interrompida não ganha resultado e continua a próxima da rodada
   assert.deepEqual([orch.run.results[1].code, orch.run.results[1].attempts], ['CHAT_NOT_FOUND', 1]);
   assert.equal(orch.run.retry.cursor, 0);
-  assert.deepEqual([...staging.files.keys()], ['000000']);
+  // O staging, a fila e os resultados saem no cancelamento também na repescagem
+  assert.deepEqual(staging.saves.map((s) => s.chatId), ['000000']);
+  assert.deepEqual([...staging.files.keys()], []);
+  assert.deepEqual(fake.storageKeys(), ['extractionRun']);
   assert.equal(fake.api.downloads.onCreated.listeners.size, 0);
   assert.equal(fake.readStorage('extractionRun').state, WORKFLOW_STATES.CANCELLED);
   // Um arquivo que chegue depois do cancelamento é recusado
@@ -2010,8 +2056,7 @@ async function snapshotDuringRetry(fakeA, { stallAt }) {
 
   const loopA = orchA.start({ safeDelayMs: 0, retryCooldownMs: 0 });
   await stalled.promise;
-  await orchA.cancel();
-  await loopA;
+  await stopLikeRestart(orchA, loopA);
   return snapshot;
 }
 
@@ -2162,7 +2207,7 @@ for (const { stopReason, durationMs, lastChatTimestamp, summary } of [
 
     assert.equal(orch.getState().state, WORKFLOW_STATES.COMPLETED);
     assert.deepEqual(orch.run.scan, { found: 2, steps: 7, durationMs, stopReason, lastChatTimestamp });
-    assert.deepEqual(fake.readStorage('extractionRun').scan, orch.run.scan);
+    assert.deepEqual(storageAtPackaging().extractionRun.scan, orch.run.scan);
     const lines = archive.calls[0].report.split('\n');
     assert.deepEqual(lines.slice(4, 6), [
       'Modo: lista principal (arquivadas não incluídas)',
@@ -2191,8 +2236,7 @@ test('estatísticas da varredura sobrevivem a um reinício; execução gravada a
 
   const loopA = orchA.start({ safeDelayMs: 0 });
   await stalled.promise;
-  await orchA.cancel();
-  await loopA;
+  await stopLikeRestart(orchA, loopA);
   assert.deepEqual(snapshot.extractionRun.scan, { found: 3, ...stats });
 
   /** Nova instância com o storage dado, retomada até o fim; devolve as linhas do relatório */
@@ -2518,7 +2562,7 @@ test('_execucao.log: uma linha por tentativa, em ordem cronológica, com horári
     attemptRecord({ attempt: 1, status: 'failed', code: 'CHAT_NOT_FOUND', reason: notFound('Bia').error }),
     attemptRecord({ attempt: 2, status: 'saved', via: 'search' })
   ]);
-  assert.deepEqual(persistedRun(fake.snapshotStorage()).results[1].history, results[1].history);
+  assert.deepEqual(persistedRun(storageAtPackaging()).results[1].history, results[1].history);
 
   const [{ executionLog }] = archive.calls;
   assert.ok(executionLog.endsWith('\n'));
@@ -2636,7 +2680,7 @@ test('_execucao.log: diagnóstico da abertura pela busca e pela rolagem no fim d
     [searchDiagnostics],
     [scrollDiagnostics, scrollDiagnostics]
   ]);
-  assert.deepEqual(persistedRun(fake.snapshotStorage()).results.map((r) => r.history), results.map((r) => r.history));
+  assert.deepEqual(persistedRun(storageAtPackaging()).results.map((r) => r.history), results.map((r) => r.history));
 
   // Os campos de antes ficam na mesma posição; o diagnóstico vem depois do motivo
   const events = archive.calls[0].executionLog.split('\n').slice(6, -1);
@@ -2802,9 +2846,12 @@ test('checkpoint: numa fila de 10 conversas, no máximo 2 gravações por conver
     assert.equal('queue' in items.extractionRun, false);
     assert.equal('results' in items.extractionRun, false);
   }
-  // O storage só é apagado uma vez, no início (a execução anterior)
-  assert.deepEqual(fake.storageOps.map((op) => op.method).filter((method) => method === 'remove'), ['remove']);
+  // O storage só é apagado no início (a execução anterior) e no fim (a fila e os resultados desta, pelo tamanho da fila)
+  const removes = fake.storageOps.filter((op) => op.method === 'remove');
+  assert.equal(removes.length, 2);
   assert.equal(fake.storageOps[0].method, 'remove');
+  assert.equal(fake.storageOps.at(-1), removes[1]);
+  assert.deepEqual(removes[1].keys, ['extractionRun:queue', ...titles.map((_, index) => `extractionRun:result:${String(index).padStart(6, '0')}`)]);
 
   // A fila vai uma vez só, no fim da varredura
   const queueWrites = writes.filter((items) => 'extractionRun:queue' in items);
@@ -2860,7 +2907,7 @@ test('checkpoint na repescagem: o resultado vai no mesmo set do estado com o nov
     [[['000000'], 1, 2], [['000002'], 2, 2]]
   );
   assert.ok(duringRetry.length <= 2 * 2, `${duringRetry.length} gravações para 2 conversas repescadas`);
-  assert.deepEqual(persistedRun(fake.snapshotStorage()).results.map((result) => [result.status, result.attempts]), [
+  assert.deepEqual(persistedRun(storageAtPackaging()).results.map((result) => [result.status, result.attempts]), [
     ['saved', 2], ['saved', 1], ['saved', 2]
   ]);
 });
@@ -2900,15 +2947,26 @@ test('gravação que falha: o erro fica registrado, a execução segue e o resul
   const resent = writes.filter((items) => 'extractionRun:result:000001' in items);
   assert.equal(resent.length, 1);
   assert.ok(resent[0].extractionRun.nextIndex >= 2);
-  assert.deepEqual(persistedRun(fake.snapshotStorage()).results, orch.run.results);
+  assert.deepEqual(persistedRun(storageAtPackaging()).results, orch.run.results);
 });
 
-test('iniciar outra execução apaga todas as chaves da anterior antes da 1ª gravação da nova, sem mexer nas preferências do popup', { timeout: TEST_TIMEOUT_MS }, async () => {
-  // Execução A: 5 conversas, concluída
+test('iniciar outra execução apaga todas as chaves da anterior antes da 1ª gravação da nova, sem mexer nas preferências do popup, também as que a limpeza do fim dela não apagou', { timeout: TEST_TIMEOUT_MS }, async () => {
+  // Execução A: 5 conversas, concluída, com a limpeza do fim falhando: a fila e os resultados ficam no storage
   const { fake: fakeA } = setUp({ chats: sidebarChats(['Ana', 'Bia', 'Caio', 'Davi', 'Eva']) });
   const orchA = createOrchestrator();
   fakeA.content.onExport = deliveringExport(orchA);
-  await orchA.start({ safeDelayMs: 0 });
+  const realRemove = fakeA.api.storage.local.remove;
+  fakeA.api.storage.local.remove = async (keys) => {
+    if (orchA.getState().state === WORKFLOW_STATES.COMPLETED) throw new Error('falha simulada na limpeza');
+    return realRemove(keys);
+  };
+  const silencedError = console.error;
+  console.error = () => {};
+  try {
+    await orchA.start({ safeDelayMs: 0 });
+  } finally {
+    console.error = silencedError;
+  }
   assert.equal(orchA.getState().state, WORKFLOW_STATES.COMPLETED);
   const keysOfA = [
     'extractionRun',
@@ -2916,6 +2974,8 @@ test('iniciar outra execução apaga todas as chaves da anterior antes da 1ª gr
     ...['000000', '000001', '000002', '000003', '000004'].map((key) => `extractionRun:result:${key}`)
   ];
   assert.deepEqual(fakeA.storageKeys(), keysOfA);
+  // O estado de A, já só com o resumo, guarda o tamanho da fila
+  assert.equal(fakeA.readStorage('extractionRun').queueLength, 5);
 
   // Execução B: 2 conversas, num service worker novo, com o storage de A e as preferências do popup
   const extractionConfig = { downloadAll: false, maxChats: 3, safeDelayMs: 2000 };
@@ -2941,19 +3001,155 @@ test('iniciar outra execução apaga todas as chaves da anterior antes da 1ª gr
   assert.deepEqual([...firstOp.keys].sort(), keysOfA);
   assert.deepEqual(keysAtFirstWrite, ['extractionConfig']);
 
-  // No fim, só as chaves de B (as posições 3 a 5 de A não sobram), e as preferências intactas
-  assert.deepEqual(fakeB.storageKeys(), [
+  // No fim, nada de A sobra, B leva só o seu estado, já com o resumo, e as preferências ficam intactas
+  assert.deepEqual(fakeB.storageKeys(), ['extractionConfig', 'extractionRun']);
+  assert.equal(fakeB.readStorage('extractionRun').runId, orchB.run.runId);
+  // Antes do fim, só as chaves de B estavam lá (as posições 3 a 5 de A não sobraram)
+  assert.deepEqual(Object.keys(storageAtPackaging()).sort(), [
     'extractionConfig',
     'extractionRun',
     'extractionRun:queue',
     'extractionRun:result:000000',
     'extractionRun:result:000001'
   ]);
-  const persisted = persistedRun(fakeB.snapshotStorage());
+  const persisted = persistedRun(storageAtPackaging());
   assert.equal(persisted.runId, orchB.run.runId);
   assert.deepEqual(persisted.queue.map((chat) => chat.title), ['Zeca', 'Yara']);
   assert.deepEqual(persisted.results.map((result) => result.title), ['Zeca', 'Yara']);
   assert.deepEqual(fakeB.readStorage('extractionConfig'), extractionConfig);
+});
+
+test('execução com falha: a fila, os resultados e o staging saem do perfil, o estado fica com a falha e o resumo, um reinício mostra o resumo, e outra execução começa normalmente', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const chats = sidebarChats(['Ana', 'Bia']);
+  const { fake, staging } = setUp({ chats });
+  const orch = createOrchestrator();
+  fake.content.onExport = deliveringExport(orch);
+  // O offscreen document não monta o ZIP: a execução falha com as duas conversas no staging
+  const packagingStub = ArchiveDownloader.buildAndDownload;
+  ArchiveDownloader.buildAndDownload = async () => {
+    throw new Error('O offscreen document não conseguiu montar o ZIP.');
+  };
+  const silencedError = console.error;
+  console.error = () => {};
+  try {
+    await orch.start({ safeDelayMs: 0 });
+  } finally {
+    console.error = silencedError;
+    ArchiveDownloader.buildAndDownload = packagingStub;
+  }
+
+  const failed = orch.getState();
+  assert.deepEqual([failed.state, failed.errorMessage], [WORKFLOW_STATES.FAILED, 'O offscreen document não conseguiu montar o ZIP.']);
+  assert.deepEqual(staging.saves.map((s) => s.chatId), ['000000', '000001']);
+  assert.deepEqual([...staging.files.keys()], []);
+  assert.deepEqual(fake.storageKeys(), ['extractionRun']);
+  const record = fake.readStorage('extractionRun');
+  assert.deepEqual(record, {
+    runId: orch.run.runId,
+    state: WORKFLOW_STATES.FAILED,
+    errorMessage: 'O offscreen document não conseguiu montar o ZIP.',
+    errorCode: null,
+    statusMessage: failed.statusMessage,
+    queueLength: 2,
+    finalSummary: { total: 2, current: 2, percentage: 100, summary: failed.summary }
+  });
+  // Sem a linha, os títulos e os telefones
+  const recordText = JSON.stringify(record);
+  for (const forbidden of [FAKE_LINE_PHONE, 'Ana', 'Bia']) assert.equal(recordText.includes(forbidden), false, forbidden);
+
+  // Depois de um reinício, o popup mostra a falha e as contagens do resumo
+  const fakeB = createFakeChrome({ chats: sidebarChats(['Caio']), storage: fake.snapshotStorage() });
+  installFakeChrome(fakeB);
+  const orchB = createOrchestrator();
+  await orchB.restore();
+  assert.equal(orchB.run, null);
+  assert.deepEqual(orchB.getState(), {
+    state: WORKFLOW_STATES.FAILED,
+    current: 2,
+    total: 2,
+    percentage: 100,
+    summary: failed.summary,
+    retry: null,
+    scanFound: 0,
+    currentChatTitle: '',
+    errorMessage: 'O offscreen document não conseguiu montar o ZIP.',
+    errorCode: null,
+    statusMessage: failed.statusMessage
+  });
+  assert.equal(orchB.resume(), false);
+
+  // Outra execução apaga o resumo (e as chaves dos resultados, pelo tamanho da fila guardado nele) e segue
+  fakeB.content.onExport = deliveringExport(orchB);
+  await orchB.start({ safeDelayMs: 0 });
+  assert.equal(orchB.getState().state, WORKFLOW_STATES.COMPLETED);
+  assert.deepEqual(orchB.getState().summary, { saved: 1, empty: 0, savedToDisk: 0, notExportable: 0, failed: 0 });
+  assert.deepEqual([...fakeB.storageOps[0].keys].sort(), ['extractionRun', 'extractionRun:queue', 'extractionRun:result:000000', 'extractionRun:result:000001']);
+});
+
+test('execução encerrada por uma versão anterior, com a fila, os resultados e o staging guardados: a restauração os apaga e deixa só o resumo', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const chats = sidebarChats(['Ana', 'Bia', 'Caio']);
+  const { fake, staging } = setUp({ chats });
+  const orch = createOrchestrator();
+  fake.content.onExport = deliveringExport(orch, { failures: { Bia: { error: EXPORT_UNAVAILABLE_MESSAGE, code: 'EXPORT_OPTION_UNAVAILABLE' } } });
+  await orch.start({ safeDelayMs: 0 });
+  // A versão anterior deixava, no fim, o estado com a fila e os resultados, e o staging de uma execução cancelada
+  const legacy = { ...storageAtPackaging() };
+  legacy.extractionRun = { ...legacy.extractionRun, state: WORKFLOW_STATES.CANCELLED, statusMessage: 'Extração cancelada.' };
+  await staging.files.set('000000', { chatId: '000000', chatTitle: 'Ana', filename: 'conversa.zip', blob: new Blob(['x']) });
+
+  const fakeB = createFakeChrome({ chats, storage: legacy });
+  installFakeChrome(fakeB);
+  const orchB = createOrchestrator();
+  await orchB.restore();
+
+  const restored = orchB.getState();
+  assert.equal(restored.state, WORKFLOW_STATES.CANCELLED);
+  assert.deepEqual(restored.summary, { saved: 2, empty: 0, savedToDisk: 0, notExportable: 1, failed: 0 });
+  assert.deepEqual(fakeB.storageKeys(), ['extractionRun']);
+  assert.deepEqual([...staging.files.keys()], []);
+  assert.deepEqual(fakeB.readStorage('extractionRun'), {
+    runId: orch.run.runId,
+    state: WORKFLOW_STATES.CANCELLED,
+    errorMessage: null,
+    errorCode: null,
+    statusMessage: 'Extração cancelada.',
+    queueLength: 3,
+    finalSummary: { total: 3, current: restored.current, percentage: 100, summary: restored.summary }
+  });
+});
+
+test('cancelar uma execução restaurada, pausada e sem o laço, também tira a fila, os resultados e o staging do perfil', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const chats = sidebarChats(['Ana', 'Bia', 'Caio']);
+  const { fake: fakeA, staging } = setUp({ chats });
+  const orchA = createOrchestrator();
+  const deliverA = deliveringExport(orchA);
+  const stalled = createDeferred();
+  let snapshot = null;
+  // Em Caio, o storage é copiado como estaria se o Chrome encerrasse o service worker ali
+  fakeA.content.onExport = (message) => {
+    if (message.chat.title !== 'Caio') return deliverA(message);
+    snapshot = fakeA.snapshotStorage();
+    stalled.resolve();
+    return { success: true, triggered: true };
+  };
+  const loopA = orchA.start({ safeDelayMs: 0 });
+  await stalled.promise;
+  await stopLikeRestart(orchA, loopA);
+  assert.deepEqual([...staging.files.keys()], ['000000', '000001']);
+
+  const fakeB = createFakeChrome({ chats, storage: snapshot });
+  installFakeChrome(fakeB);
+  const orchB = createOrchestrator();
+  await orchB.restore();
+  assert.equal(orchB.getState().state, WORKFLOW_STATES.PAUSED);
+
+  await orchB.cancel();
+
+  assert.equal(orchB.getState().state, WORKFLOW_STATES.CANCELLED);
+  assert.deepEqual([...staging.files.keys()], []);
+  assert.deepEqual(fakeB.storageKeys(), ['extractionRun']);
+  assert.equal(fakeB.readStorage('extractionRun').state, WORKFLOW_STATES.CANCELLED);
+  assert.equal(fakeB.receivedActions().includes(ACTIONS.EXPORT_CHAT_REQUEST), false);
 });
 
 test('execução gravada numa chave só, pela versão anterior: a retomada continua dela, e a 1ª gravação passa a fila e os resultados para as chaves próprias no mesmo set', { timeout: TEST_TIMEOUT_MS }, async () => {
@@ -2977,8 +3173,7 @@ test('execução gravada numa chave só, pela versão anterior: a retomada conti
   const stalledA = stallingAt(fakeA, orchA, 'Caio');
   const loopA = orchA.start({ safeDelayMs: 0 });
   const legacy = toSingleKeyFormat(await stalledA);
-  await orchA.cancel();
-  await loopA;
+  await stopLikeRestart(orchA, loopA);
   assert.deepEqual(Object.keys(legacy), ['extractionRun']);
   assert.deepEqual([legacy.extractionRun.queue.length, legacy.extractionRun.results.length, legacy.extractionRun.nextIndex], [5, 2, 2]);
 
@@ -2996,8 +3191,7 @@ test('execução gravada numa chave só, pela versão anterior: a retomada conti
   assert.equal(orchB.resume(), true);
   const loopB = orchB._loopPromise;
   const snapshotB = await stalledB;
-  await orchB.cancel();
-  await loopB;
+  await stopLikeRestart(orchB, loopB);
 
   // A 1ª gravação de B (a da retomada) leva o estado, sem a fila e os resultados, a fila e os resultados de Ana
   // e Bia; as seguintes não levam a fila de novo, e só o resultado novo (Caio) vai junto do estado
@@ -3101,8 +3295,7 @@ async function snapshotStalledAt(fakeA, stallAt, startOptions = {}) {
 
   const loopA = orchA.start({ safeDelayMs: 0, ...startOptions });
   await stalled.promise;
-  await orchA.cancel();
-  await loopA;
+  await stopLikeRestart(orchA, loopA);
   return snapshot;
 }
 
@@ -3132,7 +3325,7 @@ test('linha detectada na aba: gravada em run.line antes da varredura, persistida
   // A linha sai da mesma resposta que confere a aba, e já vai na 1ª gravação do estado
   assert.equal(fake.content.readyChecks, 1);
   assert.deepEqual(storageWrites(fake)[0].extractionRun.line, line);
-  assert.deepEqual(fake.readStorage('extractionRun').line, line);
+  assert.deepEqual(storageAtPackaging().extractionRun.line, line);
 
   const { report, executionLog } = archive.calls[0];
   assert.equal(report.split('\n')[3], `Linha: ${FAKE_LINE_PHONE} (detectada na aba)`);
@@ -3197,7 +3390,7 @@ test('sem a linha na aba, vale o número informado no popup, só com os dígitos
 
     assert.equal(orch.getState().state, WORKFLOW_STATES.COMPLETED, linePhone);
     assert.deepEqual(orch.run.line, { phone, source: 'manual' });
-    assert.deepEqual(fake.readStorage('extractionRun').line, { phone, source: 'manual' });
+    assert.deepEqual(storageAtPackaging().extractionRun.line, { phone, source: 'manual' });
     const { report, executionLog } = archive.calls.at(-1);
     assert.equal(report.split('\n')[3], `Linha: ${phone} (informada no popup)`);
     assert.equal(executionLog.split('\n')[2], `Linha: ${phone} (informada no popup)`);
@@ -3434,7 +3627,7 @@ test('retomada com a linha digitada no popup com o 9 depois do DDD e a aba na me
   assert.deepEqual(fakeB.progressUpdates().map((m) => m.warningMessage).filter(Boolean), []);
   // A linha da execução continua a digitada, no estado e no relatório
   assert.deepEqual(orchB.run.line, typedLine);
-  assert.deepEqual(fakeB.readStorage('extractionRun').line, typedLine);
+  assert.deepEqual(storageAtPackaging().extractionRun.line, typedLine);
   assert.equal(archive.calls[0].report.split('\n')[3], `Linha: ${FAKE_LINE_PHONE} (informada no popup)`);
 
   // Outro número, com ou sem o 9, de outro DDD ou com outros dígitos, continua recusado
@@ -3539,7 +3732,7 @@ test('tipo e telefone do contato: o título que é telefone dispensa o painel; o
     contactRecord({ kind: 'group', infoMs: 2000 })
   ];
   assert.deepEqual(orch.run.results.map((r) => r.contact), contacts);
-  assert.deepEqual(persistedRun(fake.snapshotStorage()).results.map((r) => r.contact), contacts);
+  assert.deepEqual(persistedRun(storageAtPackaging()).results.map((r) => r.contact), contacts);
   // A leitura do painel fica no histórico da tentativa que a fez
   assert.deepEqual(contactInfoAttempts(orch.run.results), [
     [null], [{ ms: 1234, error: null }], [{ ms: 1500, error: null }], [{ ms: 2000, error: null }]
@@ -3673,7 +3866,7 @@ test('tipo e telefone do contato também na falha: a não exportável guarda o c
   assert.deepEqual(orch.run.results.map((r) => r.contact ?? null), contacts);
   // Sem nada conhecido do contato, o resultado fica sem o campo
   assert.equal('contact' in orch.run.results[1], false);
-  assert.deepEqual(persistedRun(fake.snapshotStorage()).results.map((r) => r.contact ?? null), contacts);
+  assert.deepEqual(persistedRun(storageAtPackaging()).results.map((r) => r.contact ?? null), contacts);
   assert.deepEqual(contactInfoAttempts(orch.run.results), [[{ ms: 1100, error: null }], [null], [null], [{ ms: 1300, error: null }], [null]]);
 
   // A não exportável continua contada à parte, e nenhuma linha leva o aviso do telefone
@@ -3766,7 +3959,7 @@ test('repescagem: o resultado da 2ª tentativa não perde o telefone nem o tipo 
     contactRecord({ kind: 'chat', phone: '5511900000003', phoneSource: 'contact_info', infoMs: 1200 })
   ];
   assert.deepEqual(orch.run.results.map((r) => r.contact), contacts);
-  assert.deepEqual(persistedRun(fake.snapshotStorage()).results.map((r) => r.contact), contacts);
+  assert.deepEqual(persistedRun(storageAtPackaging()).results.map((r) => r.contact), contacts);
   // O histórico guarda a leitura do painel de cada tentativa que a fez
   assert.deepEqual(contactInfoAttempts(orch.run.results), [
     [{ ms: 1000, error: null }, { ms: 5000, error: DRAWER_NOT_OPENED }],
@@ -3817,8 +4010,7 @@ test('tipo e telefone do contato persistidos com o resultado: depois de um rein�
   };
   const loopA = orchA.start({ safeDelayMs: 0 });
   await stalled.promise;
-  await orchA.cancel();
-  await loopA;
+  await stopLikeRestart(orchA, loopA);
 
   const savedBeforeRestart = [
     contactRecord({ kind: 'chat', phone: PANEL_PHONE, phoneSource: 'contact_info', infoMs: 1234 }),
@@ -4086,7 +4278,7 @@ test('aba oculta durante uma conversa que falha: a execução pausa sozinha, com
   const [pause] = orch.run.tabHiddenPauses;
   assert.equal(pause.resumedBy, 'tab_visible');
   assert.ok(Date.parse(pause.resumedAt) >= Date.parse(pause.pausedAt));
-  assert.deepEqual(fake.readStorage('extractionRun').tabHiddenPauses, orch.run.tabHiddenPauses);
+  assert.deepEqual(storageAtPackaging().extractionRun.tabHiddenPauses, orch.run.tabHiddenPauses);
 
   // Relatório: a pausa no fim do cabeçalho; log: a pausa e a retomada entre as tentativas, sem a tentativa descartada
   const { report, executionLog } = archive.calls[0];
@@ -4385,8 +4577,7 @@ test('reinício do service worker durante a pausa da aba oculta: a execução vo
   await settle();
   // O storage como estaria se o Chrome encerrasse o service worker durante a pausa
   const snapshot = fakeA.snapshotStorage();
-  await orchA.cancel();
-  await loopA;
+  await stopLikeRestart(orchA, loopA);
   assert.equal(snapshot.extractionRun.state, WORKFLOW_STATES.PAUSED);
   assert.deepEqual(snapshot.extractionRun.tabHiddenPauses.map((pause) => pause.resumedAt), [null]);
 
@@ -4623,7 +4814,7 @@ test('mensagens antigas: o limite vai no pedido de exportação (padrão 60 s, o
     assert.equal(orch.getState().state, WORKFLOW_STATES.COMPLETED);
     assert.deepEqual(fake.content.exportRequests.map((m) => m.historyLimitMs), [expected, expected]);
     assert.equal(orch.run.options.historyLimitMs, expected);
-    assert.equal(persistedRun(fake.snapshotStorage()).options.historyLimitMs, expected);
+    assert.equal(persistedRun(storageAtPackaging()).options.historyLimitMs, expected);
     harness.archive.restore();
     harness.staging.restore();
     uninstallFakeChrome();
@@ -4683,7 +4874,7 @@ test('mensagens antigas: a carga fica no histórico da tentativa; a que parou no
     [{ ms: 60000, clicks: 4, reason: 'time-limit', complete: false }]
   ];
   assert.deepEqual(historyLoadAttempts(orch.run.results), loads);
-  assert.deepEqual(historyLoadAttempts(persistedRun(fake.snapshotStorage()).results), loads);
+  assert.deepEqual(historyLoadAttempts(persistedRun(storageAtPackaging()).results), loads);
   // A mensagem da conversa não muda: o aviso fica no relatório, e o popup não recebe aviso pela carga
   assert.equal(orch.run.results[3].message, '"Davi" salvo (1.5 KB).');
   assert.deepEqual(fake.progressUpdates().map((m) => m.warningMessage).filter(Boolean), [`[7/7] ⚠️ "Gil": ${rangeNotAll.error}`]);
@@ -4854,8 +5045,7 @@ test('mensagens antigas: a execução gravada antes do limite existir continua s
 
   const loopA = orchA.start({ safeDelayMs: 0 });
   await stalled.promise;
-  await orchA.cancel();
-  await loopA;
+  await stopLikeRestart(orchA, loopA);
   assert.equal(snapshot.extractionRun.options.historyLimitMs, 60000);
   delete snapshot.extractionRun.options.historyLimitMs;
 
