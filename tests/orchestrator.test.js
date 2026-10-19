@@ -3585,6 +3585,44 @@ test('tipo e telefone do contato também na falha: a não exportável guarda o c
   assert.equal(lines[8], `[NÃO EXPORTÁVEL] 1. "Ana": ${EXPORT_UNAVAILABLE_MESSAGE}`);
 });
 
+test('aviso do telefone do contato só nas conversas com o arquivo: a não exportável e a que falhou leem o painel sem o número e ficam sem a nota, que só o log registra', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const { fake, archive } = setUp({ chats: sidebarChats(['Ana', 'Bia', 'Caio']) });
+  const orch = createOrchestrator();
+  const rangeNotAll = { error: 'O modal de exportação não oferece "Todas as mensagens".', code: 'DATE_RANGE_NOT_ALL' };
+  fake.content.onExport = deliveringExport(orch, {
+    failures: { Ana: { error: EXPORT_UNAVAILABLE_MESSAGE, code: 'EXPORT_OPTION_UNAVAILABLE' }, Bia: rangeNotAll },
+    contacts: {
+      // Como a conta comercial do próprio WhatsApp, que não se exporta: o painel abre e não mostra o número
+      Ana: { chatKind: 'chat', contactInfo: contactInfo({ ms: 900 }) },
+      Bia: { chatKind: 'chat', contactInfoError: { message: DRAWER_NOT_OPENED, ms: 5000 } },
+      Caio: { chatKind: 'chat', contactInfoError: { message: DRAWER_NOT_OPENED, ms: 5000 } }
+    }
+  });
+
+  await orch.start({ safeDelayMs: 0 });
+
+  assert.equal(orch.getState().state, WORKFLOW_STATES.COMPLETED);
+  // O motivo continua no resultado das três, para o log e o JSON
+  assert.deepEqual(orch.run.results.map((r) => r.contact.infoError), [PHONE_NOT_FOUND, DRAWER_NOT_OPENED, DRAWER_NOT_OPENED]);
+  const { report, executionLog } = archive.calls[0];
+  assert.deepEqual(report.split('\n').slice(6), [
+    'Conversas na fila: 3 | no ZIP: 1 (vazias: 0) | na pasta Downloads: 0 | não exportáveis: 1 | falhas: 1',
+    missingContactsHeader(1),
+    '',
+    `[NÃO EXPORTÁVEL] 1. "Ana": ${EXPORT_UNAVAILABLE_MESSAGE}`,
+    `[FALHA] 2. "Bia": ${rangeNotAll.error}`,
+    `[OK] 3. "Caio" salvo (1.5 KB).${contactNote(DRAWER_NOT_OPENED)}`,
+    ''
+  ]);
+  assert.deepEqual(executionLog.split('\n').slice(6, -1).map(withoutClockAndDuration), [
+    'nº 1 "Ana" | tentativa 1 | <duração> | abertura: não informada | NÃO EXPORTÁVEL (EXPORT_OPTION_UNAVAILABLE) | ' +
+      `motivo: ${EXPORT_UNAVAILABLE_MESSAGE} | dados do contato: falhou em 0.9 s (${PHONE_NOT_FOUND})`,
+    `nº 2 "Bia" | tentativa 1 | <duração> | abertura: não informada | FALHA (DATE_RANGE_NOT_ALL) | motivo: ${rangeNotAll.error} | ` +
+      `dados do contato: falhou em 5 s (${DRAWER_NOT_OPENED})`,
+    `nº 3 "Caio" | tentativa 1 | <duração> | abertura: lista visível | OK | dados do contato: falhou em 5 s (${DRAWER_NOT_OPENED})`
+  ]);
+});
+
 test('repescagem: o resultado da 2ª tentativa não perde o telefone nem o tipo lidos na 1ª, e o log mostra o painel de cada tentativa', { timeout: TEST_TIMEOUT_MS }, async () => {
   const { fake, archive } = setUp({ chats: sidebarChats(['Ana', 'Bia', 'Caio']) });
   const orch = createOrchestrator();
@@ -4469,6 +4507,12 @@ function incompleteHistoriesHeader(count) {
     'o histórico delas pode estar incompleto, e o motivo está na linha de cada uma.';
 }
 
+/** Linha do cabeçalho do relatório com as conversas cujas mensagens anteriores a uma data só estão no celular */
+function phoneOnlyHistoriesHeader(count) {
+  return `Aviso: em ${count} conversa(s) o WhatsApp Web avisou que as mensagens mais antigas só estão no celular e não ` +
+    'vêm na exportação; a data do aviso, quando ele a traz, está na linha de cada uma, como o WhatsApp a mostra.';
+}
+
 test('mensagens antigas: o limite vai no pedido de exportação (padrão 60 s, o escolhido até o teto de 3 min ou 0) e fica nas opções da execução', { timeout: TEST_TIMEOUT_MS }, async () => {
   for (const [startOptions, expected] of [[{}, 60000], [{ historyLimitMs: 180000 }, 180000], [{ historyLimitMs: 0 }, 0]]) {
     const { fake } = setUp({ chats: sidebarChats(['Ana', 'Bia']) });
@@ -4505,7 +4549,7 @@ test('mensagens antigas: limite negativo, não numérico, infinito ou acima de 3
   assert.equal(fake.content.exportRequests.length, 0);
 });
 
-test('mensagens antigas: a carga fica no histórico da tentativa; a que parou no limite ou sem resposta do celular marca a conversa no relatório (linha e cabeçalho), e o log mostra a de cada tentativa', { timeout: TEST_TIMEOUT_MS }, async () => {
+test('mensagens antigas: a carga fica no histórico da tentativa; a que parou no limite, sem resposta do celular ou com falha, e a que deu com as anteriores só no celular, marcam a conversa no relatório (linha e cabeçalho), e o log mostra a de cada tentativa', { timeout: TEST_TIMEOUT_MS }, async () => {
   const { fake, archive } = setUp({ chats: sidebarChats(['Ana', 'Bia', 'Caio', 'Davi', 'Eva', 'Fabi', 'Gil']) });
   const orch = createOrchestrator();
   const rangeNotAll = { error: 'O modal não ofereceu a opção "Todas as mensagens".', code: 'DATE_RANGE_NOT_ALL' };
@@ -4546,19 +4590,22 @@ test('mensagens antigas: a carga fica no histórico da tentativa; a que parou no
   assert.deepEqual(fake.progressUpdates().map((m) => m.warningMessage).filter(Boolean), [`[7/7] ⚠️ "Gil": ${rangeNotAll.error}`]);
 
   const { report, executionLog } = archive.calls[0];
-  // A falha de Gil não entra na contagem: sem arquivo, não há histórico exportado para conferir
+  // A falha de Gil não entra na contagem: sem arquivo, não há histórico exportado para conferir. A falha da carga (Fabi)
+  // conta como histórico possivelmente incompleto: a exportação seguiu só com as mensagens que o navegador já tinha
   assert.deepEqual(report.split('\n').slice(6), [
     'Conversas na fila: 7 | no ZIP: 6 (vazias: 0) | na pasta Downloads: 0 | não exportáveis: 0 | falhas: 1',
-    incompleteHistoriesHeader(2),
+    incompleteHistoriesHeader(3),
+    phoneOnlyHistoriesHeader(1),
     '',
     '[OK] 1. "Ana" salvo (1.5 KB).',
     '[OK] 2. "Bia" salvo (1.5 KB).',
-    '[OK] 3. "Caio" salvo (1.5 KB).',
+    '[OK] 3. "Caio" salvo (1.5 KB). Aviso: as mensagens anteriores a 6/26/2026 só estão no celular e não vieram na exportação.',
     '[OK] 4. "Davi" salvo (1.5 KB). Aviso: histórico possivelmente incompleto (o carregamento das mensagens mais ' +
       'antigas parou no limite de 60 s, depois de 7 pedido(s) ao celular).',
     '[OK] 5. "Eva" salvo (1.5 KB). Aviso: histórico possivelmente incompleto (o celular deixou de responder aos pedidos ' +
       'das mensagens mais antigas, depois de 2 pedido(s) ao celular).',
-    '[OK] 6. "Fabi" salvo (1.5 KB).',
+    '[OK] 6. "Fabi" salvo (1.5 KB). Aviso: histórico possivelmente incompleto (o carregamento das mensagens mais ' +
+      `antigas falhou: ${MESSAGES_PANEL_NOT_FOUND}).`,
     `[FALHA] 7. "Gil": ${rangeNotAll.error}`,
     ''
   ]);
@@ -4601,8 +4648,19 @@ test('mensagens antigas: só os campos conhecidos da carga são guardados; data 
     [{ ms: 70, clicks: 0, reason: null, complete: null, error: 'falha sem mensagem na aba' }]
   ]);
   const { report, executionLog } = archive.calls[0];
-  // Motivo desconhecido não marca a conversa
-  assert.equal(report.includes('histórico possivelmente incompleto'), false);
+  // Motivo desconhecido não marca a conversa; a data fora do formato não vai à nota, e a falha sem mensagem diz isso
+  assert.deepEqual(report.split('\n').slice(6), [
+    'Conversas na fila: 4 | no ZIP: 4 (vazias: 0) | na pasta Downloads: 0 | não exportáveis: 0 | falhas: 0',
+    incompleteHistoriesHeader(1),
+    phoneOnlyHistoriesHeader(1),
+    '',
+    '[OK] 1. "Ana" salvo (1.5 KB). Aviso: as mensagens mais antigas só estão no celular e não vieram na exportação.',
+    '[OK] 2. "Bia" salvo (1.5 KB).',
+    '[OK] 3. "Caio" salvo (1.5 KB).',
+    '[OK] 4. "Davi" salvo (1.5 KB). Aviso: histórico possivelmente incompleto (o carregamento das mensagens mais ' +
+      'antigas falhou: falha sem mensagem na aba).',
+    ''
+  ]);
   assert.deepEqual(executionLog.split('\n').slice(6, -1).map(withoutClockAndDuration), [
     'nº 1 "Ana" | tentativa 1 | <duração> | abertura: lista visível | OK | mensagens antigas: 1 pedido(s) ao celular em 3 s; ' +
       'as anteriores a uma data não lida só estão no celular',

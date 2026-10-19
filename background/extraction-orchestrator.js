@@ -512,27 +512,51 @@ function finalHistoryLoadOf(result) {
 }
 
 /**
- * A conversa recebeu o arquivo com a carga das mensagens mais antigas interrompida, com o aviso ainda no topo
+ * A conversa recebeu o arquivo sem que a carga das mensagens mais antigas terminasse: interrompida com o aviso ainda no
+ * topo, ou com falha (a exportação seguiu só com as mensagens que o navegador já tinha)
  * @param {Object|undefined} result
  * @returns {boolean}
  */
 function hasIncompleteHistory(result) {
-  return gotFile(result) && finalHistoryLoadOf(result)?.complete === false;
+  if (!gotFile(result)) return false;
+  const historyLoad = finalHistoryLoadOf(result);
+  return historyLoad?.complete === false || Boolean(historyLoad?.error);
+}
+
+/**
+ * A conversa recebeu o arquivo depois de o WhatsApp Web avisar que as mensagens anteriores a uma data só estão no celular:
+ * elas não vêm na exportação
+ * @param {Object|undefined} result
+ * @returns {boolean}
+ */
+function hasPhoneOnlyHistory(result) {
+  return gotFile(result) && finalHistoryLoadOf(result)?.reason === HISTORY_LOAD_REASONS.PHONE_ONLY;
 }
 
 /**
  * Por que o histórico da conversa pode estar incompleto, para a nota do relatório
- * @param {HistoryLoadRecord} historyLoad Com o reason num dos INCOMPLETE_HISTORY_REASONS
+ * @param {HistoryLoadRecord} historyLoad Com o reason num dos INCOMPLETE_HISTORY_REASONS, ou com a falha
  * @param {number|undefined} limitMs O limite da execução
  * @returns {string}
  */
-function describeIncompleteHistory({ reason, clicks }, limitMs) {
+function describeIncompleteHistory({ reason, clicks, error }, limitMs) {
+  if (error) return `o carregamento das mensagens mais antigas falhou: ${error}`;
   const requests = `${clicks} pedido(s) ao celular`;
   if (reason === HISTORY_LOAD_REASONS.STALLED) {
     return `o celular deixou de responder aos pedidos das mensagens mais antigas, depois de ${requests}`;
   }
   const limit = Number.isFinite(limitMs) ? ` de ${formatSeconds(limitMs)}` : '';
   return `o carregamento das mensagens mais antigas parou no limite${limit}, depois de ${requests}`;
+}
+
+/**
+ * Nota do relatório da conversa cujas mensagens anteriores a uma data só estão no celular
+ * @param {HistoryLoadRecord} historyLoad Com o reason 'phone-only'
+ * @returns {string}
+ */
+function describePhoneOnlyHistory({ before }) {
+  const messages = before ? `as mensagens anteriores a ${before}` : 'as mensagens mais antigas';
+  return ` Aviso: ${messages} só estão no celular e não vieram na exportação.`;
 }
 
 /**
@@ -699,14 +723,15 @@ function mergeRetriedContact(first, second) {
 }
 
 /**
- * Por que o telefone de uma conversa individual não foi lido no painel "Dados do contato", para a nota do relatório
+ * Por que o telefone de uma conversa individual não foi lido no painel "Dados do contato", para a nota do relatório. Só
+ * nas conversas que receberam o arquivo: numa falha ou numa não exportável, o aviso do telefone não serve para nada
  * @param {Object|undefined} result
- * @returns {string|null} null num grupo, com o telefone, sem leitura do painel e numa execução gravada por uma versão
- *   anterior da extensão (sem `contact`)
+ * @returns {string|null} null sem o arquivo, num grupo, com o telefone, sem leitura do painel e numa execução gravada por
+ *   uma versão anterior da extensão (sem `contact`)
  */
 function missingContactPhoneReason(result) {
   const contact = result?.contact;
-  if (!contact || contact.kind === CHAT_KINDS.GROUP || contact.phone) return null;
+  if (!gotFile(result) || !contact || contact.kind === CHAT_KINDS.GROUP || contact.phone) return null;
   return contact.infoError ?? null;
 }
 
@@ -2170,6 +2195,7 @@ export class ExtractionOrchestrator {
     const hasUnconfirmedRange = (result) => gotFile(result) && Boolean(result.warnings?.includes(DATE_RANGE_UNCONFIRMED_WARNING));
     const unconfirmedRange = results.filter(hasUnconfirmedRange).length;
     const incompleteHistories = results.filter(hasIncompleteHistory).length;
+    const phoneOnlyHistories = results.filter(hasPhoneOnlyHistory).length;
     const missingContactPhones = results.filter(missingContactPhoneReason).length;
 
     const lines = [
@@ -2197,6 +2223,12 @@ export class ExtractionOrchestrator {
       lines.push(
         `Aviso: em ${incompleteHistories} conversa(s) as mensagens mais antigas do celular não terminaram de carregar; ` +
           'o histórico delas pode estar incompleto, e o motivo está na linha de cada uma.'
+      );
+    }
+    if (phoneOnlyHistories) {
+      lines.push(
+        `Aviso: em ${phoneOnlyHistories} conversa(s) o WhatsApp Web avisou que as mensagens mais antigas só estão no ` +
+          'celular e não vêm na exportação; a data do aviso, quando ele a traz, está na linha de cada uma, como o WhatsApp a mostra.'
       );
     }
     if (missingContactPhones) {
@@ -2234,7 +2266,7 @@ export class ExtractionOrchestrator {
       const rangeNote = hasUnconfirmedRange(result) ? DATE_RANGE_UNCONFIRMED_NOTE : '';
       const historyNote = hasIncompleteHistory(result)
         ? ` Aviso: histórico possivelmente incompleto (${describeIncompleteHistory(finalHistoryLoadOf(result), options.historyLimitMs)}).`
-        : '';
+        : (hasPhoneOnlyHistory(result) ? describePhoneOnlyHistory(finalHistoryLoadOf(result)) : '');
       const contactReason = missingContactPhoneReason(result);
       const contactNote = contactReason ? ` Aviso: telefone do contato não lido no painel (${contactReason}).` : '';
       lines.push(
