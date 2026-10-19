@@ -7,11 +7,17 @@
 import { ArchivePackager } from '../shared/archive/archive-packager.js';
 import { OFFSCREEN_ACTIONS, OFFSCREEN_TARGET } from '../shared/constants/actions.js';
 import { Logger } from '../shared/utils/logger.js';
+import { isFromExtensionPage } from '../shared/utils/message-sender.js';
 
 const log = new Logger('Offscreen');
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.target !== OFFSCREEN_TARGET) return false;
+  // Só o service worker pede o ZIP: um content script não chega ao staging nem à URL do ZIP por aqui
+  if (!isFromExtensionPage(sender)) {
+    sendResponse({ success: false, error: 'Origem não autorizada para o offscreen document.' });
+    return false;
+  }
 
   (async () => {
     try {

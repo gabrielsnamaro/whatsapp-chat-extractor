@@ -180,7 +180,7 @@ test('_execucao.log vai para a raiz do ZIP, e uma conversa chamada _execucao.log
   assert.equal(decoder.decode(files.get('_execucao.log_1/conversa.txt')), '[01/02/2026, 09:00:00] Ana: oi\n');
 });
 
-test('_indice.csv na raiz: BOM, ";", cabeçalho, pasta de cada conversa (vazia sem staging), apóstrofo antes de +, =, - e @ e aspas no campo com ";" ou aspas; uma conversa chamada _indice.csv vai para outra pasta', async () => {
+test('_indice.csv na raiz: BOM, ";", cabeçalho, pasta de cada conversa (vazia sem staging), apóstrofo antes de +, =, -, @, TAB e CR e aspas no campo com ";", aspas ou CR; uma conversa chamada _indice.csv vai para outra pasta', async () => {
   staging = stubStaging();
   await stage('000000', '+55 11 98765-4321', '[01/02/2026, 09:00:00] +55 11 98765-4321: oi\n', 'conversa.txt');
   await stage('000001', 'Ana; Bia "amigas"', '\n', 'conversa.txt');
@@ -205,7 +205,10 @@ test('_indice.csv na raiz: BOM, ";", cabeçalho, pasta de cada conversa (vazia s
       firstTimestamp: '06/02/2026, 08:00:00', lastTimestamp: '06/02/2026, 08:00:00', durationMs: 2500, via: 'rolagem da lista'
     }),
     row({ order: 5, title: '=SOMA(1;2)', status: 'NA PASTA DOWNLOADS', durationMs: 5100, via: 'lista visível' }),
-    row({ order: 6, title: '@Loja', status: 'NÃO EXPORTÁVEL', code: 'EXPORT_OPTION_UNAVAILABLE', durationMs: 1000 })
+    row({ order: 6, title: '@Loja', status: 'NÃO EXPORTÁVEL', code: 'EXPORT_OPTION_UNAVAILABLE', durationMs: 1000 }),
+    // O Excel descarta o TAB e o CR do início e leria o resto como fórmula
+    row({ order: 7, title: '\t=1+1', status: 'FALHA', code: 'TIMEOUT', durationMs: 1000 }),
+    row({ order: 8, title: '\r=1+1', status: 'FALHA', code: 'TIMEOUT', durationMs: 1000 })
   ];
 
   const { blob, check } = await ArchivePackager.build({ report: REPORT, expectedKeys: ['000000', '000001', '000003'], indexRows });
@@ -228,6 +231,8 @@ test('_indice.csv na raiz: BOM, ";", cabeçalho, pasta de cada conversa (vazia s
     '4;_indice.csv;_indice.csv_1;OK;;1;256;1;0;0;06/02/2026, 08:00:00;06/02/2026, 08:00:00;2,5;rolagem da lista',
     `5;"'=SOMA(1;2)";;NA PASTA DOWNLOADS;;1;;;;;;;5,1;lista visível`,
     "6;'@Loja;;NÃO EXPORTÁVEL;EXPORT_OPTION_UNAVAILABLE;1;;;;;;;1;",
+    "7;'\t=1+1;;FALHA;TIMEOUT;1;;;;;;;1;",
+    "8;\"'\r=1+1\";;FALHA;TIMEOUT;1;;;;;;;1;",
     ''
   ].join('\r\n')}`);
   assert.equal(decoder.decode(files.get('_indice.csv_1/conversa.txt')), '[06/02/2026, 08:00:00] Davi: oi\n');

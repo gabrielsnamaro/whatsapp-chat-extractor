@@ -38,6 +38,16 @@ const INDEX_COLUMNS = [
   'Anexos omitidos', 'Primeira data', 'Última data', 'Duração (s)', 'Abertura'
 ];
 
+// Início de um campo do _indice.csv que o Excel trataria como fórmula: além de +, =, - e @, o TAB e o CR, que ele
+// descarta antes de ler o resto
+const CSV_FORMULA_START_PATTERN = /^[+=\-@\t\r]/;
+
+// Marcas invisíveis de direção do texto: num nome de pasta, fazem o explorador de arquivos mostrar os caracteres em outra
+// ordem, e um nome pode se passar por outro
+const DIRECTION_MARKS_PATTERN = /[‎‏‪-‮⁦-⁩]/g;
+// Nomes de dispositivo do Windows, com ou sem extensão: uma pasta com um deles não é criada ao extrair o ZIP
+const WINDOWS_RESERVED_NAME_PATTERN = /^(con|prn|aux|nul|com[0-9¹²³]|lpt[0-9¹²³])(\..*)?$/i;
+
 /**
  * Nome de pasta seguro e único (sem diferenciar maiúsculas) para uma conversa dentro do ZIP
  * @param {string} title
@@ -45,10 +55,12 @@ const INDEX_COLUMNS = [
  * @returns {string}
  */
 export function buildUniqueFolderName(title, usedNames) {
-  const safeTitle = String(title || 'conversa')
+  const cleanTitle = String(title || 'conversa')
     .replace(/[\\/:*?"<>|\u0000-\u001F]/g, '_')
+    .replace(DIRECTION_MARKS_PATTERN, '')
     .replace(/[. ]+$/, '') // Windows não aceita pastas terminadas em ponto ou espaço
     .trim() || 'conversa';
+  const safeTitle = WINDOWS_RESERVED_NAME_PATTERN.test(cleanTitle) ? `${cleanTitle}_` : cleanTitle;
 
   let folderName = safeTitle;
   let counter = 1;
@@ -183,7 +195,7 @@ function buildCheckSection(check, { unreadable, unexpected, crcMismatch, json })
 }
 
 /**
- * Campo do _indice.csv. Um texto que começa com +, =, - ou @ ganha um apóstrofo na frente, porque o Excel o
+ * Campo do _indice.csv. Um texto que começa com +, =, -, @, TAB ou CR ganha um apóstrofo na frente, porque o Excel o
  * trataria como fórmula (a maioria dos títulos é telefone, "+55…"); com ;, aspas ou quebra de linha, vai
  * entre aspas, com as aspas dobradas.
  * @param {string|number|null|undefined} value
@@ -192,7 +204,7 @@ function buildCheckSection(check, { unreadable, unexpected, crcMismatch, json })
 function csvField(value) {
   if (value === null || value === undefined) return '';
   let text = String(value);
-  if (/^[+=\-@]/.test(text)) text = `'${text}`;
+  if (CSV_FORMULA_START_PATTERN.test(text)) text = `'${text}`;
   return /[;"\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
 }
 

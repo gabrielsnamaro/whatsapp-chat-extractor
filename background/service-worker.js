@@ -5,6 +5,7 @@
 import { ACTIONS } from '../shared/constants/actions.js';
 import { ExtractionOrchestrator } from './extraction-orchestrator.js';
 import { Logger } from '../shared/utils/logger.js';
+import { isFromWhatsAppTab, isFromExtensionPage } from '../shared/utils/message-sender.js';
 
 const log = new Logger('ServiceWorker');
 const orchestrator = new ExtractionOrchestrator();
@@ -19,24 +20,30 @@ const TRANSFER_ACTIONS = new Set([
   ACTIONS.EXPORT_TRANSFER_FAILED
 ]);
 
+// Comandos do popup: só valem vindos de uma página da extensão, e não de um content script
+const POPUP_ACTIONS = new Set([
+  ACTIONS.GET_WORKFLOW_STATE,
+  ACTIONS.START_BATCH_EXTRACTION,
+  ACTIONS.PAUSE_BATCH_EXTRACTION,
+  ACTIONS.RESUME_BATCH_EXTRACTION,
+  ACTIONS.CANCEL_BATCH_EXTRACTION
+]);
+
 chrome.runtime.onInstalled.addListener((details) => {
   log.info(`Extensão instalada/atualizada: ${details.reason}`);
 });
 
 /**
  * Mensagens sobre o arquivo exportado, a varredura e a visibilidade da aba só valem vindas do content script da aba do
- * WhatsApp Web
- */
-function isFromWhatsAppTab(sender) {
-  return Boolean(sender.tab?.url?.startsWith('https://web.whatsapp.com/'));
-}
-
-/**
+ * WhatsApp Web (isFromWhatsAppTab); os comandos do popup, de uma página da extensão (isFromExtensionPage)
  * @param {Object} message
  * @param {chrome.runtime.MessageSender} sender
  * @returns {Promise<Object>}
  */
 async function handleMessage(message, sender) {
+  if (POPUP_ACTIONS.has(message.action) && !isFromExtensionPage(sender)) {
+    return { success: false, error: 'Origem não autorizada para comandar a extração.' };
+  }
   if (TRANSFER_ACTIONS.has(message.action)) {
     if (!isFromWhatsAppTab(sender)) {
       return { success: false, error: 'Origem não autorizada para transferência de arquivo.' };

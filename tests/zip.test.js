@@ -106,6 +106,19 @@ test('nomes de pasta únicos, sem diferenciar maiúsculas, e seguros no Windows'
   assert.equal(buildUniqueFolderName('ana', used), 'ana_1');
   assert.equal(buildUniqueFolderName('Pai/Mãe: casa.', used), 'Pai_Mãe_ casa');
   assert.equal(buildUniqueFolderName('', used), 'conversa');
+  // Nomes de dispositivo do Windows, com ou sem extensão, ganham um "_"; os que só começam por um deles ficam
+  assert.equal(buildUniqueFolderName('CON', used), 'CON_');
+  assert.equal(buildUniqueFolderName('nul.txt', used), 'nul.txt_');
+  assert.equal(buildUniqueFolderName('Com1', used), 'Com1_');
+  assert.equal(buildUniqueFolderName('LPT¹', used), 'LPT¹_');
+  assert.equal(buildUniqueFolderName('aux.', used), 'aux_');
+  assert.equal(buildUniqueFolderName('CONSOLE', used), 'CONSOLE');
+  assert.equal(buildUniqueFolderName('Com10', used), 'Com10');
+  // Marcas invisíveis de direção do texto saem do nome: com elas, o nome apareceria em outra ordem no explorador de arquivos
+  assert.equal(buildUniqueFolderName('‪+55 11 98765-4321‬', used), '+55 11 98765-4321');
+  assert.equal(buildUniqueFolderName('foto‮gpj.exe', used), 'fotogpj.exe');
+  // Sem as marcas, é a mesma "Ana" de antes ("Ana" e "ana_1" já usados)
+  assert.equal(buildUniqueFolderName('⁨Ana⁩', used), 'Ana_2');
 });
 
 /** Posição no arquivo de cada entrada do diretório central (ZIP sem comentário e sem ZIP64) */

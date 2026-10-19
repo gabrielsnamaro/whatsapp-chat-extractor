@@ -211,7 +211,8 @@ export function createFakeChrome({ chats = [], ready = true, line = accountLine(
       sendMessage: async (message) => {
         runtimeMessages.push(structuredClone(message));
       },
-      onMessage: createEvent()
+      onMessage: createEvent(),
+      onInstalled: createEvent()
     },
 
     storage: {
