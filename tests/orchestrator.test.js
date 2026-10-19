@@ -2515,14 +2515,18 @@ test('_execucao.log: diagnóstico da abertura pela busca e pela rolagem no fim d
   const orch = createOrchestrator();
   const menuTimeout = 'Timeout de 15s aguardando o menu de opções da conversa.';
   const deliver = deliveringExport(orch, { failures: { Caio: { error: menuTimeout, code: 'TIMEOUT' } } });
-  // Como o content real: Bia abre pela busca; Caio, pela rolagem depois de a busca não achar, e falha no
-  // menu, e a falha traz o diagnóstico da abertura que a precedeu. Um campo que o orquestrador não conhece não é guardado
-  const searchDiagnostics = { searchMs: 1234, searchCellsSeen: 3, searchExited: true };
+  // Como o content real: Ana abre perto da posição estimada; Bia, pela busca, depois de não estar perto da posição
+  // estimada; Caio, pela rolagem depois de a busca não achar (com o estado da tela na busca sem resultado), e falha no menu,
+  // e a falha traz o diagnóstico da abertura que a precedeu. Um campo que o orquestrador não conhece não é guardado
+  const nearbyDiagnostics = { nearbyMs: 450, nearbyFound: true };
+  const searchDiagnostics = { nearbyMs: 520, nearbyFound: false, searchMs: 1234, searchCellsSeen: 3, searchExited: true };
   const scrollDiagnostics = {
-    searchMs: 8000, searchCellsSeen: 0, searchExited: false, scrollSteps: 12, scrollMs: 4321, scrollHeightGrew: true, scrollStopReason: 'found'
+    searchMs: 8000, searchCellsSeen: 21, searchExited: false, searchTyped: true, searchGridShown: true, searchFrames: 0,
+    windowFocused: false, scrollSteps: 12, scrollMs: 4321, scrollHeightGrew: true, scrollStopReason: 'found', scrollTitlesSeen: 140
   };
   fake.content.onExport = (message) => {
     const response = deliver(message);
+    if (message.chat.title === 'Ana') return { ...response, via: 'nearby', openDiagnostics: nearbyDiagnostics };
     if (message.chat.title === 'Bia') return { ...response, via: 'search', openDiagnostics: { ...searchDiagnostics, campoDeUmaVersaoFutura: 1 } };
     if (message.chat.title === 'Caio') return { ...response, openDiagnostics: scrollDiagnostics };
     return response;
@@ -2534,20 +2538,21 @@ test('_execucao.log: diagnóstico da abertura pela busca e pela rolagem no fim d
   const { results } = orch.run;
   // Só as tentativas cuja resposta trouxe o diagnóstico o guardam; Caio falha igual na repescagem
   assert.deepEqual(results.map((r) => r.history.map((entry) => entry.openDiagnostics ?? null)), [
-    [null],
+    [nearbyDiagnostics],
     [searchDiagnostics],
     [scrollDiagnostics, scrollDiagnostics]
   ]);
-  assert.equal('openDiagnostics' in results[0].history[0], false);
   assert.deepEqual(persistedRun(fake.snapshotStorage()).results.map((r) => r.history), results.map((r) => r.history));
 
   // Os campos de antes ficam na mesma posição; o diagnóstico vem depois do motivo
   const events = archive.calls[0].executionLog.split('\n').slice(6, -1);
-  const caioDiagnostics = 'busca: 8 s, 0 célula(s) de conversa no painel, saída não confirmada | ' +
-    'rolagem: 12 passo(s) em 4.3 s, lista cresceu: sim, parou: achou a conversa';
+  const caioDiagnostics = 'busca: 8 s, 21 célula(s) de conversa no painel, saída não confirmada, texto na caixa: sim, ' +
+    'lista normal na tela: sim, quadros desenhados: 0, janela com foco: não | ' +
+    'rolagem: 12 passo(s) em 4.3 s, lista cresceu: sim, parou: achou a conversa, títulos diferentes vistos: 140';
   assert.deepEqual(events.map(withoutClockAndDuration), [
-    'nº 1 "Ana" | tentativa 1 | <duração> | abertura: lista visível | OK',
-    'nº 2 "Bia" | tentativa 1 | <duração> | abertura: busca | OK | busca: 1.2 s, 3 célula(s) de conversa no painel, saída confirmada',
+    'nº 1 "Ana" | tentativa 1 | <duração> | abertura: posição estimada na lista | OK | posição estimada: achou em 0.5 s',
+    'nº 2 "Bia" | tentativa 1 | <duração> | abertura: busca | OK | posição estimada: não achou em 0.5 s | ' +
+      'busca: 1.2 s, 3 célula(s) de conversa no painel, saída confirmada',
     `nº 3 "Caio" | tentativa 1 | <duração> | abertura: não informada | FALHA (TIMEOUT) | motivo: ${menuTimeout} | ${caioDiagnostics}`,
     'Repescagem: rodada prevista para este horário (fim da espera; uma pausa a adia), com 1 conversa(s) que falharam na fila.',
     `nº 3 "Caio" | tentativa 2 | <duração> | abertura: não informada | FALHA (TIMEOUT) | motivo: ${menuTimeout} | ${caioDiagnostics}`

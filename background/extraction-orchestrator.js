@@ -81,14 +81,17 @@ const RESULT_LABELS = Object.freeze({
 const VIA_LABELS = Object.freeze({
   'already-open': 'já estava aberta',
   visible: 'lista visível',
+  nearby: 'posição estimada na lista',
   search: 'busca',
   scroll: 'rolagem da lista'
 });
 
-// Campos do diagnóstico da abertura que o content devolve quando a busca ou a rolagem rodaram
+// Campos do diagnóstico da abertura que o content devolve quando a posição estimada, a busca ou a rolagem rodaram
 // (OpenDiagnostics em content/dom/chat-navigator.js); só eles vão para o histórico da tentativa
 const OPEN_DIAGNOSTIC_KEYS = Object.freeze([
-  'searchMs', 'searchCellsSeen', 'searchExited', 'scrollSteps', 'scrollMs', 'scrollHeightGrew', 'scrollStopReason'
+  'nearbyMs', 'nearbyFound',
+  'searchMs', 'searchCellsSeen', 'searchExited', 'searchTyped', 'searchGridShown', 'searchFrames', 'windowFocused',
+  'scrollSteps', 'scrollMs', 'scrollHeightGrew', 'scrollStopReason', 'scrollTitlesSeen'
 ]);
 
 // Por que a rolagem de abertura parou, pelo `scrollStopReason` do diagnóstico ('found' e os LOCATE_FAILURES
@@ -318,26 +321,50 @@ function compactOpenDiagnostics(raw) {
   return entries.length ? Object.fromEntries(entries) : null;
 }
 
+/** @param {boolean} value */
+function yesNo(value) {
+  return value ? 'sim' : 'não';
+}
+
 /**
- * Trechos da linha de uma tentativa no log da execução com o diagnóstico da abertura: a busca (células
- * na lista quando ela achou a conversa ou esgotou o prazo, tempo e se a saída dela foi confirmada) e a
- * rolagem (passos, tempo, se a lista cresceu e por que parou)
+ * Trechos da linha de uma tentativa no log da execução com o diagnóstico da abertura: a posição estimada (se achou a
+ * conversa e o tempo), a busca (células na lista quando ela achou a conversa ou esgotou o prazo, tempo, se a saída dela foi
+ * confirmada e, sem resultado, o estado da tela) e a rolagem (passos, tempo, se a lista cresceu, por que parou e quantos
+ * títulos passaram pela lista)
  * @param {Object} diagnostics Diagnóstico compacto (compactOpenDiagnostics)
  * @returns {string[]}
  */
 function describeOpenDiagnostics(diagnostics) {
-  const { searchMs, searchCellsSeen, searchExited, scrollSteps, scrollMs, scrollHeightGrew, scrollStopReason } = diagnostics;
+  const {
+    nearbyMs, nearbyFound, searchMs, searchCellsSeen, searchExited, searchTyped, searchGridShown, searchFrames, windowFocused,
+    scrollSteps, scrollMs, scrollHeightGrew, scrollStopReason, scrollTitlesSeen
+  } = diagnostics;
   const parts = [];
+  if (nearbyMs != null) {
+    parts.push(`posição estimada: ${nearbyFound ? 'achou' : 'não achou'} em ${formatSeconds(nearbyMs)}`);
+  }
   if (searchMs != null) {
     const exit = searchExited == null ? '' : `, saída ${searchExited ? 'confirmada' : 'não confirmada'}`;
+    // Só na busca sem resultado: o que separa o texto que não chegou à caixa, a busca que não começou e a página que o
+    // navegador deixou de desenhar (0 quadros)
+    const stalled = [
+      searchTyped == null ? null : `texto na caixa: ${yesNo(searchTyped)}`,
+      searchGridShown == null ? null : `lista normal na tela: ${yesNo(searchGridShown)}`,
+      searchFrames == null ? null : `quadros desenhados: ${searchFrames}`,
+      windowFocused == null ? null : `janela com foco: ${yesNo(windowFocused)}`
+    ].filter(Boolean);
     // Conta as células de conversa no painel lateral ao fim da busca: sem um snapshot da tela de busca, não dá
     // para separar resultado da busca de linha da lista normal que tenha ficado na tela
-    parts.push(`busca: ${formatSeconds(searchMs)}, ${searchCellsSeen} célula(s) de conversa no painel${exit}`);
+    parts.push(
+      `busca: ${formatSeconds(searchMs)}, ${searchCellsSeen} célula(s) de conversa no painel${exit}` +
+        (stalled.length ? `, ${stalled.join(', ')}` : '')
+    );
   }
   if (scrollSteps != null) {
     const stop = OPEN_SCROLL_STOP_LABELS[scrollStopReason] ?? `motivo desconhecido (${scrollStopReason})`;
+    const titles = scrollTitlesSeen == null ? '' : `, títulos diferentes vistos: ${scrollTitlesSeen}`;
     parts.push(
-      `rolagem: ${scrollSteps} passo(s) em ${formatSeconds(scrollMs)}, lista cresceu: ${scrollHeightGrew ? 'sim' : 'não'}, parou: ${stop}`
+      `rolagem: ${scrollSteps} passo(s) em ${formatSeconds(scrollMs)}, lista cresceu: ${yesNo(scrollHeightGrew)}, parou: ${stop}${titles}`
     );
   }
   return parts;

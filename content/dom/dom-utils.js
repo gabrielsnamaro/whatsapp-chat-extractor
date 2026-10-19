@@ -1,8 +1,8 @@
 /**
  * DomUtils
  * Responsabilidade Única: Utilitários compartilhados pelas classes de automação DOM
- * (seletores, códigos de erro, esperas com timeout/cancelamento, clique simulado e leitura de títulos, telefones e do aviso
- * de mensagens mais antigas).
+ * (seletores, códigos de erro, esperas com timeout/cancelamento, clique simulado, leitura de títulos, telefones e do aviso
+ * de mensagens mais antigas, e a contagem dos quadros que a página desenha).
  *
  * Content scripts clássicos não importam módulos ES, por isso o compartilhamento é via window.
  * Deve ser o primeiro arquivo da lista de content scripts no manifest.
@@ -347,6 +347,45 @@
     return Math.max(0, Math.floor(index * rowHeight - viewportHeight));
   }
 
+  /**
+   * Posição da lista lateral para a tentativa de achar a conversa perto de onde ela estava na varredura, antes da busca: a
+   * linha estimada (posição na fila × altura de uma linha) fica `rowsAbove` linhas abaixo do topo da tela. A folga é
+   * pequena porque, durante a extração, a conversa tende a descer na lista (cada conversa de baixo que recebe mensagem sobe
+   * para o topo e a empurra uma linha), e quase nunca a subir. Não toca no DOM, para ser testada no Node.
+   * @param {{ index: number, rowHeight: number, rowsAbove: number }} params
+   * @returns {number} scrollTop, nunca negativo
+   */
+  function estimateNearbyTop({ index, rowHeight, rowsAbove }) {
+    for (const [name, value] of Object.entries({ index, rowHeight, rowsAbove })) {
+      if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+        throw new Error(`Valor inválido para estimar a posição da conversa na lista: ${name} = ${String(value)}`);
+      }
+    }
+    return Math.max(0, Math.floor((index - rowsAbove) * rowHeight));
+  }
+
+  /**
+   * Conta os quadros que a página desenha (requestAnimationFrame) a partir de agora. Com a aba oculta, ou quando o
+   * navegador deixa de desenhar a página por outro motivo, nenhum quadro é contado: a lista virtual e a busca da lista
+   * lateral dependem do desenho para mudar na tela
+   * @returns {function(): (number|null)} Para a contagem e devolve os quadros contados; null sem requestAnimationFrame
+   */
+  function countAnimationFrames() {
+    if (typeof requestAnimationFrame !== 'function') return () => null;
+    let frames = 0;
+    let counting = true;
+    const tick = () => {
+      if (!counting) return;
+      frames++;
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+    return () => {
+      counting = false;
+      return frames;
+    };
+  }
+
   function throwIfAborted(signal) {
     if (signal?.aborted) throw new OperationCancelledError();
   }
@@ -525,6 +564,8 @@
     classifyHistoryNotice,
     buildChatNotFoundMessage,
     estimateScrollStart,
+    estimateNearbyTop,
+    countAnimationFrames,
     throwIfAborted,
     sleep,
     waitFor,

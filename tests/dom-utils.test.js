@@ -9,7 +9,8 @@ import { phoneFromTitle } from '../shared/utils/phone.js';
 const context = vm.createContext({ window: {} });
 vm.runInContext(readFileSync(new URL('../content/dom/dom-utils.js', import.meta.url), 'utf8'), context);
 const {
-  isTitleMatch, normalizeTitle, buildChatNotFoundMessage, estimateScrollStart, waitFor, extractPhoneDigits, chooseDrawerPhone,
+  isTitleMatch, normalizeTitle, buildChatNotFoundMessage, estimateScrollStart, estimateNearbyTop, countAnimationFrames, waitFor,
+  extractPhoneDigits, chooseDrawerPhone,
   classifyHistoryNotice, ERROR_CODES, LOCATE_FAILURES, TIMEOUTS, HISTORY_NOTICE_KINDS, HISTORY_LOAD_REASONS, DomAutomationError,
   OperationTimeoutError
 } = context.window.DomUtils;
@@ -114,6 +115,39 @@ test('rolagem de abertura começa uma tela acima da linha estimada, nunca antes 
   ]) {
     assert.throws(() => estimateScrollStart(params), /^Error: Valor inválido para estimar a posição da conversa na lista: /);
   }
+});
+
+test('tentativa perto da posição estimada: a linha estimada fica as linhas pedidas abaixo do topo da tela, nunca antes do topo', () => {
+  assert.equal(estimateNearbyTop({ index: 110, rowHeight: 72, rowsAbove: 1 }), 109 * 72);
+  assert.equal(estimateNearbyTop({ index: 0, rowHeight: 72, rowsAbove: 1 }), 0);
+  assert.equal(estimateNearbyTop({ index: 1, rowHeight: 72, rowsAbove: 1 }), 0);
+  assert.equal(estimateNearbyTop({ index: 3, rowHeight: 72.5, rowsAbove: 0 }), 217);
+
+  for (const params of [
+    { index: -1, rowHeight: 72, rowsAbove: 1 },
+    { index: 5, rowHeight: Number.NaN, rowsAbove: 1 },
+    { index: 5, rowHeight: 72, rowsAbove: undefined }
+  ]) {
+    assert.throws(() => estimateNearbyTop(params), /^Error: Valor inválido para estimar a posição da conversa na lista: /);
+  }
+});
+
+test('quadros desenhados: conta os do requestAnimationFrame até parar, e sem ele devolve null', () => {
+  const callbacks = [];
+  const withFrames = vm.createContext({ window: {}, requestAnimationFrame: (callback) => callbacks.push(callback) });
+  vm.runInContext(readFileSync(new URL('../content/dom/dom-utils.js', import.meta.url), 'utf8'), withFrames);
+  const stop = withFrames.window.DomUtils.countAnimationFrames();
+  // Cada quadro desenhado roda o callback pendente, que pede o seguinte
+  for (let frame = 0; frame < 3; frame++) callbacks.shift()();
+  assert.equal(stop(), 3);
+  // Depois de parar, um quadro pendente não conta nem pede outro
+  callbacks.shift()();
+  assert.equal(callbacks.length, 0);
+
+  // A página que não desenha nada: nenhum quadro
+  assert.equal(withFrames.window.DomUtils.countAnimationFrames()(), 0);
+  // No contexto sem requestAnimationFrame
+  assert.equal(countAnimationFrames()(), null);
 });
 
 test('motivo ou tentativa desconhecidos lançam erro em vez de sair na mensagem', () => {

@@ -6,8 +6,8 @@
 (function registerChatNavigator() {
   const {
     SELECTORS, TIMEOUTS, ERROR_CODES, LOCATE_FAILURES, OperationTimeoutError, DomAutomationError,
-    buildChatNotFoundMessage, estimateScrollStart, waitFor, sleep, throwIfAborted, simulateClick, pressEscape,
-    isVisible, readTextWithEmojis, readCellTitle, isTitleMatch
+    buildChatNotFoundMessage, estimateScrollStart, estimateNearbyTop, countAnimationFrames, waitFor, sleep, throwIfAborted,
+    simulateClick, pressEscape, isVisible, readTextWithEmojis, readCellTitle, normalizeTitle, isTitleMatch
   } = window.DomUtils;
 
   // Motivo da parada da rolagem de abertura que achou a conversa, no diagnóstico, ao lado dos
@@ -20,16 +20,31 @@
   // arredondamento de cada descida e a lista que muda um pouco durante a rolagem (~4 s com a espera de 200 ms)
   const OPEN_SCROLL_STEP_SLACK = 20;
 
+  // Tentativa perto da posição estimada, antes da busca: a linha estimada fica uma linha abaixo do topo da tela, e, sem
+  // achar a conversa ali, a lista desce mais um passo (estimateNearbyTop)
+  const NEARBY_ROWS_ABOVE = 1;
+  const NEARBY_EXTRA_STEPS = 1;
+
   /**
-   * @typedef {Object} OpenDiagnostics Como foi uma abertura que precisou da busca e/ou da rolagem; só traz os
-   *   campos da fase que rodou
+   * @typedef {Object} OpenDiagnostics Como foi uma abertura que precisou da posição estimada, da busca e/ou da rolagem; só
+   *   traz os campos da fase que rodou
+   * @property {number} [nearbyMs] Da ida à posição estimada da conversa na lista até achá-la, ou até desistir dela
+   * @property {boolean} [nearbyFound] A conversa estava perto da posição estimada
    * @property {number} [searchMs] Da busca digitada até a conversa aparecer, ou até o prazo esgotar
    * @property {number} [searchCellsSeen] Células de conversa na lista lateral nesse momento
    * @property {boolean} [searchExited] A lista normal voltou depois de sair da busca (exitSearch)
+   * @property {boolean} [searchTyped] Só na busca sem resultado: a caixa tinha o título digitado quando o prazo esgotou
+   * @property {boolean} [searchGridShown] Só na busca sem resultado: a grade da lista normal continuava na tela, como se
+   *   a busca não tivesse começado
+   * @property {number} [searchFrames] Só na busca sem resultado: quadros que a página desenhou durante a espera (0 quando o
+   *   navegador deixou de desenhá-la); ausente sem requestAnimationFrame
+   * @property {boolean} [windowFocused] Só na busca sem resultado: a janela da aba tinha o foco quando o prazo esgotou
    * @property {number} [scrollSteps] Passos em que a lista andou, nas duas descidas somadas
    * @property {number} [scrollMs] Duração da rolagem inteira
    * @property {boolean} [scrollHeightGrew] A altura da lista aumentou durante a rolagem
    * @property {string} [scrollStopReason] SCROLL_FOUND ou o LOCATE_FAILURES da rolagem
+   * @property {number} [scrollTitlesSeen] Títulos diferentes que passaram pela lista durante a rolagem: perto do número de
+   *   linhas de uma tela quando a lista virtual não redesenhou as linhas ao rolar
    */
 
   class ChatNavigator {
@@ -38,6 +53,7 @@
      * @param {Object} [options.timeouts] Sobrescrita dos timeouts padrão (ms): `openChatMs`, `searchResultsMs`,
      *   `openScrollMs` (teto da rolagem de abertura) e `searchExitMs` (espera da lista normal depois da busca)
      * @param {number} [options.scrollDelayMs=200] Espera de renderização da lista virtual a cada passo
+     * @param {number} [options.jumpRenderMs=300] Espera de renderização da lista virtual depois de um salto da rolagem
      */
     constructor(options = {}) {
       this.timeouts = {
@@ -48,6 +64,7 @@
         ...options.timeouts
       };
       this.scrollDelayMs = options.scrollDelayMs ?? 200;
+      this.jumpRenderMs = options.jumpRenderMs ?? 300;
     }
 
     /**
@@ -238,6 +255,7 @@
       // não veria mudança e não refaria a busca
       if (this._readSearchText(input)) this._setSearchText(input, '');
       const startedAt = Date.now();
+      const stopFrameCount = countAnimationFrames();
       this._setSearchText(input, targetTitle);
       const measure = () => ({ searchMs: Date.now() - startedAt, searchCellsSeen: this._countSideCells() });
       try {
@@ -249,10 +267,14 @@
             signal
           }
         );
+        stopFrameCount();
         return { cell, failure: null, diagnostics: measure() };
       } catch (err) {
+        const frames = stopFrameCount();
         if (!(err instanceof OperationTimeoutError)) throw err;
-        const diagnostics = measure();
+        // O que separa as causas de uma busca sem resultado: o texto não chegou à caixa, a busca não começou (a lista normal
+        // continuou na tela) ou o navegador deixou de desenhar a página
+        const diagnostics = { ...measure(), ...this._describeStalledSearch(targetTitle), ...(frames === null ? {} : { searchFrames: frames }) };
         // Antes da rolagem: no modo de busca, ela rolaria os resultados, e não a lista de conversas
         diagnostics.searchExited = await this.exitSearch({ signal });
         return {
@@ -261,6 +283,57 @@
           diagnostics
         };
       }
+    }
+
+    /**
+     * Estado da lista lateral quando a busca esgota o prazo sem resultado
+     * @private
+     * @param {string} targetTitle
+     * @returns {{ searchTyped: boolean, searchGridShown: boolean, windowFocused: boolean }}
+     */
+    _describeStalledSearch(targetTitle) {
+      const input = this._findSearchInput();
+      return {
+        searchTyped: Boolean(input) && normalizeTitle(this._readSearchText(input)) === normalizeTitle(targetTitle),
+        searchGridShown: isVisible(document.querySelector(SELECTORS.CHAT_LIST_GRID)),
+        windowFocused: document.hasFocus()
+      };
+    }
+
+    /**
+     * Tenta achar a conversa perto de onde ela estava na varredura, antes da busca: leva a lista até a posição estimada
+     * (posição na fila × altura de uma linha; estimateNearbyTop) e, sem achar ali, desce mais um passo. Depois de uma
+     * abertura pela busca, a lista lateral volta ao topo, e sem isto todas as conversas seguintes da fila, que já não
+     * estavam na tela, iam para a busca (+0,8 s cada; na execução de 16/10/2026, da nº 111 até a última). A conversa achada
+     * aqui deixa a lista no ponto da fila, e as seguintes voltam a ser achadas na tela.
+     * @private
+     * @param {string} targetTitle
+     * @param {Object} [params]
+     * @param {number} [params.queueIndex] Posição da conversa na fila da varredura
+     * @param {AbortSignal} [params.signal]
+     * @returns {Promise<{ cell: HTMLElement|null, diagnostics: OpenDiagnostics }|null>} null quando a tentativa não roda:
+     *   sem a posição na fila, sem a lista ou sem uma linha com altura para medir
+     */
+    async _locateCellNearEstimate(targetTitle, { queueIndex, signal } = {}) {
+      if (!Number.isInteger(queueIndex) || queueIndex < 0) return null;
+      const pane = document.querySelector(SELECTORS.PANE_SIDE);
+      if (!pane) return null;
+      const rowHeight = this._measureRowHeight(pane);
+      if (!(rowHeight > 0)) return null;
+
+      const startedAt = Date.now();
+      pane.scrollTop = estimateNearbyTop({ index: queueIndex, rowHeight, rowsAbove: NEARBY_ROWS_ABOVE });
+      await sleep(this.jumpRenderMs, signal);
+      let cell = this.findVisibleCellByTitle(targetTitle);
+      for (let step = 0; !cell && step < NEARBY_EXTRA_STEPS; step++) {
+        const previousTop = pane.scrollTop;
+        pane.scrollTop += this._scrollStepOf(pane);
+        // No fim da lista não há mais o que descer
+        if (pane.scrollTop === previousTop) break;
+        await sleep(this.scrollDelayMs, signal);
+        cell = this.findVisibleCellByTitle(targetTitle);
+      }
+      return { cell, diagnostics: { nearbyMs: Date.now() - startedAt, nearbyFound: Boolean(cell) } };
     }
 
     /**
@@ -277,6 +350,20 @@
         if (height > 0) return height;
       }
       return 0;
+    }
+
+    /**
+     * Junta os títulos das conversas desenhadas agora na lista, para o diagnóstico da rolagem
+     * @private
+     * @param {HTMLElement} pane
+     * @param {Set<string>} titles Atualizado aqui, com os títulos normalizados
+     */
+    _collectTitles(pane, titles) {
+      for (const cell of pane.querySelectorAll(SELECTORS.CHAT_CELL)) {
+        if (cell.closest(SELECTORS.ARCHIVED_BUTTON)) continue;
+        const title = normalizeTitle(readCellTitle(cell));
+        if (title) titles.add(title);
+      }
     }
 
     /**
@@ -322,7 +409,8 @@
         deadline: startedAt + this.timeouts.openScrollMs,
         maxSteps: 2 * Math.ceil(initialScrollHeight / this._scrollStepOf(pane)) + OPEN_SCROLL_STEP_SLACK,
         steps: 0,
-        maxScrollHeight: initialScrollHeight
+        maxScrollHeight: initialScrollHeight,
+        titlesSeen: new Set()
       };
       const finish = ({ cell, failure }) => ({
         cell,
@@ -331,7 +419,8 @@
           scrollSteps: budget.steps,
           scrollMs: Date.now() - startedAt,
           scrollHeightGrew: budget.maxScrollHeight > initialScrollHeight,
-          scrollStopReason: cell ? SCROLL_FOUND : failure.reason
+          scrollStopReason: cell ? SCROLL_FOUND : failure.reason,
+          scrollTitlesSeen: budget.titlesSeen.size
         }
       });
 
@@ -354,14 +443,14 @@
      * @param {HTMLElement} pane
      * @param {number} startTop
      * @param {string} targetTitle
-     * @param {{ deadline: number, maxSteps: number, steps: number, maxScrollHeight: number }} budget Tetos e
-     *   contagem da rolagem inteira (as duas descidas), atualizada aqui
+     * @param {{ deadline: number, maxSteps: number, steps: number, maxScrollHeight: number, titlesSeen: Set<string> }} budget
+     *   Tetos e contagem da rolagem inteira (as duas descidas), atualizada aqui
      * @param {AbortSignal} [signal]
      * @returns {Promise<{ cell: HTMLElement|null, failure: Object|null }>}
      */
     async _scrollDownFrom(pane, startTop, targetTitle, budget, signal) {
       pane.scrollTop = startTop;
-      await sleep(300, signal);
+      await sleep(this.jumpRenderMs, signal);
       budget.maxScrollHeight = Math.max(budget.maxScrollHeight, pane.scrollHeight);
 
       const step = this._scrollStepOf(pane);
@@ -370,6 +459,7 @@
 
       while (true) {
         throwIfAborted(signal);
+        this._collectTitles(pane, budget.titlesSeen);
         const cell = this.findVisibleCellByTitle(targetTitle);
         if (cell) return { cell, failure: null };
 
@@ -413,8 +503,9 @@
      * @param {string} [chat.title]
      * @param {Object} [params]
      * @param {AbortSignal} [params.signal]
-     * @param {number} [params.queueIndex] Posição da conversa na fila da varredura, para a rolagem começar perto dela
-     * @returns {Promise<{ success: boolean, title: string, via: string, diagnostics: OpenDiagnostics|null }>}
+     * @param {number} [params.queueIndex] Posição da conversa na fila da varredura, para procurá-la perto de onde ela
+     *   estava, antes da busca, e para a rolagem começar perto dela
+     * @returns {Promise<{ success: boolean, title: string, via: 'already-open'|'visible'|'nearby'|'search'|'scroll', diagnostics: OpenDiagnostics|null }>}
      */
     async openChat(chat, { signal, queueIndex } = {}) {
       const targetTitle = typeof chat === 'string' ? chat : chat?.title;
@@ -433,7 +524,8 @@
         return { success: true, title: targetTitle, via: 'already-open', diagnostics: null };
       }
 
-      // 3. Localiza a célula: visível agora → busca → rolagem da lista (perto da posição estimada, depois inteira)
+      // 3. Localiza a célula: visível agora → perto da posição estimada → busca → rolagem da lista (a partir de uma tela
+      // acima da posição estimada, depois inteira)
       let via = 'visible';
       /** @type {OpenDiagnostics} */
       const diagnostics = {};
@@ -442,6 +534,16 @@
       try {
         let cellElement = this.findVisibleCellByTitle(targetTitle);
         const failedAttempts = [];
+        if (!cellElement) {
+          const nearby = await this._locateCellNearEstimate(targetTitle, { queueIndex, signal });
+          if (nearby) {
+            Object.assign(diagnostics, nearby.diagnostics);
+            if (nearby.cell) {
+              via = 'nearby';
+              cellElement = nearby.cell;
+            }
+          }
+        }
         if (!cellElement) {
           via = 'search';
           const search = await this._locateCellViaSearch(targetTitle, signal);
