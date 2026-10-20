@@ -2465,7 +2465,8 @@ export class ExtractionOrchestrator {
       const pausedMs = tabHiddenPauses.reduce((total, pause) => total + pauseDurationOf(pause), 0);
       lines.push(
         `Pausas por aba oculta: ${tabHiddenPauses.length}, somando ${formatPauseDuration(pausedMs)}. A extração pausou ` +
-          `sozinha com a aba do WhatsApp Web em segundo plano; o horário de cada pausa está no ${EXECUTION_LOG_FILENAME}.`
+          'sozinha com a aba do WhatsApp Web fora da tela (outra aba na frente, ou a janela minimizada ou coberta por outra); ' +
+          `o horário de cada pausa está no ${EXECUTION_LOG_FILENAME}.`
       );
     }
     lines.push('');

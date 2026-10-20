@@ -4301,7 +4301,7 @@ const TAB_VISIBLE_AGAIN_INFO = new RegExp(
 function tabHiddenPausesHeader(count) {
   return new RegExp(
     `^Pausas por aba oculta: ${count}, somando ${PAUSE_DURATION}\\. A extração pausou sozinha com a aba do WhatsApp Web ` +
-      'em segundo plano; o horário de cada pausa está no _execucao\\.log\\.$'
+      'fora da tela \\(outra aba na frente, ou a janela minimizada ou coberta por outra\\); o horário de cada pausa está no _execucao\\.log\\.$'
   );
 }
 
