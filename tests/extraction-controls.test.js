@@ -323,11 +323,12 @@ test('o campo do número da linha fica desabilitado durante a execução e na pa
 
 // Avisos fixos do popup, à vista antes de iniciar
 
-test('o popup mostra, antes do botão de iniciar, o aviso de manter a aba do WhatsApp Web visível, ao lado do de leitura', () => {
+test('o popup mostra, antes do botão de iniciar, o aviso de manter a aba do WhatsApp Web à vista, sem minimizar nem cobrir a janela, ao lado do de leitura', () => {
   const html = readFileSync(new URL('../popup/popup.html', import.meta.url), 'utf8');
   const startButtonAt = html.indexOf('id="btn-start-batch"');
-  const visibilityNotice = '<p class="tab-visibility-notice">Mantenha a aba do WhatsApp Web visível durante a extração ' +
-    '(pode ser numa janela separada, sem minimizar). Se ela ficar oculta, a extração pausa e continua quando a aba voltar.</p>';
+  const visibilityNotice = '<p class="tab-visibility-notice">Mantenha a aba do WhatsApp Web à vista durante a extração: pode ' +
+    'ser numa janela separada, mas sem minimizar e sem outra janela por cima dela. Se ela sair da tela, a extração pausa e ' +
+    'continua quando ela voltar a aparecer.</p>';
   const visibilityNoticeAt = html.indexOf(visibilityNotice);
   const readReceiptNoticeAt = html.indexOf('<p class="read-receipt-notice">');
 

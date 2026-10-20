@@ -2,7 +2,7 @@
  * Content Script (Injetado em https://web.whatsapp.com/*)
  * Atua estritamente como Mediador de Mensagens entre o Background/Popup da extensão
  * e os controladores especializados de DOM (ChatListScanner, ChatNavigator, HistoryLoader, ContactInfoReader,
- * ChatOptionsMenu, ExportModalHandler).
+ * ChatOptionsMenu, ExportModalHandler) e do RenderWatch, que percebe a página que deixou de ser desenhada.
  */
 
 (function initWhatsAppContentMediator() {
@@ -50,21 +50,39 @@
    */
   const operationsWithHiddenTab = new WeakSet();
 
+  /**
+   * A página que deixa de ser desenhada com a aba tida como visível (janela minimizada ou coberta, no Wayland) conta como
+   * aba oculta: a operação em andamento fica marcada, e o background é avisado, como no visibilitychange
+   */
+  const renderWatch = new window.RenderWatch({
+    onChange: (stalled) => {
+      if (!isActiveInstance()) return;
+      if (stalled && currentOperation) operationsWithHiddenTab.add(currentOperation);
+      console.warn(`[WhatsApp Web Extractor] A página ${stalled ? 'deixou de ser desenhada (janela minimizada ou coberta)' : 'voltou a ser desenhada'}.`);
+      reportTabVisibility();
+    }
+  });
+
   console.log('[WhatsApp Web Extractor] Mediador de Content Script inicializado.');
 
   function isTabVisible() {
-    return document.visibilityState === 'visible';
+    return document.visibilityState === 'visible' && !renderWatch.stalled;
   }
 
   function beginOperation() {
     currentOperation?.abort();
     currentOperation = new AbortController();
     if (!isTabVisible()) operationsWithHiddenTab.add(currentOperation);
+    // Os quadros só são contados durante a varredura e a exportação: pedir um quadro a cada desenho mantém a página sendo
+    // desenhada, o que fora da extração só gastaria processamento
+    renderWatch.start();
     return currentOperation;
   }
 
   function endOperation(operation) {
-    if (currentOperation === operation) currentOperation = null;
+    if (currentOperation !== operation) return;
+    currentOperation = null;
+    renderWatch.stop();
   }
 
   /**

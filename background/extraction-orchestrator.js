@@ -49,14 +49,16 @@ const PAUSABLE_STATES = [WORKFLOW_STATES.SCANNING, WORKFLOW_STATES.EXPORTING, WO
 const FINAL_STATES = new Set([WORKFLOW_STATES.COMPLETED, WORKFLOW_STATES.CANCELLED, WORKFLOW_STATES.FAILED]);
 
 // Com a aba do WhatsApp Web oculta (outra aba na frente ou janela minimizada), o Chrome roda os temporizadores dela no
-// máximo uma vez por minuto e não redesenha a página: as esperas da automação estouram, e as conversas falhavam por isso
-const TAB_HIDDEN_PAUSE_MESSAGE = 'A aba do WhatsApp Web ficou em segundo plano. O Chrome deixa abas ocultas lentas, ' +
-  'então a extração pausou e continua sozinha quando a aba voltar a ficar visível.';
+// máximo uma vez por minuto e não redesenha a página: as esperas da automação estouram, e as conversas falhavam por isso.
+// No Wayland, a janela minimizada ou coberta por outra também para de ser desenhada, e o content a trata como oculta
+const TAB_HIDDEN_PAUSE_MESSAGE = 'A aba do WhatsApp Web saiu da tela (outra aba na frente, ou a janela minimizada ou ' +
+  'coberta por outra). O Chrome deixa de atualizar a página assim, então a extração pausou e continua sozinha quando ela ' +
+  'voltar a aparecer.';
 // Depois de um reinício do service worker, a pausa da aba oculta não continua sozinha: a execução volta pausada, como as outras
 const TAB_HIDDEN_PAUSE_RESTORED_MESSAGE = 'A extração estava pausada com a aba do WhatsApp Web oculta e foi interrompida ' +
   'pelo navegador. Deixe a aba visível e clique em "Retomar" para continuar de onde parou.';
-const TAB_HIDDEN_PAUSE_LOG_TEXT = 'Pausa: a aba do WhatsApp Web ficou oculta (outra aba na frente ou janela minimizada), ' +
-  'e a extração parou até ela voltar a ficar visível.';
+const TAB_HIDDEN_PAUSE_LOG_TEXT = 'Pausa: a aba do WhatsApp Web saiu da tela (outra aba na frente, ou a janela minimizada ' +
+  'ou coberta por outra), e a extração parou até ela voltar a aparecer.';
 
 // Quem encerrou uma pausa da aba oculta: a volta da aba ou o "Retomar" do usuário (também numa execução restaurada)
 const TAB_HIDDEN_PAUSE_ENDINGS = Object.freeze({ TAB_VISIBLE: 'tab_visible', USER: 'user' });
@@ -209,7 +211,8 @@ const HISTORY_LOAD_REASONS = Object.freeze({
 const INCOMPLETE_HISTORY_REASONS = new Set([HISTORY_LOAD_REASONS.TIME_LIMIT, HISTORY_LOAD_REASONS.STALLED]);
 
 // Data do aviso "Use o WhatsApp no seu celular para ver mensagens enviadas e recebidas antes de <data>", como o content a
-// devolve (com o mês primeiro, ex: "6/26/2026"); outro texto não vai ao log
+// devolve: como o WhatsApp Web a escreve, com o dia ou o mês primeiro ("21/07/2026", "6/26/2026"); outro texto não vai ao
+// relatório nem ao log
 const HISTORY_NOTICE_DATE_PATTERN = /^\d{1,2}\/\d{1,2}\/\d{2,4}$/;
 
 class RunCancelledError extends Error {
@@ -271,7 +274,7 @@ function describeTabHiddenPauseEnd(pause) {
   const duration = formatPauseDuration(pauseDurationOf(pause));
   return pause.resumedBy === TAB_HIDDEN_PAUSE_ENDINGS.USER
     ? `Retomada pelo usuário ("Retomar"), depois de ${duration} de pausa com a aba oculta.`
-    : `Retomada: a aba voltou a ficar visível, depois de ${duration} de pausa.`;
+    : `Retomada: a aba voltou a aparecer, depois de ${duration} de pausa.`;
 }
 
 /**
@@ -1415,10 +1418,10 @@ export class ExtractionOrchestrator {
   /** @private */
   _resumeAfterHiddenTab() {
     const pausedMs = this._endTabHiddenPause(TAB_HIDDEN_PAUSE_ENDINGS.TAB_VISIBLE);
-    log.info('Extração retomada: a aba do WhatsApp Web voltou a ficar visível.');
+    log.info('Extração retomada: a aba do WhatsApp Web voltou a aparecer.');
     this._continueAfterPause();
     this._notifyProgress({
-      infoMessage: `A aba do WhatsApp Web voltou a ficar visível: a extração continua, depois de ${formatPauseDuration(pausedMs)} de pausa.`
+      infoMessage: `A aba do WhatsApp Web voltou a aparecer: a extração continua, depois de ${formatPauseDuration(pausedMs)} de pausa.`
     });
   }
 

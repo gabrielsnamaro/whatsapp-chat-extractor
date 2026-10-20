@@ -27,7 +27,7 @@
    * @property {number} ms Tempo da carga inteira
    * @property {string} reason Como ela terminou: um dos DomUtils.HISTORY_LOAD_REASONS
    * @property {string} [before] Com o reason 'phone-only' e a data no aviso: as mensagens anteriores a ela só estão no
-   *   celular (a data como o WhatsApp Web a escreve, com o mês primeiro)
+   *   celular (a data como o WhatsApp Web a escreve, com o dia ou o mês primeiro)
    */
 
   /**

@@ -155,8 +155,8 @@
     STALLED: 'stalled'
   });
 
-  // Textos dos avisos do topo do painel de mensagens. A data do "só no celular" vem como o WhatsApp Web a escreve, com o
-  // mês primeiro (ex: "6/26/2026"), como no texto exportado
+  // Textos dos avisos do topo do painel de mensagens. A data do "só no celular" vem como o WhatsApp Web a escreve, e a
+  // ordem do dia e do mês muda: "6/26/2026" num snapshot da kb/, "21/07/2026" no WhatsApp real em 19/10/2026
   const HISTORY_LOAD_NOTICE_PATTERN = /carregar mensagens mais antigas/i;
   const HISTORY_PHONE_ONLY_NOTICE_PATTERN = /use o whatsapp no seu celular para ver mensagens/i;
   const HISTORY_PHONE_ONLY_DATE_PATTERN = /antes de (\d{1,2}\/\d{1,2}\/\d{2,4})/i;

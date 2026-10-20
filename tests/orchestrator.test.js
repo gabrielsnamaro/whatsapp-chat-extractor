@@ -4277,22 +4277,24 @@ test('JSON no ZIP: conversa com o texto não interpretado no empacotamento vira 
   assert.equal(await runWithCheck({ unreadable: ['000001'], jsonUnparsed: ['000001'] }), `⚠️ Conferência do ZIP: 1 ${unreadableIssue}. ${seeReport}`);
 });
 
-// Aba do WhatsApp Web oculta (outra aba na frente ou janela minimizada): o Chrome deixa a aba lenta, e a execução pausa
+// Aba do WhatsApp Web oculta (outra aba na frente, janela minimizada ou, no Wayland, coberta, que o content percebe pela
+// página sem desenho): o Chrome deixa a aba lenta, e a execução pausa
 // sozinha, avisa o popup e o ícone da extensão e retoma sozinha quando a aba volta. Uma tentativa que falhou com a aba
 // oculta não conta como falha nem como tentativa, e a varredura com a aba oculta é refeita
 
-const TAB_HIDDEN_PAUSE_MESSAGE = 'A aba do WhatsApp Web ficou em segundo plano. O Chrome deixa abas ocultas lentas, ' +
-  'então a extração pausou e continua sozinha quando a aba voltar a ficar visível.';
+const TAB_HIDDEN_PAUSE_MESSAGE = 'A aba do WhatsApp Web saiu da tela (outra aba na frente, ou a janela minimizada ou ' +
+  'coberta por outra). O Chrome deixa de atualizar a página assim, então a extração pausou e continua sozinha quando ela ' +
+  'voltar a aparecer.';
 const TAB_HIDDEN_PAUSE_WARNING = `⚠️ ${TAB_HIDDEN_PAUSE_MESSAGE}`;
-const TAB_HIDDEN_PAUSE_LOG = 'Pausa: a aba do WhatsApp Web ficou oculta (outra aba na frente ou janela minimizada), ' +
-  'e a extração parou até ela voltar a ficar visível.';
-const TAB_VISIBLE_RESUME_LOG = 'Retomada: a aba voltou a ficar visível, depois de <pausa> de pausa.';
+const TAB_HIDDEN_PAUSE_LOG = 'Pausa: a aba do WhatsApp Web saiu da tela (outra aba na frente, ou a janela minimizada ' +
+  'ou coberta por outra), e a extração parou até ela voltar a aparecer.';
+const TAB_VISIBLE_RESUME_LOG = 'Retomada: a aba voltou a aparecer, depois de <pausa> de pausa.';
 const USER_RESUME_LOG = 'Retomada pelo usuário ("Retomar"), depois de <pausa> de pausa com a aba oculta.';
 const PAUSE_BADGE = { text: '||', color: '#e9a935' };
 // Duração de uma pausa, como o relatório, o log e o popup a escrevem
 const PAUSE_DURATION = String.raw`(?:\d+ s|\d+ min(?: \d+ s)?)`;
 const TAB_VISIBLE_AGAIN_INFO = new RegExp(
-  `^A aba do WhatsApp Web voltou a ficar visível: a extração continua, depois de ${PAUSE_DURATION} de pausa\\.$`
+  `^A aba do WhatsApp Web voltou a aparecer: a extração continua, depois de ${PAUSE_DURATION} de pausa\\.$`
 );
 
 /** Linha do cabeçalho do relatório com as pausas da aba oculta */
